@@ -1,0 +1,25 @@
+{
+  "name": "peerline",
+  "version": "0.1.0-alpha.0",
+  "description": "P2P post-quantum encrypted file transfer CLI",
+  "bin": {
+    "peerline": "npm/peerline.js"
+  },
+  "files": [
+    "npm/bin",
+    "npm/peerline.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "cargo build --release -p peerline-cli",
+    "prepack": "node npm/prepack.js",
+    "test": "cargo test --workspace",
+    "smoke": "node npm/peerline.js --version"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "alpha"
+  },
+  "license": "Apache-2.0"
+}
