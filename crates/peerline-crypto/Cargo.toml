@@ -1,0 +1,24 @@
+[package]
+name = "peerline-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+ml-kem.workspace = true
+opaque-ke.workspace = true
+postcard.workspace = true
+rand.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

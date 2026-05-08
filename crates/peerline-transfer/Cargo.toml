@@ -1,0 +1,22 @@
+[package]
+name = "peerline-transfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+lzma-rs.workspace = true
+peerline-core = { path = "../peerline-core" }
+postcard.workspace = true
+tempfile.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+walkdir.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
