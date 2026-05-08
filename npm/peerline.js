@@ -20,6 +20,22 @@ function binaryName() {
   return process.platform === "win32" ? "peerline.exe" : "peerline";
 }
 
+function ensureExecutable(binaryPath) {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  try {
+    fs.accessSync(binaryPath, fs.constants.X_OK);
+    return;
+  } catch {
+    // Fall through and repair the mode bits below.
+  }
+
+  const stat = fs.statSync(binaryPath);
+  fs.chmodSync(binaryPath, stat.mode | 0o111);
+}
+
 function resolveBinary() {
   const bundledBinary = path.join(__dirname, "bin", binaryName());
   if (fs.existsSync(bundledBinary)) return bundledBinary;
@@ -39,11 +55,28 @@ function resolveBinary() {
   return candidate;
 }
 
-const result = spawnSync(resolveBinary(), process.argv.slice(2), {
-  stdio: "inherit"
-});
+function main(argv = process.argv.slice(2)) {
+  const binary = resolveBinary();
+  ensureExecutable(binary);
 
-if (result.error) {
-  throw result.error;
+  const result = spawnSync(binary, argv, {
+    stdio: "inherit",
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+  process.exit(result.status ?? 1);
 }
-process.exit(result.status ?? 1);
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  binaryName,
+  ensureExecutable,
+  main,
+  packageName,
+  resolveBinary,
+};
