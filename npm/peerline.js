@@ -3,6 +3,7 @@
 
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 function packageName() {
@@ -20,20 +21,57 @@ function binaryName() {
   return process.platform === "win32" ? "peerline.exe" : "peerline";
 }
 
-function ensureExecutable(binaryPath) {
+function ensureExecutable(binaryPath, fsImpl = fs) {
   if (process.platform === "win32") {
     return;
   }
 
   try {
-    fs.accessSync(binaryPath, fs.constants.X_OK);
+    fsImpl.accessSync(binaryPath, fs.constants.X_OK);
     return;
   } catch {
     // Fall through and repair the mode bits below.
   }
 
-  const stat = fs.statSync(binaryPath);
-  fs.chmodSync(binaryPath, stat.mode | 0o111);
+  try {
+    const stat = fsImpl.statSync(binaryPath);
+    fsImpl.chmodSync(binaryPath, stat.mode | 0o111);
+  } catch (error) {
+    if (error && (error.code === "EACCES" || error.code === "EPERM" || error.code === "EROFS")) {
+      return;
+    }
+    throw error;
+  }
+}
+
+function isRetryableExecutionError(error) {
+  return Boolean(error && (error.code === "EACCES" || error.code === "ENOEXEC"));
+}
+
+function copyBinaryToTemporaryLocation(binaryPath, fsImpl = fs, osImpl = os) {
+  const tempDir = fsImpl.mkdtempSync(path.join(osImpl.tmpdir(), "peerline-exec-"));
+  const tempBinary = path.join(tempDir, binaryName());
+
+  fsImpl.copyFileSync(binaryPath, tempBinary);
+  fsImpl.chmodSync(tempBinary, 0o755);
+
+  return {
+    binaryPath: tempBinary,
+    cleanup() {
+      fsImpl.rmSync(tempDir, { recursive: true, force: true });
+    },
+  };
+}
+
+function formatExecutionFallbackError(binaryPath, primaryCode, fallbackCode, fallbackPath) {
+  return [
+    `peerline could not execute its bundled binary from ${binaryPath}.`,
+    `Primary error: ${primaryCode}.`,
+    fallbackPath
+      ? `Temporary copy at ${fallbackPath} also failed with ${fallbackCode}.`
+      : `Creating a temporary executable copy also failed with ${fallbackCode}.`,
+    "This usually means the package cache or temporary directory cannot execute files.",
+  ].join(" ");
 }
 
 function resolveBinary() {
@@ -55,17 +93,65 @@ function resolveBinary() {
   return candidate;
 }
 
-function main(argv = process.argv.slice(2)) {
-  const binary = resolveBinary();
-  ensureExecutable(binary);
-
-  const result = spawnSync(binary, argv, {
+function executeBinary(binaryPath, argv = process.argv.slice(2), deps = {}) {
+  const spawnImpl = deps.spawnSync ?? spawnSync;
+  const fsImpl = deps.fs ?? fs;
+  const osImpl = deps.os ?? os;
+  const spawnOptions = {
     stdio: "inherit",
-  });
+    ...(deps.spawnOptions ?? {}),
+  };
 
-  if (result.error) {
-    throw result.error;
+  ensureExecutable(binaryPath, fsImpl);
+
+  const primaryResult = spawnImpl(binaryPath, argv, spawnOptions);
+  if (!primaryResult.error) {
+    return primaryResult;
   }
+  if (!isRetryableExecutionError(primaryResult.error)) {
+    throw primaryResult.error;
+  }
+
+  let tempBinary;
+  try {
+    try {
+      tempBinary = copyBinaryToTemporaryLocation(binaryPath, fsImpl, osImpl);
+    } catch (copyError) {
+      const error = new Error(
+        formatExecutionFallbackError(binaryPath, primaryResult.error.code ?? "unknown", copyError.code ?? "unknown")
+      );
+      error.cause = copyError;
+      throw error;
+    }
+
+    const retryResult = spawnImpl(tempBinary.binaryPath, argv, spawnOptions);
+    if (!retryResult.error) {
+      return retryResult;
+    }
+
+    const error = new Error(
+      formatExecutionFallbackError(
+        binaryPath,
+        primaryResult.error.code ?? "unknown",
+        retryResult.error.code ?? "unknown",
+        tempBinary.binaryPath
+      )
+    );
+    error.cause = retryResult.error;
+    throw error;
+  } finally {
+    if (tempBinary) {
+      try {
+        tempBinary.cleanup();
+      } catch {
+        // Ignore cleanup failures; execution has already finished or failed.
+      }
+    }
+  }
+}
+
+function main(argv = process.argv.slice(2), deps = {}) {
+  const result = executeBinary(resolveBinary(), argv, deps);
   process.exit(result.status ?? 1);
 }
 
@@ -76,6 +162,10 @@ if (require.main === module) {
 module.exports = {
   binaryName,
   ensureExecutable,
+  executeBinary,
+  copyBinaryToTemporaryLocation,
+  formatExecutionFallbackError,
+  isRetryableExecutionError,
   main,
   packageName,
   resolveBinary,
