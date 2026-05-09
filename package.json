@@ -1,6 +1,6 @@
 {
   "name": "peerline",
-  "version": "0.1.0-alpha.2",
+  "version": "0.1.0-alpha.3",
   "description": "P2P post-quantum encrypted file transfer CLI",
   "repository": {
     "type": "git",
@@ -29,13 +29,13 @@
     "access": "public"
   },
   "optionalDependencies": {
-    "peerline-darwin-arm64": "0.1.0-alpha.2",
-    "peerline-darwin-x64": "0.1.0-alpha.2",
-    "peerline-linux-arm64-gnu": "0.1.0-alpha.2",
-    "peerline-linux-arm64-musl": "0.1.0-alpha.2",
-    "peerline-linux-x64-gnu": "0.1.0-alpha.2",
-    "peerline-linux-x64-musl": "0.1.0-alpha.2",
-    "peerline-win32-x64-msvc": "0.1.0-alpha.2"
+    "peerline-darwin-arm64": "0.1.0-alpha.3",
+    "peerline-darwin-x64": "0.1.0-alpha.3",
+    "peerline-linux-arm64-gnu": "0.1.0-alpha.3",
+    "peerline-linux-arm64-musl": "0.1.0-alpha.3",
+    "peerline-linux-x64-gnu": "0.1.0-alpha.3",
+    "peerline-linux-x64-musl": "0.1.0-alpha.3",
+    "peerline-win32-x64-msvc": "0.1.0-alpha.3"
   },
   "license": "Apache-2.0"
 }
