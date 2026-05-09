@@ -235,8 +235,13 @@ jobs:
           if [ "$release_channel" != "stable" ]; then
             args+=(--prerelease)
           fi
+          mapfile -t assets < <(find dist-assets -type f | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found under dist-assets" >&2
+            exit 1
+          fi
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist-assets/* --clobber
+            gh release upload "$tag" "${assets[@]}" --clobber
           else
-            gh "${args[@]}" dist-assets/*
+            gh "${args[@]}" "${assets[@]}"
           fi
