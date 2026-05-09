@@ -240,8 +240,9 @@ jobs:
             echo "No release assets found under dist-assets" >&2
             exit 1
           fi
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "${assets[@]}" --clobber
-          else
-            gh "${args[@]}" "${assets[@]}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh "${args[@]}"
           fi
+          for asset in "${assets[@]}"; do
+            gh release upload "$tag" "$asset" --clobber
+          done
