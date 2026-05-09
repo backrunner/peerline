@@ -9,8 +9,10 @@ const {
   nextAlphaVersion,
   parseArgs,
   platformPackageNames,
+  setCargoLockVersion,
   setCargoWorkspaceVersion,
   setPlatformDependencyVersions,
+  workspacePackageNames,
 } = require("./release-alpha.js");
 
 test("nextAlphaVersion increments the alpha prerelease number", () => {
@@ -39,6 +41,27 @@ test("cargo workspace version can be read and replaced", () => {
   assert.equal(cargoWorkspaceVersion(setCargoWorkspaceVersion(cargoToml, "0.1.0-alpha.2")), "0.1.0-alpha.2");
 });
 
+test("cargo lock version replacement touches only workspace packages", () => {
+  const lock = [
+    "[[package]]",
+    'name = "cc"',
+    'version = "1.2.61"',
+    "",
+    ...workspacePackageNames.flatMap((name) => [
+      "[[package]]",
+      `name = "${name}"`,
+      'version = "0.1.0-alpha.1"',
+      "",
+    ]),
+  ].join("\n");
+
+  const updated = setCargoLockVersion(lock, "0.1.0-alpha.2");
+
+  assert.match(updated, /name = "cc"\nversion = "1\.2\.61"/);
+  assert.match(updated, /name = "peerline-cli"\nversion = "0\.1\.0-alpha\.2"/);
+  assert.match(updated, /name = "peerline-core"\nversion = "0\.1\.0-alpha\.2"/);
+});
+
 test("parseArgs supports publish options and current-version retries", () => {
   const options = parseArgs(["--current", "--otp", "123456", "--tag=alpha", "--access", "public"]);
 
@@ -56,6 +79,18 @@ test("platform package names do not require a private npm scope", () => {
   assert.ok(platformPackageNames.includes("peerline-linux-x64-gnu"));
   assert.ok(platformPackageNames.includes("peerline-darwin-arm64"));
   assert.equal(platformPackageNames.some((name) => name.startsWith("@peerline/")), false);
+});
+
+test("workspace package list covers every local crate in Cargo.lock", () => {
+  assert.deepEqual([...workspacePackageNames].sort(), [
+    "peerline-cli",
+    "peerline-core",
+    "peerline-crypto",
+    "peerline-net",
+    "peerline-testkit",
+    "peerline-transfer",
+    "peerline-tui",
+  ]);
 });
 
 test("setPlatformDependencyVersions pins every platform package to the release version", () => {

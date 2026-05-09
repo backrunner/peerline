@@ -11,6 +11,15 @@ const repoRoot = path.resolve(__dirname, "..");
 const packageJsonPath = path.join(repoRoot, "package.json");
 const cargoTomlPath = path.join(repoRoot, "Cargo.toml");
 const cargoLockPath = path.join(repoRoot, "Cargo.lock");
+const workspacePackageNames = [
+  "peerline-cli",
+  "peerline-core",
+  "peerline-crypto",
+  "peerline-net",
+  "peerline-testkit",
+  "peerline-transfer",
+  "peerline-tui",
+];
 const platformPackageNames = [
   "peerline-darwin-arm64",
   "peerline-darwin-x64",
@@ -129,6 +138,27 @@ function setCargoWorkspaceVersion(cargoToml, version) {
   );
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function setCargoLockVersion(cargoLock, version) {
+  let updated = cargoLock;
+
+  for (const name of workspacePackageNames) {
+    const pattern = new RegExp(
+      `(\\[\\[package\\]\\]\\nname = "${escapeRegExp(name)}"\\n[\\s\\S]*?^version = ")([^"]+)(")`,
+      "m"
+    );
+    if (!pattern.test(updated)) {
+      throw new Error(`could not find ${name} in Cargo.lock`);
+    }
+    updated = updated.replace(pattern, `$1${version}$3`);
+  }
+
+  return updated;
+}
+
 function nextAlphaVersion(version) {
   const match = version.match(/^(\d+)\.(\d+)\.(\d+)-alpha\.(\d+)$/);
   if (!match) {
@@ -216,7 +246,8 @@ function setProjectVersion(version, versions = currentVersions()) {
 
   writeJson(packageJsonPath, nextPackageJson);
   fs.writeFileSync(cargoTomlPath, setCargoWorkspaceVersion(versions.cargoToml, version));
-  run("cargo", ["metadata", "--format-version=1", "--no-deps"], { capture: true });
+  fs.writeFileSync(cargoLockPath, setCargoLockVersion(fs.readFileSync(cargoLockPath, "utf8"), version));
+  run("cargo", ["check", "--workspace", "--all-targets", "--locked"]);
 }
 
 function verifyCargoLockVersion(version) {
@@ -436,5 +467,7 @@ module.exports = {
   platformPackageNames,
   release,
   setCargoWorkspaceVersion,
+  setCargoLockVersion,
   setPlatformDependencyVersions,
+  workspacePackageNames,
 };
