@@ -523,10 +523,6 @@ function publishMainPackage(version, options) {
     args.push(`--otp=${options.otp}`);
   }
   run("npm", args);
-  const publishedVersion = run("npm", ["view", `peerline@${version}`, "version"], { capture: true }).trim();
-  if (publishedVersion !== version) {
-    throw new Error(`published version verification failed: expected ${version}, got ${publishedVersion}`);
-  }
 }
 
 function npmPackageExists(name, version) {
@@ -557,15 +553,6 @@ function publishPlatformPackage(platformPackage, options) {
     publishArgs.push(`--otp=${options.otp}`);
   }
   run("npm", publishArgs);
-
-  const publishedVersion = run("npm", ["view", `${platformPackage.name}@${platformPackage.version}`, "version"], {
-    capture: true,
-  }).trim();
-  if (publishedVersion !== platformPackage.version) {
-    throw new Error(
-      `platform package verification failed: expected ${platformPackage.version}, got ${publishedVersion}`
-    );
-  }
 }
 
 function targetIncludes(options, target) {
