@@ -1,67 +1,143 @@
 # Peerline
 
-Peerline is a Rust CLI/TUI for peer-to-peer file transfer.
-It prefers direct TCP first, then libp2p discovery and fallback routes, while keeping file contents end-to-end encrypted at the application layer.
+Peerline is a terminal-first peer-to-peer file transfer tool.
 
-## Current Status
+It is built for the moments when you want to move files, folders, logs, build artifacts, or project snapshots directly between two machines without first uploading them to a cloud drive. One side opens a receive session, shares a human-friendly name and code, and the other side sends one or more paths. Peerline then tries to find the best route between the two peers and transfers the data with application-layer end-to-end encryption.
 
-- Direct IP send/recv works.
-- Named discovery uses saved names, `code`, OPAQUE PAKE, Kademlia provider records, mDNS, DCUtR, relay fallback, and libp2p-webrtc's built-in ICE servers.
-- Files, multiple files, and folders are archived with safe relative paths, BLAKE3 integrity checks, and streaming zstd/lzma compression support.
-- Conflicts default to non-overwrite behavior, with TUI-driven handling in the receiver flow.
-- The receive side includes a modern terminal UI for identity, route state, and transfer progress.
-- The workspace test suite and E2E coverage are in place.
+Peerline is not a sync service and it does not keep a permanent hosted copy of your files. It is closer to a one-shot terminal copy workflow: start a receiver, send the paths, verify the transfer, and exit.
 
-## Install
+## Why Peerline Exists
+
+- Direct handoff: transfer files and folders from one machine to another without using shared storage as the normal path.
+- Human-friendly pairing: use readable names and codes instead of asking people to exchange long keys or machine identifiers.
+- Flexible networking: prefer direct TCP, discover peers through libp2p, and use fallback routes when direct paths are unavailable.
+- Encrypted by default: authenticate the transfer with the shared code and encrypt file contents at the application layer.
+- Safe file handling: archive multiple inputs with safe relative paths, BLAKE3 integrity checks, and non-overwriting output by default.
+
+## How It Works
+
+Peerline has two roles:
+
+- Receiver: runs `peerline recv`, listens for one incoming transfer, and prints a `name`, `code`, and direct endpoint.
+- Sender: runs `peerline send`, points at the receiver by name/code or IP/code, and provides the files or folders to send.
+
+For named transfers, the receiver publishes a short-lived descriptor keyed by the shared name and code. The sender derives the same lookup key, discovers candidate routes, and tries them in order. Peerline prefers direct LAN or public TCP endpoints first, then libp2p routes such as DCUtR and WebRTC TURN. Relay data fallback is available only when explicitly enabled.
+
+For direct transfers, the sender can skip discovery and dial an IP address or `host:port` directly. This is useful on the same network, over VPNs, or whenever the receiver already knows which address the sender should use.
+
+During a transfer, Peerline scans the requested paths into a manifest, preserves directories with safe relative paths, compresses when useful, and streams the archive to the receiver. The receiver verifies file sizes and BLAKE3 hashes before writing files into the current directory. Existing files are kept by default; conflicting names receive a non-overwriting suffix unless `--overwrite` is used.
+
+The secure session combines the shared code with OPAQUE PAKE, X25519, ML-KEM, HKDF, and ChaCha20-Poly1305. Discovery and transport routes can vary, but file contents stay encrypted by Peerline itself.
+
+## Install And Run
+
+Use the npm package without installing it globally:
 
 ```sh
-npx peerline@alpha --version
+npx peerline@alpha --help
 ```
 
-Or from source:
+Install it globally through npm:
+
+```sh
+npm install -g peerline@alpha
+peerline --help
+```
+
+The npm package is a small launcher. It selects the matching platform binary package for macOS, Linux, or Windows when available, and also knows how to run a locally built `target/debug/peerline` or `target/release/peerline` during development.
+
+Run from source:
 
 ```sh
 cargo run -p peerline-cli -- --help
 ```
 
-## Release
-
-Releases are published with the bundled npm release script:
+Build a local binary:
 
 ```sh
-npm run release:alpha -- --otp=123456
-npm run release:beta -- --otp=123456
-npm run release:stable -- --otp=123456
+cargo build --release -p peerline-cli
+./target/release/peerline --help
 ```
 
-The release script publishes an unscoped platform binary package for the current runner, such as
-`peerline-linux-x64-gnu`, `peerline-linux-arm64-musl`, or `peerline-darwin-arm64`, and then
-publishes the main `peerline` shim. It runs `npm run lint` and `npm test` before publishing unless
-`--skip-tests` is passed.
+## Basic Usage
 
-GitHub Actions has a manual `Release Packages` workflow that does this for native runners:
-Linux x64 glibc, Linux arm64 glibc, Linux x64 musl, Linux arm64 musl, macOS arm64, macOS x64, and
-Windows x64. Configure the package as a GitHub Actions trusted publisher in npm, then run the
-workflow once with `publish=false` for a dry run and rerun with `publish=true`. The workflow can
-publish `alpha`, `beta`, or `stable`, and can create a GitHub release after npm publish. No
-`NPM_TOKEN` secret is needed.
-
-If a publish attempt fails after the version bump commit, retry the current version:
+Start a receiver:
 
 ```sh
-npm run release:alpha -- --current --otp=123456
-npm run release:beta -- --current --otp=123456
-npm run release:stable -- --current --otp=123456
+peerline recv
 ```
 
-## Usage
+The receiver prints values like:
+
+```text
+peerline recv
+name: river-mango-42
+code: rose-lime-iris-jade-1234
+direct: 0.0.0.0:43117
+waiting for one transfer over direct TCP or libp2p...
+```
+
+Send a file, multiple files, or a folder by name and code:
+
+```sh
+peerline send river-mango-42 rose-lime-iris-jade-1234 ./file.txt
+peerline send river-mango-42 rose-lime-iris-jade-1234 ./file.txt ./notes.md ./photos
+```
+
+Receive with a saved name:
 
 ```sh
 peerline set name river-mango-42
-peerline recv rose-lime-iris-jade-1234
-peerline send river-mango-42 rose-lime-iris-jade-1234 ./file.txt
-peerline send 127.0.0.1:43117 ./file.txt --code=rose-lime-iris-jade-1234
+peerline recv
 ```
+
+After a name is saved, you can receive with only a fresh code:
+
+```sh
+peerline recv rose-lime-iris-jade-1234
+```
+
+Use a direct IP address when discovery is not needed:
+
+```sh
+peerline send 192.168.1.23:43117 ./file.txt --code=rose-lime-iris-jade-1234
+peerline send 192.168.1.23 ./folder --code=rose-lime-iris-jade-1234
+```
+
+When the port is omitted, Peerline uses the default direct port `43117`.
+
+## Common Options
+
+Receiver options:
+
+```sh
+peerline recv [NAME_OR_CODE] [CODE] --port 43117
+peerline recv [NAME_OR_CODE] [CODE] --overwrite
+peerline recv [NAME_OR_CODE] [CODE] --no-tui
+peerline recv [NAME_OR_CODE] [CODE] --allow-relay-fallback
+```
+
+Sender options:
+
+```sh
+peerline send <name> <code> <path...> --compression auto
+peerline send <name> <code> <path...> --compression none
+peerline send <name> <code> <path...> --compression zstd
+peerline send <name> <code> <path...> --compression lzma
+peerline send <name> <code> <path...> --allow-relay-fallback
+peerline send --name <name> --code <code> <path...>
+```
+
+Relay fallback must be enabled on both sides when you want Peerline to use relay data paths. Direct and hole-punched routes are attempted before relay fallback.
+
+## Current Status
+
+- Direct IP send and receive works.
+- Named discovery uses saved names, generated codes, OPAQUE PAKE, Kademlia provider records, mDNS, DCUtR, relay fallback, and libp2p-webrtc's built-in ICE servers.
+- Files, multiple files, and folders are archived with safe relative paths, BLAKE3 integrity checks, and streaming zstd/lzma compression support.
+- Conflicts default to non-overwrite behavior, with TUI-driven handling in the receiver flow.
+- The receive side includes a modern terminal UI for identity, route state, and transfer progress.
+- The workspace test suite and E2E coverage are in place.
 
 ## License
 

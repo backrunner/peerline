@@ -1,6 +1,9 @@
 name: Release Packages
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       channel:
@@ -129,8 +132,8 @@ jobs:
       - name: Publish or dry-run platform package
         shell: bash
         env:
-          SHOULD_PUBLISH: ${{ inputs.publish }}
-          RELEASE_CHANNEL: ${{ inputs.channel }}
+          SHOULD_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.publish) || '' }}
+          RELEASE_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || '' }}
           PEERLINE_PLATFORM_PACKAGE: ${{ matrix.package }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
@@ -138,14 +141,29 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           set -euo pipefail
+          should_publish="${SHOULD_PUBLISH:-}"
+          if [ -z "$should_publish" ]; then
+            should_publish=true
+          fi
+
+          release_channel="${RELEASE_CHANNEL:-}"
+          if [ -z "$release_channel" ]; then
+            version="$(node -p "require('./package.json').version")"
+            case "$version" in
+              *-alpha.*) release_channel=alpha ;;
+              *-beta.*) release_channel=beta ;;
+              *) release_channel=stable ;;
+            esac
+          fi
+
           flags=(--current --platform-only --skip-tests --no-commit)
           flags+=(--platform-package="$PEERLINE_PLATFORM_PACKAGE")
-          if [ "$SHOULD_PUBLISH" = "true" ]; then
+          if [ "$should_publish" = "true" ]; then
             flags+=(--ignore-existing)
           else
             flags+=(--no-publish)
           fi
-          npm run "release:$RELEASE_CHANNEL" -- "${flags[@]}"
+          npm run "release:$release_channel" -- "${flags[@]}"
 
   publish-main:
     name: Main package
@@ -169,22 +187,37 @@ jobs:
       - name: Publish or dry-run main package
         shell: bash
         env:
-          SHOULD_PUBLISH: ${{ inputs.publish }}
-          RELEASE_CHANNEL: ${{ inputs.channel }}
+          SHOULD_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.publish) || '' }}
+          RELEASE_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || '' }}
         run: |
           set -euo pipefail
+          should_publish="${SHOULD_PUBLISH:-}"
+          if [ -z "$should_publish" ]; then
+            should_publish=true
+          fi
+
+          release_channel="${RELEASE_CHANNEL:-}"
+          if [ -z "$release_channel" ]; then
+            version="$(node -p "require('./package.json').version")"
+            case "$version" in
+              *-alpha.*) release_channel=alpha ;;
+              *-beta.*) release_channel=beta ;;
+              *) release_channel=stable ;;
+            esac
+          fi
+
           flags=(--current --main-only --skip-tests --no-commit)
-          if [ "$SHOULD_PUBLISH" = "true" ]; then
+          if [ "$should_publish" = "true" ]; then
             flags+=(--ignore-existing)
           else
             flags+=(--no-publish)
           fi
-          npm run "release:$RELEASE_CHANNEL" -- "${flags[@]}"
+          npm run "release:$release_channel" -- "${flags[@]}"
 
   github-release:
     name: GitHub release
     needs: publish-main
-    if: ${{ inputs.publish && inputs.github_release }}
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish && inputs.github_release) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -196,18 +229,23 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_CHANNEL: ${{ inputs.channel }}
         run: |
           set -euo pipefail
           version="$(node -p "require('./package.json').version")"
           tag="v$version"
+          release_channel="stable"
+          case "$version" in
+            *-alpha.*) release_channel=alpha ;;
+            *-beta.*) release_channel=beta ;;
+          esac
+
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "GitHub release $tag already exists; skipping."
             exit 0
           fi
 
           args=(release create "$tag" --title "Peerline $version" --generate-notes)
-          if [ "$RELEASE_CHANNEL" != "stable" ]; then
+          if [ "$release_channel" != "stable" ]; then
             args+=(--prerelease)
           fi
           gh "${args[@]}"
