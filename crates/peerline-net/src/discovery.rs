@@ -368,16 +368,29 @@ async fn run_descriptor_publisher(
                 )?;
             }
             event = swarm.select_next_some() => {
-                if let SwarmEvent::Behaviour(event) = event
-                    && handle_discovery_event(&mut swarm, event)
-                {
-                    let _ = publish_descriptor(
-                        &mut swarm,
-                        record_key.clone(),
-                        provider_key.clone(),
-                        direct_bind,
-                        allow_loopback,
-                    );
+                match event {
+                    SwarmEvent::Behaviour(event) => {
+                        let should_publish = handle_discovery_event(&mut swarm, event);
+                        if should_publish {
+                            let _ = publish_descriptor(
+                                &mut swarm,
+                                record_key.clone(),
+                                provider_key.clone(),
+                                direct_bind,
+                                allow_loopback,
+                            );
+                        }
+                    }
+                    SwarmEvent::ConnectionEstablished { .. } => {
+                        let _ = publish_descriptor(
+                            &mut swarm,
+                            record_key.clone(),
+                            provider_key.clone(),
+                            direct_bind,
+                            allow_loopback,
+                        );
+                    }
+                    _ => {}
                 }
             }
         }

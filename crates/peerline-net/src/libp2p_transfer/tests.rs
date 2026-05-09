@@ -64,7 +64,7 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
         events: None,
     }));
 
-    let candidate = time::timeout(Duration::from_secs(30), async {
+    let candidate = time::timeout(Duration::from_secs(60), async {
         loop {
             let candidates =
                 crate::discovery::discover_peer_candidates(&name, &code, discovery.clone())

@@ -119,6 +119,7 @@ pub(crate) async fn recv_libp2p(
                         }
                     }
                     SwarmEvent::NewListenAddr { .. }
+                    | SwarmEvent::ConnectionEstablished { .. }
                     | SwarmEvent::ExternalAddrConfirmed { .. }
                     | SwarmEvent::NewExternalAddrCandidate { .. } => {
                         let _ = publish_receiver_descriptor(
