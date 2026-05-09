@@ -50,8 +50,11 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      - name: Unit and integration tests
-        run: npm test
+      - name: Rust tests
+        run: npm run test:rust
+
+      - name: Node tests
+        run: npm run test:node
 
       - name: Dry-run main package
         run: npm pack --dry-run --json

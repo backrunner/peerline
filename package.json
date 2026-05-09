@@ -22,7 +22,9 @@
     "release:beta": "node npm/release.js --channel=beta",
     "release:stable": "node npm/release.js --channel=stable",
     "release": "node npm/release.js --channel=stable",
-    "test": "cargo test --workspace && node --test npm/peerline.test.js npm/release.test.js",
+    "test": "npm run test:rust && npm run test:node",
+    "test:node": "node --test npm/peerline.test.js npm/release.test.js",
+    "test:rust": "cargo test --workspace -- --test-threads=1",
     "smoke": "node npm/peerline.js --version"
   },
   "publishConfig": {
