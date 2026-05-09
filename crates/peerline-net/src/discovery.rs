@@ -514,7 +514,7 @@ fn handle_discovery_event_with_snapshot(
             let changed = !peers.is_empty();
             for (peer, addr) in peers {
                 if let Some(snapshot) = snapshot.as_mut() {
-                    snapshot.observe_local_peer(peer.clone());
+                    snapshot.observe_local_peer(peer);
                 }
                 swarm.behaviour_mut().kad.add_address(&peer, addr);
             }

@@ -54,6 +54,10 @@ impl Archive {
     pub fn len(&self) -> u64 {
         self.len
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 pub fn create_archive(paths: &[PathBuf], compression: Compression) -> anyhow::Result<Archive> {

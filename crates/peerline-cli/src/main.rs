@@ -118,8 +118,10 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     let actual_bind = listener.local_addr()?;
     let destination = std::env::current_dir()?;
-    let mut discovery = peerline_net::DiscoveryConfig::default();
-    discovery.allow_relay_data_fallback = args.allow_relay_fallback;
+    let discovery = peerline_net::DiscoveryConfig {
+        allow_relay_data_fallback: args.allow_relay_fallback,
+        ..Default::default()
+    };
 
     println!("peerline recv");
     println!("name: {name}");
@@ -291,8 +293,10 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
         eprintln!("warning: code entropy looks low; generated codes are safer on public networks");
     }
     println!("discovering {name} through libp2p Kademlia/mDNS...");
-    let mut discovery = peerline_net::DiscoveryConfig::default();
-    discovery.allow_relay_data_fallback = allow_relay_fallback;
+    let discovery = peerline_net::DiscoveryConfig {
+        allow_relay_data_fallback: allow_relay_fallback,
+        ..Default::default()
+    };
     let candidates =
         peerline_net::discovery::discover_peer_candidates(&name, &code, discovery.clone()).await?;
     if candidates.is_empty() {

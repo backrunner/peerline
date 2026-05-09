@@ -88,13 +88,13 @@ pub async fn render_once(
             }
             _ = tick.tick() => {
                 while crossterm::event::poll(Duration::from_millis(0))? {
-                    if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                        if matches!(
+                    if let crossterm::event::Event::Key(key) = crossterm::event::read()?
+                        && matches!(
                             key.code,
                             crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc
-                        ) {
-                            return Ok(());
-                        }
+                        )
+                    {
+                        return Ok(());
                     }
                 }
             }
