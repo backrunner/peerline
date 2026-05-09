@@ -10,7 +10,7 @@ const { detectLibc, packageName } = require("./peerline.js");
 const repoRoot = path.resolve(__dirname, "..");
 const repository = {
   type: "git",
-  url: "https://github.com/peerline/peerline",
+  url: "https://github.com/backrunner/peerline",
 };
 const packageJsonPath = path.join(repoRoot, "package.json");
 const cargoTomlPath = path.join(repoRoot, "Cargo.toml");

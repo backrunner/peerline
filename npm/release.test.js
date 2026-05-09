@@ -136,7 +136,7 @@ test("trusted publishing keeps GitHub repository metadata aligned", () => {
   const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
 
   assert.deepEqual(packageJson.repository, repository);
-  assert.equal(packageJson.repository.url, "https://github.com/peerline/peerline");
+  assert.equal(packageJson.repository.url, "https://github.com/backrunner/peerline");
   assert.equal(packageJson.publishConfig?.tag, undefined);
 });
 

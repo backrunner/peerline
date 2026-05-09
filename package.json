@@ -4,7 +4,7 @@
   "description": "P2P post-quantum encrypted file transfer CLI",
   "repository": {
     "type": "git",
-    "url": "https://github.com/peerline/peerline"
+    "url": "https://github.com/backrunner/peerline"
   },
   "bin": {
     "peerline": "npm/peerline.js"
