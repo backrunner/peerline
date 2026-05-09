@@ -85,11 +85,11 @@ jobs:
             rust_target: aarch64-unknown-linux-musl
             musl: true
           - package: peerline-darwin-arm64
-            os: macos-14
+            os: macos-15
             rust_target: ""
             musl: false
           - package: peerline-darwin-x64
-            os: macos-13
+            os: macos-15-intel
             rust_target: ""
             musl: false
           - package: peerline-win32-x64-msvc
