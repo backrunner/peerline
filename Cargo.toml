@@ -14,7 +14,7 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/backrunner/peerline"
-version = "0.1.0-alpha.7"
+version = "0.1.0-alpha.8"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
