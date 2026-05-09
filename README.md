@@ -26,26 +26,31 @@ cargo run -p peerline-cli -- --help
 
 ## Release
 
-Alpha releases are published with the bundled npm release script:
+Releases are published with the bundled npm release script:
 
 ```sh
 npm run release:alpha -- --otp=123456
+npm run release:beta -- --otp=123456
+npm run release:stable -- --otp=123456
 ```
 
 The release script publishes an unscoped platform binary package for the current runner, such as
-`peerline-linux-x64-gnu` or `peerline-darwin-arm64`, and then publishes the main `peerline` shim.
-In CI, run `--platform-only --current` on each platform first, then run `--main-only --current`
-after the platform packages are available.
+`peerline-linux-x64-gnu`, `peerline-linux-arm64-musl`, or `peerline-darwin-arm64`, and then
+publishes the main `peerline` shim. It runs `npm run lint` and `npm test` before publishing unless
+`--skip-tests` is passed.
 
-GitHub Actions has a manual `Release Alpha` workflow that does this for the native runners we can
-trust for npm binaries: Linux x64 glibc, macOS arm64, macOS x64, and Windows x64. Add an npm
-automation token as the `NPM_TOKEN` repository secret, run the workflow once with `publish=false`
-for a dry run, then rerun with `publish=true`.
+GitHub Actions has a manual `Release Packages` workflow that does this for native runners:
+Linux x64 glibc, Linux arm64 glibc, Linux x64 musl, Linux arm64 musl, macOS arm64, macOS x64, and
+Windows x64. Add an npm automation token as the `NPM_TOKEN` repository secret, run the workflow
+once with `publish=false` for a dry run, then rerun with `publish=true`. The workflow can publish
+`alpha`, `beta`, or `stable`, and can create a GitHub release after npm publish.
 
 If a publish attempt fails after the version bump commit, retry the current version:
 
 ```sh
 npm run release:alpha -- --current --otp=123456
+npm run release:beta -- --current --otp=123456
+npm run release:stable -- --current --otp=123456
 ```
 
 ## Usage

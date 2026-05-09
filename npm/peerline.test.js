@@ -15,6 +15,7 @@ test("packageName uses unscoped platform packages", () => {
   assert.equal(packageName("linux", "x64", "gnu"), "peerline-linux-x64-gnu");
   assert.equal(packageName("linux", "x64", "musl"), "peerline-linux-x64-musl");
   assert.equal(packageName("linux", "arm64", "gnu"), "peerline-linux-arm64-gnu");
+  assert.equal(packageName("linux", "arm64", "musl"), "peerline-linux-arm64-musl");
   assert.equal(packageName("win32", "x64"), "peerline-win32-x64-msvc");
 });
 

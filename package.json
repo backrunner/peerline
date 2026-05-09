@@ -12,9 +12,13 @@
   ],
   "scripts": {
     "build": "cargo build --release -p peerline-cli",
+    "lint": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && node --check npm/peerline.js && node --check npm/release.js && node --check npm/release-alpha.js && node --check npm/peerline.test.js && node --check npm/release.test.js",
     "prepack": "node npm/prepack.js",
-    "release:alpha": "node npm/release-alpha.js",
-    "test": "cargo test --workspace && node --test npm/peerline.test.js npm/release-alpha.test.js",
+    "release:alpha": "node npm/release.js --channel=alpha",
+    "release:beta": "node npm/release.js --channel=beta",
+    "release:stable": "node npm/release.js --channel=stable",
+    "release": "node npm/release.js --channel=stable",
+    "test": "cargo test --workspace && node --test npm/peerline.test.js npm/release.test.js",
     "smoke": "node npm/peerline.js --version"
   },
   "publishConfig": {

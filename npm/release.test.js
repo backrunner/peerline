@@ -5,25 +5,48 @@ const test = require("node:test");
 
 const {
   assertAlphaVersion,
+  assertReleaseVersion,
   cargoWorkspaceVersion,
+  distTagForChannel,
   nextAlphaVersion,
+  nextReleaseVersion,
+  normalizeChannel,
   parseArgs,
+  platformPackageInfo,
   platformPackageNames,
+  platformPackageSpecs,
   setCargoLockVersion,
   setCargoWorkspaceVersion,
   setPlatformDependencyVersions,
   workspacePackageNames,
-} = require("./release-alpha.js");
+} = require("./release.js");
 
 test("nextAlphaVersion increments the alpha prerelease number", () => {
   assert.equal(nextAlphaVersion("0.1.0-alpha.1"), "0.1.0-alpha.2");
   assert.equal(nextAlphaVersion("1.2.3-alpha.9"), "1.2.3-alpha.10");
 });
 
+test("nextReleaseVersion advances alpha, beta, and stable channels", () => {
+  assert.equal(nextReleaseVersion("0.1.0-alpha.2", "beta"), "0.1.0-beta.0");
+  assert.equal(nextReleaseVersion("0.1.0-beta.0", "beta"), "0.1.0-beta.1");
+  assert.equal(nextReleaseVersion("0.1.0-beta.1", "stable"), "0.1.0");
+  assert.equal(nextReleaseVersion("0.1.0", "stable"), "0.1.1");
+});
+
 test("alpha release validation rejects non-alpha versions", () => {
   assert.doesNotThrow(() => assertAlphaVersion("0.1.0-alpha.2"));
   assert.throws(() => assertAlphaVersion("0.1.0"));
   assert.throws(() => assertAlphaVersion("0.1.0-beta.1"));
+});
+
+test("release channel validation and dist-tags match npm conventions", () => {
+  assert.equal(normalizeChannel("release"), "stable");
+  assert.equal(distTagForChannel("alpha"), "alpha");
+  assert.equal(distTagForChannel("beta"), "beta");
+  assert.equal(distTagForChannel("stable"), "latest");
+  assert.doesNotThrow(() => assertReleaseVersion("0.1.0-beta.0", "beta"));
+  assert.doesNotThrow(() => assertReleaseVersion("0.1.0", "stable"));
+  assert.throws(() => assertReleaseVersion("0.1.0-alpha.0", "beta"));
 });
 
 test("cargo workspace version can be read and replaced", () => {
@@ -64,20 +87,28 @@ test("cargo lock version replacement touches only workspace packages", () => {
 
 test("parseArgs supports publish options and current-version retries", () => {
   const options = parseArgs([
+    "--channel=beta",
     "--current",
     "--otp",
     "123456",
-    "--tag=alpha",
     "--access",
     "public",
+    "--platform-package",
+    "peerline-linux-arm64-musl",
     "--ignore-existing",
   ]);
 
+  assert.equal(options.channel, "beta");
   assert.equal(options.current, true);
   assert.equal(options.otp, "123456");
-  assert.equal(options.tag, "alpha");
+  assert.equal(options.tag, "beta");
   assert.equal(options.access, "public");
+  assert.equal(options.platformPackage, "peerline-linux-arm64-musl");
   assert.equal(options.ignoreExisting, true);
+});
+
+test("parseArgs rejects unknown platform packages", () => {
+  assert.throws(() => parseArgs(["--platform-package", "peerline-missing"]));
 });
 
 test("parseArgs rejects mutually exclusive version selectors", () => {
@@ -86,8 +117,16 @@ test("parseArgs rejects mutually exclusive version selectors", () => {
 
 test("platform package names do not require a private npm scope", () => {
   assert.ok(platformPackageNames.includes("peerline-linux-x64-gnu"));
+  assert.ok(platformPackageNames.includes("peerline-linux-arm64-gnu"));
+  assert.ok(platformPackageNames.includes("peerline-linux-arm64-musl"));
   assert.ok(platformPackageNames.includes("peerline-darwin-arm64"));
   assert.equal(platformPackageNames.some((name) => name.startsWith("@peerline/")), false);
+});
+
+test("platform package specs expose publish-time build metadata", () => {
+  assert.equal(platformPackageSpecs["peerline-linux-arm64-musl"].cargoTarget, "aarch64-unknown-linux-musl");
+  assert.equal(platformPackageSpecs["peerline-linux-x64-musl"].libcField[0], "musl");
+  assert.equal(platformPackageSpecs["peerline-linux-arm64-gnu"].libcField[0], "glibc");
 });
 
 test("workspace package list covers every local crate in Cargo.lock", () => {
@@ -108,4 +147,15 @@ test("setPlatformDependencyVersions pins every platform package to the release v
   for (const name of platformPackageNames) {
     assert.equal(packageJson.optionalDependencies[name], "0.1.0-alpha.2");
   }
+});
+
+test("platformPackageInfo resolves names to host package metadata", () => {
+  const info = platformPackageInfo("peerline-linux-arm64-musl", "0.1.0-beta.1");
+
+  assert.equal(info.name, "peerline-linux-arm64-musl");
+  assert.equal(info.platform, "linux");
+  assert.equal(info.arch, "arm64");
+  assert.equal(info.libc, "musl");
+  assert.equal(info.cargoTarget, "aarch64-unknown-linux-musl");
+  assert.equal(info.binaryName, "peerline");
 });
