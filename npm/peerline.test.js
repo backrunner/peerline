@@ -7,7 +7,15 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
-const { detectLibc, ensureExecutable, executeBinary, packageName } = require("./peerline.js");
+const {
+  cachedBinaryPath,
+  detectLibc,
+  ensureExecutable,
+  executeBinary,
+  packageName,
+  releaseAssetName,
+  releaseAssetUrl,
+} = require("./peerline.js");
 
 test("packageName uses unscoped platform packages", () => {
   assert.equal(packageName("darwin", "arm64"), "peerline-darwin-arm64");
@@ -22,6 +30,22 @@ test("packageName uses unscoped platform packages", () => {
 test("detectLibc distinguishes glibc and musl reports", { skip: process.platform !== "linux" }, () => {
   assert.equal(detectLibc(() => ({ header: { glibcVersionRuntime: "2.39" } })), "gnu");
   assert.equal(detectLibc(() => ({ header: {} })), "musl");
+});
+
+test("release assets are named for direct GitHub downloads", () => {
+  assert.equal(releaseAssetName("peerline-linux-x64-gnu", "peerline"), "peerline-linux-x64-gnu");
+  assert.equal(releaseAssetName("peerline-win32-x64-msvc", "peerline.exe"), "peerline-win32-x64-msvc.exe");
+  assert.equal(
+    releaseAssetUrl("0.1.0-alpha.6", {
+      PEERLINE_DOWNLOAD_BASE_URL: "https://example.invalid/releases/v0.1.0-alpha.6/",
+    }),
+    `https://example.invalid/releases/v0.1.0-alpha.6/${releaseAssetName()}`
+  );
+});
+
+test("cachedBinaryPath honors PEERLINE_BINARY_CACHE", () => {
+  const cachePath = cachedBinaryPath("0.1.0-alpha.6", { PEERLINE_BINARY_CACHE: "/tmp/peerline-cache" }, os);
+  assert.equal(cachePath, path.join("/tmp/peerline-cache", "0.1.0-alpha.6", releaseAssetName()));
 });
 
 test(

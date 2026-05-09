@@ -3,6 +3,7 @@
 
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
+const https = require("node:https");
 const os = require("node:os");
 const path = require("node:path");
 
@@ -30,6 +31,37 @@ function packageName(platform = process.platform, arch = process.arch, libc = de
 
 function binaryName() {
   return process.platform === "win32" ? "peerline.exe" : "peerline";
+}
+
+function releaseAssetName(platformPackage = packageName(), binary = binaryName()) {
+  return binary.endsWith(".exe") ? `${platformPackage}.exe` : platformPackage;
+}
+
+function packageVersion(fsImpl = fs) {
+  const pkg = JSON.parse(fsImpl.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
+  return pkg.version;
+}
+
+function cacheRoot(env = process.env, osImpl = os) {
+  if (env.PEERLINE_BINARY_CACHE) return env.PEERLINE_BINARY_CACHE;
+  if (process.platform === "win32" && env.LOCALAPPDATA) return path.join(env.LOCALAPPDATA, "peerline");
+  if (process.platform === "darwin") return path.join(osImpl.homedir(), "Library", "Caches", "peerline");
+  return path.join(env.XDG_CACHE_HOME || path.join(osImpl.homedir(), ".cache"), "peerline");
+}
+
+function releaseDownloadBaseUrl(version = packageVersion(), env = process.env) {
+  return (env.PEERLINE_DOWNLOAD_BASE_URL || `https://github.com/backrunner/peerline/releases/download/v${version}`).replace(
+    /\/+$/,
+    ""
+  );
+}
+
+function releaseAssetUrl(version = packageVersion(), env = process.env) {
+  return `${releaseDownloadBaseUrl(version, env)}/${releaseAssetName()}`;
+}
+
+function cachedBinaryPath(version = packageVersion(), env = process.env, osImpl = os) {
+  return path.join(cacheRoot(env, osImpl), version, releaseAssetName());
 }
 
 function ensureExecutable(binaryPath, fsImpl = fs) {
@@ -85,12 +117,12 @@ function formatExecutionFallbackError(binaryPath, primaryCode, fallbackCode, fal
   ].join(" ");
 }
 
-function resolveBinary() {
+function resolvePackagedBinary(fsImpl = fs) {
   const localRelease = path.join(__dirname, "..", "target", "release", binaryName());
-  if (fs.existsSync(localRelease)) return localRelease;
+  if (fsImpl.existsSync(localRelease)) return localRelease;
 
   const localDebug = path.join(__dirname, "..", "target", "debug", binaryName());
-  if (fs.existsSync(localDebug)) return localDebug;
+  if (fsImpl.existsSync(localDebug)) return localDebug;
 
   const pkg = packageName();
   let pkgJson;
@@ -98,21 +130,107 @@ function resolveBinary() {
     pkgJson = require.resolve(`${pkg}/package.json`, { paths: [__dirname] });
   } catch (error) {
     if (error && error.code === "MODULE_NOT_FOUND") {
-      throw new Error(
-        [
-          `missing peerline platform package ${pkg}.`,
-          "The main peerline npm package no longer bundles a host-specific binary.",
-          "Install again after the matching platform package has been published, or build from source with cargo.",
-        ].join(" ")
-      );
+      return null;
     }
     throw error;
   }
   const candidate = path.join(path.dirname(pkgJson), "bin", binaryName());
-  if (!fs.existsSync(candidate)) {
+  if (!fsImpl.existsSync(candidate)) {
     throw new Error(`missing peerline binary in ${pkg}`);
   }
   return candidate;
+}
+
+function downloadToFile(url, destination, deps = {}, redirects = 0) {
+  const httpsImpl = deps.https ?? https;
+  const fsImpl = deps.fs ?? fs;
+  if (redirects > 5) {
+    return Promise.reject(new Error(`too many redirects while downloading ${url}`));
+  }
+
+  return new Promise((resolve, reject) => {
+    const request = httpsImpl.get(
+      url,
+      {
+        headers: {
+          "User-Agent": `peerline-npm/${packageVersion(fsImpl)}`,
+        },
+      },
+      (response) => {
+        if (
+          response.statusCode >= 300 &&
+          response.statusCode < 400 &&
+          response.headers.location
+        ) {
+          response.resume();
+          downloadToFile(new URL(response.headers.location, url).toString(), destination, deps, redirects + 1)
+            .then(resolve, reject);
+          return;
+        }
+
+        if (response.statusCode !== 200) {
+          response.resume();
+          reject(new Error(`download failed with HTTP ${response.statusCode}: ${url}`));
+          return;
+        }
+
+        const output = fsImpl.createWriteStream(destination, { mode: 0o755 });
+        output.on("error", reject);
+        response.on("error", reject);
+        output.on("finish", () => output.close(resolve));
+        response.pipe(output);
+      }
+    );
+    request.on("error", reject);
+    request.setTimeout(60_000, () => {
+      request.destroy(new Error(`timed out downloading ${url}`));
+    });
+  });
+}
+
+async function downloadReleaseBinary(deps = {}) {
+  const fsImpl = deps.fs ?? fs;
+  const osImpl = deps.os ?? os;
+  const env = deps.env ?? process.env;
+  const version = packageVersion(fsImpl);
+  const binaryPath = cachedBinaryPath(version, env, osImpl);
+
+  if (fsImpl.existsSync(binaryPath)) {
+    ensureExecutable(binaryPath, fsImpl);
+    return binaryPath;
+  }
+
+  const dir = path.dirname(binaryPath);
+  fsImpl.mkdirSync(dir, { recursive: true });
+  const tempPath = path.join(dir, `.download-${process.pid}-${Date.now()}`);
+  const url = releaseAssetUrl(version, env);
+
+  try {
+    await downloadToFile(url, tempPath, deps);
+    if (process.platform !== "win32") {
+      fsImpl.chmodSync(tempPath, 0o755);
+    }
+    fsImpl.renameSync(tempPath, binaryPath);
+    ensureExecutable(binaryPath, fsImpl);
+    return binaryPath;
+  } catch (error) {
+    try {
+      fsImpl.rmSync(tempPath, { force: true });
+    } catch {
+      // Ignore cleanup failures; the download error below is the useful one.
+    }
+    throw new Error(
+      [
+        `missing local peerline binary and could not download ${releaseAssetName()} from ${url}.`,
+        error.message,
+        "Install from source with cargo, or retry when the GitHub release asset is available.",
+      ].join(" ")
+    );
+  }
+}
+
+async function resolveBinary(deps = {}) {
+  return resolvePackagedBinary(deps.fs ?? fs) || downloadReleaseBinary(deps);
 }
 
 function executeBinary(binaryPath, argv = process.argv.slice(2), deps = {}) {
@@ -172,18 +290,24 @@ function executeBinary(binaryPath, argv = process.argv.slice(2), deps = {}) {
   }
 }
 
-function main(argv = process.argv.slice(2), deps = {}) {
-  const result = executeBinary(resolveBinary(), argv, deps);
+async function main(argv = process.argv.slice(2), deps = {}) {
+  const result = executeBinary(await resolveBinary(deps), argv, deps);
   process.exit(result.status ?? 1);
 }
 
 if (require.main === module) {
-  main();
+  main().catch((error) => {
+    console.error(error.message);
+    process.exit(1);
+  });
 }
 
 module.exports = {
   binaryName,
+  cachedBinaryPath,
+  cacheRoot,
   detectLibc,
+  downloadReleaseBinary,
   ensureExecutable,
   executeBinary,
   copyBinaryToTemporaryLocation,
@@ -191,5 +315,10 @@ module.exports = {
   isRetryableExecutionError,
   main,
   packageName,
+  packageVersion,
+  releaseAssetName,
+  releaseAssetUrl,
+  releaseDownloadBaseUrl,
+  resolvePackagedBinary,
   resolveBinary,
 };

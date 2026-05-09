@@ -1,5 +1,6 @@
 target/
 npm/bin/
+dist/
 node_modules/
 .tgz
 .DS_Store

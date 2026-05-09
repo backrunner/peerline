@@ -16,7 +16,8 @@
   ],
   "scripts": {
     "build": "cargo build --release -p peerline-cli",
-    "lint": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && node --check npm/peerline.js && node --check npm/release.js && node --check npm/release-alpha.js && node --check npm/peerline.test.js && node --check npm/release.test.js",
+    "build:platform-asset": "node npm/build-platform-asset.js",
+    "lint": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && node --check npm/peerline.js && node --check npm/release.js && node --check npm/release-alpha.js && node --check npm/build-platform-asset.js && node --check npm/prepack.js && node --check npm/peerline.test.js && node --check npm/release.test.js",
     "prepack": "node npm/prepack.js",
     "release:alpha": "node npm/release.js --channel=alpha",
     "release:beta": "node npm/release.js --channel=beta",
@@ -29,15 +30,6 @@
   },
   "publishConfig": {
     "access": "public"
-  },
-  "optionalDependencies": {
-    "peerline-darwin-arm64": "0.1.0-alpha.5",
-    "peerline-darwin-x64": "0.1.0-alpha.5",
-    "peerline-linux-arm64-gnu": "0.1.0-alpha.5",
-    "peerline-linux-arm64-musl": "0.1.0-alpha.5",
-    "peerline-linux-x64-gnu": "0.1.0-alpha.5",
-    "peerline-linux-x64-musl": "0.1.0-alpha.5",
-    "peerline-win32-x64-msvc": "0.1.0-alpha.5"
   },
   "license": "Apache-2.0"
 }

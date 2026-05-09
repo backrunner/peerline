@@ -309,18 +309,21 @@ function assertAlphaVersion(version) {
 }
 
 function setPlatformDependencyVersions(packageJson, version) {
-  const optionalDependencies = {
-    ...(packageJson.optionalDependencies || {}),
-  };
+  const optionalDependencies = { ...(packageJson.optionalDependencies || {}) };
 
   for (const name of platformPackageNames) {
-    optionalDependencies[name] = version;
+    delete optionalDependencies[name];
   }
 
-  return {
+  const next = {
     ...packageJson,
-    optionalDependencies,
   };
+  if (Object.keys(optionalDependencies).length > 0) {
+    next.optionalDependencies = optionalDependencies;
+  } else {
+    delete next.optionalDependencies;
+  }
+  return next;
 }
 
 function run(command, args, options = {}) {

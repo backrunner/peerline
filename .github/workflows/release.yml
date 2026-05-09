@@ -21,7 +21,7 @@ on:
         type: boolean
         default: false
       github_release:
-        description: "Create a GitHub release after npm publish."
+        description: "Create a GitHub release before npm publish."
         required: true
         type: boolean
         default: true
@@ -37,10 +37,10 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "24"
 
@@ -59,12 +59,11 @@ jobs:
       - name: Dry-run main package
         run: npm pack --dry-run --json
 
-  publish-platform:
+  build-platform:
     name: Platform ${{ matrix.package }}
     needs: validate
     permissions:
       contents: read
-      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -100,10 +99,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "24"
 
@@ -132,11 +131,9 @@ jobs:
             exit 1
           fi
 
-      - name: Publish or dry-run platform package
+      - name: Build platform release asset
         shell: bash
         env:
-          SHOULD_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.publish) || '' }}
-          RELEASE_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || '' }}
           PEERLINE_PLATFORM_PACKAGE: ${{ matrix.package }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
@@ -144,48 +141,34 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           set -euo pipefail
-          should_publish="${SHOULD_PUBLISH:-}"
-          if [ -z "$should_publish" ]; then
-            should_publish=true
-          fi
+          npm run build:platform-asset -- --platform-package="$PEERLINE_PLATFORM_PACKAGE"
 
-          release_channel="${RELEASE_CHANNEL:-}"
-          if [ -z "$release_channel" ]; then
-            version="$(node -p "require('./package.json').version")"
-            case "$version" in
-              *-alpha.*) release_channel=alpha ;;
-              *-beta.*) release_channel=beta ;;
-              *) release_channel=stable ;;
-            esac
-          fi
-
-          flags=(--current --platform-only --skip-tests --no-commit)
-          flags+=(--platform-package="$PEERLINE_PLATFORM_PACKAGE")
-          if [ "$should_publish" = "true" ]; then
-            flags+=(--ignore-existing)
-          else
-            flags+=(--no-publish)
-          fi
-          npm run "release:$release_channel" -- "${flags[@]}"
+      - name: Upload platform asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}
+          path: dist/*
+          if-no-files-found: error
 
   publish-main:
     name: Main package
-    needs: publish-platform
+    needs:
+      - build-platform
+      - github-release
+    if: ${{ always() && needs['build-platform'].result == 'success' && (needs['github-release'].result == 'success' || needs['github-release'].result == 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "24"
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+          registry-url: "https://registry.npmjs.org"
 
       - name: Publish or dry-run main package
         shell: bash
@@ -219,14 +202,20 @@ jobs:
 
   github-release:
     name: GitHub release
-    needs: publish-main
+    needs: build-platform
     if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish && inputs.github_release) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Download platform assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-assets
+          merge-multiple: true
 
       - name: Create GitHub release
         shell: bash
@@ -242,13 +231,12 @@ jobs:
             *-beta.*) release_channel=beta ;;
           esac
 
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "GitHub release $tag already exists; skipping."
-            exit 0
-          fi
-
           args=(release create "$tag" --title "Peerline $version" --generate-notes)
           if [ "$release_channel" != "stable" ]; then
             args+=(--prerelease)
           fi
-          gh "${args[@]}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist-assets/* --clobber
+          else
+            gh "${args[@]}" dist-assets/*
+          fi

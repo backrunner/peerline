@@ -152,12 +152,16 @@ test("workspace package list covers every local crate in Cargo.lock", () => {
   ]);
 });
 
-test("setPlatformDependencyVersions pins every platform package to the release version", () => {
-  const packageJson = setPlatformDependencyVersions({ optionalDependencies: {} }, "0.1.0-alpha.2");
+test("setPlatformDependencyVersions removes npm platform packages for release-asset distribution", () => {
+  const packageJson = setPlatformDependencyVersions({
+    optionalDependencies: {
+      "peerline-darwin-arm64": "0.1.0-alpha.1",
+      "left-pad": "1.3.0",
+    },
+  }, "0.1.0-alpha.2");
 
-  for (const name of platformPackageNames) {
-    assert.equal(packageJson.optionalDependencies[name], "0.1.0-alpha.2");
-  }
+  assert.equal(packageJson.optionalDependencies["peerline-darwin-arm64"], undefined);
+  assert.equal(packageJson.optionalDependencies["left-pad"], "1.3.0");
 });
 
 test("platformPackageInfo resolves names to host package metadata", () => {

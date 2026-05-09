@@ -10,4 +10,4 @@ if (fs.existsSync(bundledBinaryDir)) {
   fs.rmSync(bundledBinaryDir, { recursive: true, force: true });
 }
 
-console.log("peerline main package uses platform optional dependencies; no host binary is bundled.");
+console.log("peerline main package downloads platform binaries from GitHub releases; no host binary is bundled.");
