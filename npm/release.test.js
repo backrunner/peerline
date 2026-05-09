@@ -1,6 +1,8 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
 
 const {
@@ -15,6 +17,7 @@ const {
   platformPackageInfo,
   platformPackageNames,
   platformPackageSpecs,
+  repository,
   setCargoLockVersion,
   setCargoWorkspaceVersion,
   setPlatformDependencyVersions,
@@ -127,6 +130,13 @@ test("platform package specs expose publish-time build metadata", () => {
   assert.equal(platformPackageSpecs["peerline-linux-arm64-musl"].cargoTarget, "aarch64-unknown-linux-musl");
   assert.equal(platformPackageSpecs["peerline-linux-x64-musl"].libcField[0], "musl");
   assert.equal(platformPackageSpecs["peerline-linux-arm64-gnu"].libcField[0], "glibc");
+});
+
+test("trusted publishing keeps GitHub repository metadata aligned", () => {
+  const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
+
+  assert.deepEqual(packageJson.repository, repository);
+  assert.equal(packageJson.repository.url, "https://github.com/peerline/peerline");
 });
 
 test("workspace package list covers every local crate in Cargo.lock", () => {

@@ -41,9 +41,10 @@ publishes the main `peerline` shim. It runs `npm run lint` and `npm test` before
 
 GitHub Actions has a manual `Release Packages` workflow that does this for native runners:
 Linux x64 glibc, Linux arm64 glibc, Linux x64 musl, Linux arm64 musl, macOS arm64, macOS x64, and
-Windows x64. Add an npm automation token as the `NPM_TOKEN` repository secret, run the workflow
-once with `publish=false` for a dry run, then rerun with `publish=true`. The workflow can publish
-`alpha`, `beta`, or `stable`, and can create a GitHub release after npm publish.
+Windows x64. Configure the package as a GitHub Actions trusted publisher in npm, then run the
+workflow once with `publish=false` for a dry run and rerun with `publish=true`. The workflow can
+publish `alpha`, `beta`, or `stable`, and can create a GitHub release after npm publish. No
+`NPM_TOKEN` secret is needed.
 
 If a publish attempt fails after the version bump commit, retry the current version:
 

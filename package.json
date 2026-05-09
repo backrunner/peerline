@@ -2,6 +2,10 @@
   "name": "peerline",
   "version": "0.1.0-alpha.2",
   "description": "P2P post-quantum encrypted file transfer CLI",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/peerline/peerline"
+  },
   "bin": {
     "peerline": "npm/peerline.js"
   },

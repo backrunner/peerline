@@ -8,6 +8,10 @@ const path = require("node:path");
 const { detectLibc, packageName } = require("./peerline.js");
 
 const repoRoot = path.resolve(__dirname, "..");
+const repository = {
+  type: "git",
+  url: "https://github.com/peerline/peerline",
+};
 const packageJsonPath = path.join(repoRoot, "package.json");
 const cargoTomlPath = path.join(repoRoot, "Cargo.toml");
 const cargoLockPath = path.join(repoRoot, "Cargo.lock");
@@ -484,7 +488,7 @@ function preparePlatformPackage(version, options = {}) {
     version,
     description: `Peerline binary for ${info.platform}-${info.arch}${info.platform === "linux" ? `-${info.libc}` : ""}`,
     license: "Apache-2.0",
-    repository: "https://github.com/peerline/peerline",
+    repository,
     os: [info.platform],
     cpu: [info.arch],
     files: ["bin"],
@@ -649,6 +653,7 @@ module.exports = {
   normalizeChannel,
   parseVersion,
   parseArgs,
+  repository,
   platformPackageInfo,
   platformPackageNames,
   platformPackageSpecs,
