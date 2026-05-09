@@ -37,6 +37,11 @@ The release script publishes an unscoped platform binary package for the current
 In CI, run `--platform-only --current` on each platform first, then run `--main-only --current`
 after the platform packages are available.
 
+GitHub Actions has a manual `Release Alpha` workflow that does this for the native runners we can
+trust for npm binaries: Linux x64 glibc, macOS arm64, macOS x64, and Windows x64. Add an npm
+automation token as the `NPM_TOKEN` repository secret, run the workflow once with `publish=false`
+for a dry run, then rerun with `publish=true`.
+
 If a publish attempt fails after the version bump commit, retry the current version:
 
 ```sh

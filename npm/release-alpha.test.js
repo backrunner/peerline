@@ -63,12 +63,21 @@ test("cargo lock version replacement touches only workspace packages", () => {
 });
 
 test("parseArgs supports publish options and current-version retries", () => {
-  const options = parseArgs(["--current", "--otp", "123456", "--tag=alpha", "--access", "public"]);
+  const options = parseArgs([
+    "--current",
+    "--otp",
+    "123456",
+    "--tag=alpha",
+    "--access",
+    "public",
+    "--ignore-existing",
+  ]);
 
   assert.equal(options.current, true);
   assert.equal(options.otp, "123456");
   assert.equal(options.tag, "alpha");
   assert.equal(options.access, "public");
+  assert.equal(options.ignoreExisting, true);
 });
 
 test("parseArgs rejects mutually exclusive version selectors", () => {

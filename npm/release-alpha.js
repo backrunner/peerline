@@ -42,6 +42,7 @@ function usage() {
     "  --access <access>     npm package access. Defaults to public.",
     "  --main-only           Publish only the main JS shim package.",
     "  --platform-only       Publish only the current platform binary package.",
+    "  --ignore-existing     Treat already-published package versions as success.",
     "  --skip-tests          Skip npm test before publishing.",
     "  --no-publish          Bump, verify, and optionally commit without npm publish.",
     "  --no-commit           Do not create the release bump commit.",
@@ -59,6 +60,7 @@ function parseArgs(argv) {
     otp: process.env.NPM_CONFIG_OTP || "",
     publish: true,
     publishTarget: "both",
+    ignoreExisting: false,
     skipTests: false,
     tag: "alpha",
     version: "",
@@ -93,6 +95,8 @@ function parseArgs(argv) {
       options.publishTarget = "main";
     } else if (arg === "--platform-only") {
       options.publishTarget = "platform";
+    } else if (arg === "--ignore-existing") {
+      options.ignoreExisting = true;
     } else if (arg === "--current") {
       options.current = true;
     } else if (arg === "--skip-tests") {
@@ -348,6 +352,11 @@ function preparePlatformPackage(version) {
 }
 
 function publishMainPackage(version, options) {
+  if (options.ignoreExisting && npmPackageExists("peerline", version)) {
+    console.log(`peerline@${version} already exists; skipping publish.`);
+    return;
+  }
+
   const args = ["publish", "--tag", options.tag, "--access", options.access];
   if (options.otp) {
     args.push(`--otp=${options.otp}`);
@@ -359,12 +368,26 @@ function publishMainPackage(version, options) {
   }
 }
 
+function npmPackageExists(name, version) {
+  const result = spawnSync("npm", ["view", `${name}@${version}`, "version"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    stdio: "pipe",
+  });
+
+  return result.status === 0 && result.stdout.trim() === version;
+}
+
 function publishPlatformPackage(platformPackage, options) {
   const packArgs = ["pack", "--dry-run", "--json", platformPackage.packageDir];
   run("npm", packArgs);
 
   if (!options.publish) {
     console.log(`Skipping npm publish for ${platformPackage.name}@${platformPackage.version}.`);
+    return;
+  }
+  if (options.ignoreExisting && npmPackageExists(platformPackage.name, platformPackage.version)) {
+    console.log(`${platformPackage.name}@${platformPackage.version} already exists; skipping publish.`);
     return;
   }
 
@@ -466,6 +489,7 @@ module.exports = {
   parseArgs,
   platformPackageNames,
   release,
+  npmPackageExists,
   setCargoWorkspaceVersion,
   setCargoLockVersion,
   setPlatformDependencyVersions,

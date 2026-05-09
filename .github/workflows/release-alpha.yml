@@ -1,0 +1,122 @@
+name: Release Alpha
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to npm. Leave false for a full dry run."
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: npm test
+
+      - name: Dry-run main package
+        run: npm pack --dry-run --json
+
+  publish-platform:
+    name: Platform ${{ matrix.package }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: peerline-linux-x64-gnu
+            os: ubuntu-24.04
+          - package: peerline-darwin-arm64
+            os: macos-14
+          - package: peerline-darwin-x64
+            os: macos-13
+          - package: peerline-win32-x64-msvc
+            os: windows-2022
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify platform package name
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(node -e "const shim = require('./npm/peerline.js'); process.stdout.write(shim.packageName())")"
+          expected="${{ matrix.package }}"
+          if [ "$actual" != "$expected" ]; then
+            echo "Expected $expected but runner resolves to $actual" >&2
+            exit 1
+          fi
+
+      - name: Publish or dry-run platform package
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          SHOULD_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          flags=(--current --platform-only --skip-tests --no-commit)
+          if [ "$SHOULD_PUBLISH" = "true" ]; then
+            flags+=(--ignore-existing)
+          else
+            flags+=(--no-publish)
+          fi
+          npm run release:alpha -- "${flags[@]}"
+
+  publish-main:
+    name: Main package
+    needs: publish-platform
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish or dry-run main package
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          SHOULD_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          flags=(--current --main-only --skip-tests --no-commit)
+          if [ "$SHOULD_PUBLISH" = "true" ]; then
+            flags+=(--ignore-existing)
+          else
+            flags+=(--no-publish)
+          fi
+          npm run release:alpha -- "${flags[@]}"
