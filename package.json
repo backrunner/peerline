@@ -26,8 +26,7 @@
     "smoke": "node npm/peerline.js --version"
   },
   "publishConfig": {
-    "access": "public",
-    "tag": "alpha"
+    "access": "public"
   },
   "optionalDependencies": {
     "peerline-darwin-arm64": "0.1.0-alpha.2",

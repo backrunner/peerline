@@ -137,6 +137,7 @@ test("trusted publishing keeps GitHub repository metadata aligned", () => {
 
   assert.deepEqual(packageJson.repository, repository);
   assert.equal(packageJson.repository.url, "https://github.com/peerline/peerline");
+  assert.equal(packageJson.publishConfig?.tag, undefined);
 });
 
 test("workspace package list covers every local crate in Cargo.lock", () => {
