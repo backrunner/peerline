@@ -1,11 +1,37 @@
 use super::{Libp2pRecvOptions, Libp2pSendOptions, recv_libp2p, send_libp2p};
 use crate::discovery::{DiscoveryConfig, RouteKind};
+use futures::StreamExt;
+use libp2p::{multiaddr::Protocol, swarm::SwarmEvent};
 use peerline_core::{Compression, HumanCode, HumanName};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
 use tokio::time;
+
+async fn spawn_bootstrap_peer() -> (String, tokio::task::JoinHandle<()>) {
+    let mut swarm = super::behaviour::build_receiver_swarm(false).await.unwrap();
+    swarm
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
+
+    let listen_addr = loop {
+        if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+            break address;
+        }
+    };
+
+    let peer_id = *swarm.local_peer_id();
+    let bootstrap_addr = listen_addr.with(Protocol::P2p(peer_id)).to_string();
+    let handle = tokio::spawn(async move {
+        let mut swarm = swarm;
+        loop {
+            let _ = swarm.select_next_some().await;
+        }
+    });
+
+    (bootstrap_addr, handle)
+}
 
 #[tokio::test]
 async fn libp2p_roundtrip_works_without_direct_endpoints() {
@@ -18,13 +44,14 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
 
     let name = HumanName::parse("river-mango-42").unwrap();
     let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+    let (bootstrap_peer, bootstrap_handle) = spawn_bootstrap_peer().await;
     let discovery = DiscoveryConfig {
         min_candidate_diversity: 1,
-        lookup_timeout: Duration::from_secs(20),
-        enable_mdns: true,
+        lookup_timeout: Duration::from_secs(5),
+        enable_mdns: false,
         allow_loopback_endpoints: false,
         allow_relay_data_fallback: false,
-        bootstrap_peers: Vec::new(),
+        bootstrap_peers: vec![bootstrap_peer],
     };
 
     let recv_task = tokio::spawn(recv_libp2p(Libp2pRecvOptions {
@@ -37,20 +64,25 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
         events: None,
     }));
 
-    time::sleep(Duration::from_secs(2)).await;
-
-    let candidates = crate::discovery::discover_peer_candidates(&name, &code, discovery.clone())
-        .await
-        .unwrap();
-    let candidate = candidates
-        .into_iter()
-        .find(|candidate| {
-            !matches!(
-                candidate.route,
-                RouteKind::LanDirect | RouteKind::PublicDirect
-            )
-        })
-        .expect("expected a libp2p candidate");
+    let candidate = time::timeout(Duration::from_secs(30), async {
+        loop {
+            let candidates =
+                crate::discovery::discover_peer_candidates(&name, &code, discovery.clone())
+                    .await
+                    .unwrap();
+            if let Some(candidate) = candidates.into_iter().find(|candidate| {
+                !matches!(
+                    candidate.route,
+                    RouteKind::LanDirect | RouteKind::PublicDirect
+                )
+            }) {
+                break candidate;
+            }
+            time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("expected a libp2p candidate within timeout");
 
     let peer_id = candidate.peer_id.parse().unwrap();
     let addresses = candidate
@@ -72,6 +104,8 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
     .await
     .unwrap();
     let received = recv_task.await.unwrap().unwrap();
+    bootstrap_handle.abort();
+    let _ = bootstrap_handle.await;
     assert_eq!(
         std::fs::read_to_string(dst_dir.join("hello.txt")).unwrap(),
         "hello libp2p"
