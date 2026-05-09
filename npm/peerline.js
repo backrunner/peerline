@@ -6,14 +6,25 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-function packageName() {
-  const platform = process.platform;
-  const arch = process.arch;
-  if (platform === "darwin" && arch === "arm64") return "@peerline/peerline-darwin-arm64";
-  if (platform === "darwin" && arch === "x64") return "@peerline/peerline-darwin-x64";
-  if (platform === "linux" && arch === "x64") return "@peerline/peerline-linux-x64-gnu";
-  if (platform === "linux" && arch === "arm64") return "@peerline/peerline-linux-arm64-musl";
-  if (platform === "win32" && arch === "x64") return "@peerline/peerline-win32-x64-msvc";
+function detectLibc(reportGetter = () => process.report?.getReport?.()) {
+  if (process.platform !== "linux") {
+    return "";
+  }
+
+  try {
+    const report = reportGetter();
+    return report?.header?.glibcVersionRuntime ? "gnu" : "musl";
+  } catch {
+    return "gnu";
+  }
+}
+
+function packageName(platform = process.platform, arch = process.arch, libc = detectLibc()) {
+  if (platform === "darwin" && arch === "arm64") return "peerline-darwin-arm64";
+  if (platform === "darwin" && arch === "x64") return "peerline-darwin-x64";
+  if (platform === "linux" && arch === "x64") return `peerline-linux-x64-${libc === "musl" ? "musl" : "gnu"}`;
+  if (platform === "linux" && arch === "arm64") return `peerline-linux-arm64-${libc === "musl" ? "musl" : "gnu"}`;
+  if (platform === "win32" && arch === "x64") return "peerline-win32-x64-msvc";
   throw new Error(`unsupported platform: ${platform} ${arch}`);
 }
 
@@ -75,9 +86,6 @@ function formatExecutionFallbackError(binaryPath, primaryCode, fallbackCode, fal
 }
 
 function resolveBinary() {
-  const bundledBinary = path.join(__dirname, "bin", binaryName());
-  if (fs.existsSync(bundledBinary)) return bundledBinary;
-
   const localRelease = path.join(__dirname, "..", "target", "release", binaryName());
   if (fs.existsSync(localRelease)) return localRelease;
 
@@ -85,7 +93,21 @@ function resolveBinary() {
   if (fs.existsSync(localDebug)) return localDebug;
 
   const pkg = packageName();
-  const pkgJson = require.resolve(`${pkg}/package.json`, { paths: [__dirname] });
+  let pkgJson;
+  try {
+    pkgJson = require.resolve(`${pkg}/package.json`, { paths: [__dirname] });
+  } catch (error) {
+    if (error && error.code === "MODULE_NOT_FOUND") {
+      throw new Error(
+        [
+          `missing peerline platform package ${pkg}.`,
+          "The main peerline npm package no longer bundles a host-specific binary.",
+          "Install again after the matching platform package has been published, or build from source with cargo.",
+        ].join(" ")
+      );
+    }
+    throw error;
+  }
   const candidate = path.join(path.dirname(pkgJson), "bin", binaryName());
   if (!fs.existsSync(candidate)) {
     throw new Error(`missing peerline binary in ${pkg}`);
@@ -161,6 +183,7 @@ if (require.main === module) {
 
 module.exports = {
   binaryName,
+  detectLibc,
   ensureExecutable,
   executeBinary,
   copyBinaryToTemporaryLocation,

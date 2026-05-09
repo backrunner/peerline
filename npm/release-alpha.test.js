@@ -8,7 +8,9 @@ const {
   cargoWorkspaceVersion,
   nextAlphaVersion,
   parseArgs,
+  platformPackageNames,
   setCargoWorkspaceVersion,
+  setPlatformDependencyVersions,
 } = require("./release-alpha.js");
 
 test("nextAlphaVersion increments the alpha prerelease number", () => {
@@ -48,4 +50,18 @@ test("parseArgs supports publish options and current-version retries", () => {
 
 test("parseArgs rejects mutually exclusive version selectors", () => {
   assert.throws(() => parseArgs(["--current", "--version", "0.1.0-alpha.2"]));
+});
+
+test("platform package names do not require a private npm scope", () => {
+  assert.ok(platformPackageNames.includes("peerline-linux-x64-gnu"));
+  assert.ok(platformPackageNames.includes("peerline-darwin-arm64"));
+  assert.equal(platformPackageNames.some((name) => name.startsWith("@peerline/")), false);
+});
+
+test("setPlatformDependencyVersions pins every platform package to the release version", () => {
+  const packageJson = setPlatformDependencyVersions({ optionalDependencies: {} }, "0.1.0-alpha.2");
+
+  for (const name of platformPackageNames) {
+    assert.equal(packageJson.optionalDependencies[name], "0.1.0-alpha.2");
+  }
 });

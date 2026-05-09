@@ -3,12 +3,23 @@
 
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
+const { binaryName, detectLibc, packageName } = require("./peerline.js");
 
 const repoRoot = path.resolve(__dirname, "..");
 const packageJsonPath = path.join(repoRoot, "package.json");
 const cargoTomlPath = path.join(repoRoot, "Cargo.toml");
 const cargoLockPath = path.join(repoRoot, "Cargo.lock");
+const platformPackageNames = [
+  "peerline-darwin-arm64",
+  "peerline-darwin-x64",
+  "peerline-linux-arm64-gnu",
+  "peerline-linux-arm64-musl",
+  "peerline-linux-x64-gnu",
+  "peerline-linux-x64-musl",
+  "peerline-win32-x64-msvc",
+];
 
 function usage() {
   return [
@@ -20,6 +31,8 @@ function usage() {
     "  --otp <code>          npm two-factor one-time password.",
     "  --tag <tag>           npm dist-tag. Defaults to alpha.",
     "  --access <access>     npm package access. Defaults to public.",
+    "  --main-only           Publish only the main JS shim package.",
+    "  --platform-only       Publish only the current platform binary package.",
     "  --skip-tests          Skip npm test before publishing.",
     "  --no-publish          Bump, verify, and optionally commit without npm publish.",
     "  --no-commit           Do not create the release bump commit.",
@@ -36,6 +49,7 @@ function parseArgs(argv) {
     current: false,
     otp: process.env.NPM_CONFIG_OTP || "",
     publish: true,
+    publishTarget: "both",
     skipTests: false,
     tag: "alpha",
     version: "",
@@ -66,6 +80,10 @@ function parseArgs(argv) {
       options.tag = readValue("--tag");
     } else if (arg === "--access" || arg.startsWith("--access=")) {
       options.access = readValue("--access");
+    } else if (arg === "--main-only") {
+      options.publishTarget = "main";
+    } else if (arg === "--platform-only") {
+      options.publishTarget = "platform";
     } else if (arg === "--current") {
       options.current = true;
     } else if (arg === "--skip-tests") {
@@ -125,6 +143,21 @@ function assertAlphaVersion(version) {
   }
 }
 
+function setPlatformDependencyVersions(packageJson, version) {
+  const optionalDependencies = {
+    ...(packageJson.optionalDependencies || {}),
+  };
+
+  for (const name of platformPackageNames) {
+    optionalDependencies[name] = version;
+  }
+
+  return {
+    ...packageJson,
+    optionalDependencies,
+  };
+}
+
 function run(command, args, options = {}) {
   console.log(`$ ${[command, ...args].join(" ")}`);
   const result = spawnSync(command, args, {
@@ -173,10 +206,13 @@ function currentVersions() {
 }
 
 function setProjectVersion(version, versions = currentVersions()) {
-  const nextPackageJson = {
-    ...versions.packageJson,
-    version,
-  };
+  const nextPackageJson = setPlatformDependencyVersions(
+    {
+      ...versions.packageJson,
+      version,
+    },
+    version
+  );
 
   writeJson(packageJsonPath, nextPackageJson);
   fs.writeFileSync(cargoTomlPath, setCargoWorkspaceVersion(versions.cargoToml, version));
@@ -218,7 +254,69 @@ function commitRelease(version) {
   ]);
 }
 
-function publish(version, options) {
+function currentPlatformPackage(version) {
+  const platform = process.platform;
+  const arch = process.arch;
+  const libc = detectLibc();
+  const name = packageName(platform, arch, libc);
+  const libcField = platform === "linux" ? [libc === "musl" ? "musl" : "glibc"] : undefined;
+
+  return {
+    arch,
+    libc,
+    libcField,
+    name,
+    platform,
+    version,
+  };
+}
+
+function preparePlatformPackage(version) {
+  const info = currentPlatformPackage(version);
+  run("cargo", ["build", "--release", "-p", "peerline-cli"]);
+
+  const packageDir = fs.mkdtempSync(path.join(os.tmpdir(), "peerline-platform-package-"));
+  const binDir = path.join(packageDir, "bin");
+  const source = path.join(repoRoot, "target", "release", binaryName());
+  const destination = path.join(binDir, binaryName());
+
+  if (!fs.existsSync(source)) {
+    throw new Error(`missing release binary: ${source}`);
+  }
+
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.copyFileSync(source, destination);
+  if (process.platform !== "win32") {
+    fs.chmodSync(destination, 0o755);
+  }
+
+  const packageJson = {
+    name: info.name,
+    version,
+    description: `Peerline binary for ${info.platform}-${info.arch}${info.platform === "linux" ? `-${info.libc}` : ""}`,
+    license: "Apache-2.0",
+    repository: "https://github.com/peerline/peerline",
+    os: [info.platform],
+    cpu: [info.arch],
+    files: ["bin"],
+  };
+
+  if (info.libcField) {
+    packageJson.libc = info.libcField;
+  }
+
+  writeJson(path.join(packageDir, "package.json"), packageJson);
+
+  return {
+    ...info,
+    packageDir,
+    cleanup() {
+      fs.rmSync(packageDir, { recursive: true, force: true });
+    },
+  };
+}
+
+function publishMainPackage(version, options) {
   const args = ["publish", "--tag", options.tag, "--access", options.access];
   if (options.otp) {
     args.push(`--otp=${options.otp}`);
@@ -228,6 +326,35 @@ function publish(version, options) {
   if (publishedVersion !== version) {
     throw new Error(`published version verification failed: expected ${version}, got ${publishedVersion}`);
   }
+}
+
+function publishPlatformPackage(platformPackage, options) {
+  const packArgs = ["pack", "--dry-run", "--json", platformPackage.packageDir];
+  run("npm", packArgs);
+
+  if (!options.publish) {
+    console.log(`Skipping npm publish for ${platformPackage.name}@${platformPackage.version}.`);
+    return;
+  }
+
+  const publishArgs = ["publish", platformPackage.packageDir, "--tag", options.tag, "--access", options.access];
+  if (options.otp) {
+    publishArgs.push(`--otp=${options.otp}`);
+  }
+  run("npm", publishArgs);
+
+  const publishedVersion = run("npm", ["view", `${platformPackage.name}@${platformPackage.version}`, "version"], {
+    capture: true,
+  }).trim();
+  if (publishedVersion !== platformPackage.version) {
+    throw new Error(
+      `platform package verification failed: expected ${platformPackage.version}, got ${publishedVersion}`
+    );
+  }
+}
+
+function targetIncludes(options, target) {
+  return options.publishTarget === "both" || options.publishTarget === target;
 }
 
 function release(argv = process.argv.slice(2)) {
@@ -258,17 +385,37 @@ function release(argv = process.argv.slice(2)) {
     run("npm", ["test"]);
   }
 
-  run("npm", ["pack", "--dry-run", "--json"]);
-  run("node", ["npm/peerline.js", "--version"]);
+  let platformPackage = null;
+  try {
+    if (targetIncludes(options, "platform")) {
+      platformPackage = preparePlatformPackage(targetVersion);
+      publishPlatformPackage(platformPackage, { ...options, publish: false });
+    }
 
-  if (options.commit) {
-    commitRelease(targetVersion);
-  }
+    if (targetIncludes(options, "main")) {
+      run("npm", ["pack", "--dry-run", "--json"]);
+      run("node", ["-e", "const shim = require('./npm/peerline.js'); console.log(shim.packageName());"]);
+    }
 
-  if (options.publish) {
-    publish(targetVersion, options);
-  } else {
-    console.log(`Skipping npm publish for ${targetVersion}.`);
+    if (options.commit) {
+      commitRelease(targetVersion);
+    }
+
+    if (targetIncludes(options, "platform") && platformPackage) {
+      publishPlatformPackage(platformPackage, options);
+    }
+
+    if (targetIncludes(options, "main")) {
+      if (options.publish) {
+        publishMainPackage(targetVersion, options);
+      } else {
+        console.log(`Skipping npm publish for peerline@${targetVersion}.`);
+      }
+    }
+  } finally {
+    if (platformPackage) {
+      platformPackage.cleanup();
+    }
   }
 }
 
@@ -286,6 +433,8 @@ module.exports = {
   cargoWorkspaceVersion,
   nextAlphaVersion,
   parseArgs,
+  platformPackageNames,
   release,
   setCargoWorkspaceVersion,
+  setPlatformDependencyVersions,
 };

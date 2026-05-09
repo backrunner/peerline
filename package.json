@@ -6,7 +6,6 @@
     "peerline": "npm/peerline.js"
   },
   "files": [
-    "npm/bin",
     "npm/peerline.js",
     "README.md",
     "LICENSE"
@@ -21,6 +20,15 @@
   "publishConfig": {
     "access": "public",
     "tag": "alpha"
+  },
+  "optionalDependencies": {
+    "peerline-darwin-arm64": "0.1.0-alpha.1",
+    "peerline-darwin-x64": "0.1.0-alpha.1",
+    "peerline-linux-arm64-gnu": "0.1.0-alpha.1",
+    "peerline-linux-arm64-musl": "0.1.0-alpha.1",
+    "peerline-linux-x64-gnu": "0.1.0-alpha.1",
+    "peerline-linux-x64-musl": "0.1.0-alpha.1",
+    "peerline-win32-x64-msvc": "0.1.0-alpha.1"
   },
   "license": "Apache-2.0"
 }

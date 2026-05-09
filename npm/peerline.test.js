@@ -7,7 +7,21 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
-const { ensureExecutable, executeBinary } = require("./peerline.js");
+const { detectLibc, ensureExecutable, executeBinary, packageName } = require("./peerline.js");
+
+test("packageName uses unscoped platform packages", () => {
+  assert.equal(packageName("darwin", "arm64"), "peerline-darwin-arm64");
+  assert.equal(packageName("darwin", "x64"), "peerline-darwin-x64");
+  assert.equal(packageName("linux", "x64", "gnu"), "peerline-linux-x64-gnu");
+  assert.equal(packageName("linux", "x64", "musl"), "peerline-linux-x64-musl");
+  assert.equal(packageName("linux", "arm64", "gnu"), "peerline-linux-arm64-gnu");
+  assert.equal(packageName("win32", "x64"), "peerline-win32-x64-msvc");
+});
+
+test("detectLibc distinguishes glibc and musl reports", { skip: process.platform !== "linux" }, () => {
+  assert.equal(detectLibc(() => ({ header: { glibcVersionRuntime: "2.39" } })), "gnu");
+  assert.equal(detectLibc(() => ({ header: {} })), "musl");
+});
 
 test(
   "ensureExecutable restores execute permission for bundled binaries",
