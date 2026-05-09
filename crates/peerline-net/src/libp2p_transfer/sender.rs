@@ -11,17 +11,108 @@ use libp2p::{
     request_response::{Event as RequestResponseEvent, Message as RequestResponseMessage},
     swarm::SwarmEvent,
 };
+use peerline_core::{ConnectionRoute, PeerlineEvent, TransferId, TransferStage};
 use peerline_crypto::{ChunkAead, ClientHandshake, start_client_login};
 use peerline_transfer::create_archive;
 use tokio::io::AsyncReadExt;
 
+fn emit_event(
+    events: &Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
+    event: PeerlineEvent,
+) {
+    if let Some(sender) = events {
+        let _ = sender.send(event);
+    }
+}
+
+fn emit_stage(
+    events: &Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
+    stage: TransferStage,
+) {
+    emit_event(events, PeerlineEvent::StageChanged(stage));
+}
+
+fn emit_message(
+    events: &Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
+    message: impl Into<String>,
+) {
+    emit_event(events, PeerlineEvent::Message(message.into()));
+}
+
+fn emit_transfer_started(
+    events: &Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
+    id: TransferId,
+    peer: impl Into<String>,
+    files: usize,
+    bytes: u64,
+) {
+    emit_event(
+        events,
+        PeerlineEvent::TransferStarted {
+            id,
+            peer: peer.into(),
+            files,
+            bytes,
+        },
+    );
+}
+
+fn emit_progress(
+    events: &Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
+    id: TransferId,
+    bytes_done: u64,
+    bytes_total: u64,
+) {
+    emit_event(
+        events,
+        PeerlineEvent::Progress {
+            id,
+            bytes_done,
+            bytes_total,
+        },
+    );
+}
+
+fn route_label(route: &ConnectionRoute) -> &'static str {
+    match route {
+        ConnectionRoute::LanDirect => "lan-direct",
+        ConnectionRoute::PublicDirect => "public-direct",
+        ConnectionRoute::Libp2pDcutr => "libp2p-dcutr",
+        ConnectionRoute::Libp2pRelay => "libp2p-relay",
+        ConnectionRoute::WebRtcTurn => "webrtc-turn",
+    }
+}
+
 pub(crate) async fn send_libp2p(
     options: Libp2pSendOptions,
 ) -> anyhow::Result<crate::direct::SentTransfer> {
+    emit_message(&options.events, "building archive from selected paths");
     let archive = create_archive(&options.paths, options.compression)?;
+    let transfer_id = TransferId::random();
+    let files = archive
+        .manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.blake3.is_some())
+        .count();
+    let wire_bytes = archive.len();
+    emit_stage(
+        &options.events,
+        TransferStage::Connecting(options.route.clone()),
+    );
+    emit_message(
+        &options.events,
+        format!(
+            "dialing {} via {}",
+            options.peer_id,
+            route_label(&options.route)
+        ),
+    );
+
     let lookup_key =
         peerline_core::NameCode::new(options.name.clone(), options.code.clone()).lookup_key();
     let mut swarm = build_sender_swarm(false).await?;
+    let route_name = route_label(&options.route);
     let transcript = libp2p_transcript(
         &options.name,
         &lookup_key,
@@ -29,6 +120,7 @@ pub(crate) async fn send_libp2p(
         LIBP2P_ROUTE_LABEL,
     );
 
+    emit_stage(&options.events, TransferStage::Authenticating);
     let opaque_client = start_client_login(options.code.as_str().as_bytes())?;
     let client_handshake = ClientHandshake::start();
 
@@ -39,12 +131,7 @@ pub(crate) async fn send_libp2p(
         WireFrame::ClientIntro {
             version: PROTOCOL_VERSION,
             name: Some(options.name.clone()),
-            files: archive
-                .manifest
-                .entries
-                .iter()
-                .filter(|entry| entry.blake3.is_some())
-                .count(),
+            files,
             bytes: archive.len(),
             opaque_request: opaque_client.request.clone(),
             client_hello: client_handshake.hello.clone(),
@@ -80,8 +167,17 @@ pub(crate) async fn send_libp2p(
         other => anyhow::bail!("unexpected libp2p finish response: {other:?}"),
     }
     let aead = ChunkAead::new(session_keys.send_key, *b"pl01");
+    emit_transfer_started(
+        &options.events,
+        transfer_id,
+        options.peer_id.to_string(),
+        files,
+        wire_bytes,
+    );
+    emit_stage(&options.events, TransferStage::Transferring);
     let mut sequence = 0u64;
     let mut archive_reader = tokio::fs::File::from_std(archive.reader()?);
+    let mut bytes_sent = 0u64;
     send_secure_request(
         &mut swarm,
         &options,
@@ -99,6 +195,7 @@ pub(crate) async fn send_libp2p(
         if read == 0 {
             break;
         }
+        bytes_sent += read as u64;
         send_secure_request(
             &mut swarm,
             &options,
@@ -109,6 +206,7 @@ pub(crate) async fn send_libp2p(
             },
         )
         .await?;
+        emit_progress(&options.events, transfer_id, bytes_sent, wire_bytes);
     }
 
     send_secure_request(
@@ -119,15 +217,11 @@ pub(crate) async fn send_libp2p(
         SecureFrame::Done,
     )
     .await?;
+    emit_stage(&options.events, TransferStage::Complete);
 
     Ok(crate::direct::SentTransfer {
-        endpoint: format!("{} via {}", options.peer_id, options.route_label),
-        files: archive
-            .manifest
-            .entries
-            .iter()
-            .filter(|entry| entry.blake3.is_some())
-            .count(),
+        endpoint: format!("{} via {}", options.peer_id, route_name),
+        files,
         bytes: archive.manifest.total_bytes,
     })
 }

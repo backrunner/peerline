@@ -77,7 +77,12 @@ fn direct_tcp_roundtrip_uses_destination_cwd() {
     std::fs::write(src.join("hello.txt"), "hello direct cli").unwrap();
 
     let port = free_port();
-    let mut recv = spawn_recv(&dst, port, false, &[("PEERLINE_BOOTSTRAP", "")]);
+    let mut recv = spawn_recv(
+        &dst,
+        port,
+        false,
+        &[("PEERLINE_BOOTSTRAP", ""), ("PEERLINE_DISABLE_MDNS", "1")],
+    );
     wait_for_port(port, Duration::from_secs(5));
 
     let send = spawn_send(
@@ -115,7 +120,12 @@ fn direct_tcp_respects_overwrite_flag() {
     std::fs::write(dst.join("hello.txt"), "stale").unwrap();
 
     let port = free_port();
-    let mut recv = spawn_recv(&dst, port, true, &[("PEERLINE_BOOTSTRAP", "")]);
+    let mut recv = spawn_recv(
+        &dst,
+        port,
+        true,
+        &[("PEERLINE_BOOTSTRAP", ""), ("PEERLINE_DISABLE_MDNS", "1")],
+    );
     wait_for_port(port, Duration::from_secs(5));
 
     let send = spawn_send(
@@ -154,7 +164,12 @@ fn direct_tcp_roundtrip_directory() {
     std::fs::write(src.join("nested/hello.txt"), "hello folder cli").unwrap();
 
     let port = free_port();
-    let mut recv = spawn_recv(&dst, port, false, &[("PEERLINE_BOOTSTRAP", "")]);
+    let mut recv = spawn_recv(
+        &dst,
+        port,
+        false,
+        &[("PEERLINE_BOOTSTRAP", ""), ("PEERLINE_DISABLE_MDNS", "1")],
+    );
     wait_for_port(port, Duration::from_secs(5));
 
     let send = spawn_send(

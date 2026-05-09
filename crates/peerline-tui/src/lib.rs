@@ -1,14 +1,8 @@
-use peerline_core::{HumanCode, HumanName, PeerlineEvent, TransferStage};
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph},
-};
-use std::{io, time::Duration};
+use peerline_core::{ConnectionRoute, HumanCode, HumanName, PeerlineEvent, TransferStage};
+use ratatui::style::{Color, Modifier, Style};
 use tokio::sync::mpsc::UnboundedReceiver;
+
+mod dashboard;
 
 #[derive(Clone, Debug)]
 pub struct RecvView {
@@ -20,6 +14,50 @@ pub struct RecvView {
     pub progress: Option<(u64, u64)>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SendView {
+    pub target_label: String,
+    pub target: String,
+    pub code: HumanCode,
+    pub route_status: String,
+    pub stage: TransferStage,
+    pub progress: Option<(u64, u64)>,
+}
+
+trait TransferView {
+    fn stage_mut(&mut self) -> &mut TransferStage;
+    fn route_status_mut(&mut self) -> &mut String;
+    fn progress_mut(&mut self) -> &mut Option<(u64, u64)>;
+}
+
+impl TransferView for RecvView {
+    fn stage_mut(&mut self) -> &mut TransferStage {
+        &mut self.stage
+    }
+
+    fn route_status_mut(&mut self) -> &mut String {
+        &mut self.route_status
+    }
+
+    fn progress_mut(&mut self) -> &mut Option<(u64, u64)> {
+        &mut self.progress
+    }
+}
+
+impl TransferView for SendView {
+    fn stage_mut(&mut self) -> &mut TransferStage {
+        &mut self.stage
+    }
+
+    fn route_status_mut(&mut self) -> &mut String {
+        &mut self.route_status
+    }
+
+    fn progress_mut(&mut self) -> &mut Option<(u64, u64)> {
+        &mut self.progress
+    }
+}
+
 impl RecvView {
     pub fn from_events(
         name: HumanName,
@@ -27,93 +65,86 @@ impl RecvView {
         bind: String,
         events: &[PeerlineEvent],
     ) -> Self {
-        let mut stage = TransferStage::Discovering;
-        let mut progress = None;
-        let mut route_status = "direct TCP ready; libp2p discovery publishing".to_string();
-        for event in events {
-            match event {
-                PeerlineEvent::StageChanged(next) => stage = next.clone(),
-                PeerlineEvent::TransferStarted { files, bytes, .. } => {
-                    route_status = format!("{files} file(s), {bytes} bytes");
-                }
-                PeerlineEvent::Progress {
-                    bytes_done,
-                    bytes_total,
-                    ..
-                } => progress = Some((*bytes_done, *bytes_total)),
-                PeerlineEvent::Message(message) => route_status = message.clone(),
-            }
-        }
-        Self {
+        let mut view = Self {
             name,
             code,
             bind,
-            route_status,
-            stage,
-            progress,
-        }
+            route_status: "direct TCP ready; libp2p discovery publishing".to_string(),
+            stage: TransferStage::Discovering,
+            progress: None,
+        };
+        fold_events(&mut view, events);
+        view
+    }
+}
+
+impl SendView {
+    pub fn from_events(
+        target_label: impl Into<String>,
+        target: impl Into<String>,
+        code: HumanCode,
+        route_status: impl Into<String>,
+        events: &[PeerlineEvent],
+    ) -> Self {
+        let mut view = Self {
+            target_label: target_label.into(),
+            target: target.into(),
+            code,
+            route_status: route_status.into(),
+            stage: TransferStage::Discovering,
+            progress: None,
+        };
+        fold_events(&mut view, events);
+        view
     }
 }
 
 pub async fn render_once(
-    mut view: RecvView,
-    mut events: UnboundedReceiver<PeerlineEvent>,
+    view: RecvView,
+    events: UnboundedReceiver<PeerlineEvent>,
 ) -> anyhow::Result<()> {
-    crossterm::terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
-    let _cleanup = TerminalCleanup;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
-
-    loop {
-        terminal.draw(|frame| draw_view(frame, &view))?;
-
-        tokio::select! {
-            maybe_event = events.recv() => {
-                match maybe_event {
-                    Some(event) => {
-                        if apply_event(&mut view, event) {
-                            terminal.draw(|frame| draw_view(frame, &view))?;
-                            break;
-                        }
-                    }
-                    None => {
-                        if matches!(view.stage, TransferStage::Complete | TransferStage::Failed(_)) {
-                            break;
-                        }
-                    }
-                }
-            }
-            _ = tick.tick() => {
-                while crossterm::event::poll(Duration::from_millis(0))? {
-                    if let crossterm::event::Event::Key(key) = crossterm::event::read()?
-                        && matches!(
-                            key.code,
-                            crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc
-                        )
-                    {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
+    render_once_with_quit(view, events, None).await
 }
 
-fn apply_event(view: &mut RecvView, event: PeerlineEvent) -> bool {
+pub async fn render_once_with_quit(
+    view: RecvView,
+    events: UnboundedReceiver<PeerlineEvent>,
+    quit_signal: Option<tokio::sync::watch::Sender<bool>>,
+) -> anyhow::Result<()> {
+    dashboard::run_recv(view, events, quit_signal).await
+}
+
+pub async fn render_send_once(
+    view: SendView,
+    events: UnboundedReceiver<PeerlineEvent>,
+) -> anyhow::Result<()> {
+    render_send_once_with_quit(view, events, None).await
+}
+
+pub async fn render_send_once_with_quit(
+    view: SendView,
+    events: UnboundedReceiver<PeerlineEvent>,
+    quit_signal: Option<tokio::sync::watch::Sender<bool>>,
+) -> anyhow::Result<()> {
+    dashboard::run_send(view, events, quit_signal).await
+}
+
+fn fold_events<T: TransferView>(view: &mut T, events: &[PeerlineEvent]) {
+    for event in events {
+        let _ = apply_event(view, event.clone());
+    }
+}
+
+fn apply_event<T: TransferView>(view: &mut T, event: PeerlineEvent) -> bool {
     match event {
         PeerlineEvent::StageChanged(next) => {
             let done = matches!(next, TransferStage::Complete | TransferStage::Failed(_));
-            view.stage = next;
+            *view.stage_mut() = next;
             done
         }
         PeerlineEvent::TransferStarted { files, bytes, .. } => {
-            view.route_status = format!("{files} file(s), {bytes} bytes");
-            view.progress = Some((0, bytes));
+            *view.route_status_mut() = format!("{files} file(s), {bytes} bytes");
+            *view.progress_mut() = Some((0, bytes));
             false
         }
         PeerlineEvent::Progress {
@@ -121,79 +152,55 @@ fn apply_event(view: &mut RecvView, event: PeerlineEvent) -> bool {
             bytes_total,
             ..
         } => {
-            view.progress = Some((bytes_done, bytes_total));
+            *view.progress_mut() = Some((bytes_done, bytes_total));
             false
         }
         PeerlineEvent::Message(message) => {
-            view.route_status = message;
+            *view.route_status_mut() = message;
             false
         }
     }
 }
 
-fn draw_view(frame: &mut ratatui::Frame<'_>, view: &RecvView) {
-    let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(7),
-            Constraint::Length(5),
-            Constraint::Length(3),
-            Constraint::Min(1),
-        ])
-        .split(area);
-
-    let identity = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("name  ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                view.name.as_str(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("code  ", Style::default().fg(Color::Gray)),
-            Span::styled(view.code.as_str(), Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(vec![
-            Span::styled("listen ", Style::default().fg(Color::Gray)),
-            Span::raw(&view.bind),
-        ]),
-    ])
-    .block(Block::new().title("Peerline recv").borders(Borders::ALL));
-    frame.render_widget(identity, chunks[0]);
-
-    let status = Paragraph::new(vec![
-        Line::from(format!("stage: {:?}", view.stage)),
-        Line::from(format!("route: {}", view.route_status)),
-    ])
-    .block(Block::new().title("Status").borders(Borders::ALL));
-    frame.render_widget(status, chunks[1]);
-
-    let ratio = view
-        .progress
-        .map(|(done, total)| {
-            if total == 0 {
-                0.0
-            } else {
-                done as f64 / total as f64
-            }
-        })
-        .unwrap_or(0.0);
-    let progress = Gauge::default()
-        .block(Block::new().title("Transfer").borders(Borders::ALL))
-        .gauge_style(Style::default().fg(Color::Cyan))
-        .ratio(ratio.clamp(0.0, 1.0));
-    frame.render_widget(progress, chunks[2]);
+fn stage_label(stage: &TransferStage) -> String {
+    match stage {
+        TransferStage::Discovering => "discovering".into(),
+        TransferStage::Connecting(route) => {
+            format!("connecting via {}", connection_route_label(route))
+        }
+        TransferStage::Authenticating => "authenticating".into(),
+        TransferStage::ReceivingManifest => "receiving manifest".into(),
+        TransferStage::Transferring => "transferring".into(),
+        TransferStage::Verifying => "verifying".into(),
+        TransferStage::Complete => "complete".into(),
+        TransferStage::Failed(error) => format!("failed: {error}"),
+    }
 }
 
-struct TerminalCleanup;
+fn stage_style(stage: &TransferStage) -> Style {
+    match stage {
+        TransferStage::Complete => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        TransferStage::Failed(_) => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        TransferStage::Authenticating | TransferStage::Verifying => {
+            Style::default().fg(Color::Yellow)
+        }
+        TransferStage::Transferring => Style::default().fg(Color::Green),
+        TransferStage::Discovering => Style::default().fg(Color::Blue),
+        TransferStage::Connecting(_) | TransferStage::ReceivingManifest => {
+            Style::default().fg(Color::Cyan)
+        }
+    }
+}
 
-impl Drop for TerminalCleanup {
-    fn drop(&mut self) {
-        let mut stdout = io::stdout();
-        let _ = crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen);
-        let _ = crossterm::terminal::disable_raw_mode();
+fn connection_route_label(route: &ConnectionRoute) -> &'static str {
+    match route {
+        ConnectionRoute::LanDirect => "lan-direct",
+        ConnectionRoute::PublicDirect => "public-direct",
+        ConnectionRoute::Libp2pDcutr => "libp2p-dcutr",
+        ConnectionRoute::Libp2pRelay => "libp2p-relay",
+        ConnectionRoute::WebRtcTurn => "webrtc-turn",
     }
 }
 
@@ -224,5 +231,39 @@ mod tests {
         let view = RecvView::from_events(name, code, "127.0.0.1:43117".into(), &events);
         assert!(matches!(view.stage, TransferStage::Transferring));
         assert_eq!(view.progress, Some((60, 100)));
+    }
+
+    #[test]
+    fn send_view_uses_latest_progress_and_stage() {
+        let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+        let events = vec![
+            PeerlineEvent::StageChanged(TransferStage::Discovering),
+            PeerlineEvent::TransferStarted {
+                id: peerline_core::manifest::TransferId::random(),
+                peer: "203.0.113.7:43117".into(),
+                files: 2,
+                bytes: 300,
+            },
+            PeerlineEvent::StageChanged(TransferStage::Connecting(ConnectionRoute::PublicDirect)),
+            PeerlineEvent::Progress {
+                id: peerline_core::manifest::TransferId::random(),
+                bytes_done: 200,
+                bytes_total: 300,
+            },
+        ];
+
+        let view = SendView::from_events(
+            "peer",
+            "203.0.113.7:43117",
+            code,
+            "discovering routes through libp2p Kademlia/mDNS...",
+            &events,
+        );
+        assert!(matches!(
+            view.stage,
+            TransferStage::Connecting(ConnectionRoute::PublicDirect)
+        ));
+        assert_eq!(view.progress, Some((200, 300)));
+        assert_eq!(view.route_status, "2 file(s), 300 bytes");
     }
 }

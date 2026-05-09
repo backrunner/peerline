@@ -99,7 +99,8 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
         code: code.clone(),
         paths: vec![src_dir.join("hello.txt")],
         compression: Compression::None,
-        route_label: format!("{:?}", candidate.route),
+        route: candidate.route.connection_route(),
+        events: None,
     })
     .await
     .unwrap();

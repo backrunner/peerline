@@ -33,10 +33,15 @@ pub(crate) fn publish_receiver_descriptor(
             .as_millis() as u64,
     };
     let record = kad::Record::new(record_key, postcard::to_allocvec(&descriptor)?);
-    let _ = swarm
+    if let Err(error) = swarm
         .behaviour_mut()
         .kad
-        .put_record(record, kad::Quorum::One);
-    let _ = swarm.behaviour_mut().kad.start_providing(provider_key);
+        .put_record(record, kad::Quorum::One)
+    {
+        tracing::warn!(%error, "could not start DHT descriptor publish");
+    }
+    if let Err(error) = swarm.behaviour_mut().kad.start_providing(provider_key) {
+        tracing::warn!(%error, "could not start DHT provider publish");
+    }
     Ok(())
 }

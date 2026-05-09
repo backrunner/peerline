@@ -4,7 +4,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle},
     yamux,
 };
-use peerline_core::{HumanCode, HumanName, LookupKey, NameCode};
+use peerline_core::{ConnectionRoute, HumanCode, HumanName, LookupKey, NameCode};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::{
@@ -20,6 +20,18 @@ pub enum RouteKind {
     Libp2pDcutr,
     Libp2pRelay,
     WebRtcTurn,
+}
+
+impl RouteKind {
+    pub fn connection_route(&self) -> ConnectionRoute {
+        match self {
+            RouteKind::LanDirect => ConnectionRoute::LanDirect,
+            RouteKind::PublicDirect => ConnectionRoute::PublicDirect,
+            RouteKind::Libp2pDcutr => ConnectionRoute::Libp2pDcutr,
+            RouteKind::Libp2pRelay => ConnectionRoute::Libp2pRelay,
+            RouteKind::WebRtcTurn => ConnectionRoute::WebRtcTurn,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,7 +54,8 @@ pub struct DiscoveryConfig {
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
-            min_candidate_diversity: 3,
+            // Prefer the first usable descriptor so named send feels immediate.
+            min_candidate_diversity: 1,
             lookup_timeout: Duration::from_secs(15),
             enable_mdns: env_flag("PEERLINE_DISABLE_MDNS").is_none(),
             allow_loopback_endpoints: env_flag("PEERLINE_ALLOW_LOOPBACK_DISCOVERY").is_some(),
@@ -308,13 +321,13 @@ async fn discover_peer_descriptors(
                 match event {
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
                         handle_discovery_query_result(&mut snapshot, result);
-                        if snapshot.has_local_descriptor() {
+                        if snapshot.is_diverse_enough(config.min_candidate_diversity) {
                             break;
                         }
                     }
                     SwarmEvent::Behaviour(event) => {
                         let _ = handle_discovery_event_with_snapshot(&mut swarm, event, Some(&mut snapshot));
-                        if snapshot.has_local_descriptor() {
+                        if snapshot.is_diverse_enough(config.min_candidate_diversity) {
                             break;
                         }
                     }
@@ -464,11 +477,16 @@ fn publish_descriptor(
             .as_millis() as u64,
     };
     let record = kad::Record::new(record_key, postcard::to_allocvec(&descriptor)?);
-    let _ = swarm
+    if let Err(error) = swarm
         .behaviour_mut()
         .kad
-        .put_record(record, kad::Quorum::One);
-    let _ = swarm.behaviour_mut().kad.start_providing(provider_key);
+        .put_record(record, kad::Quorum::One)
+    {
+        tracing::warn!(%error, "could not start DHT descriptor publish");
+    }
+    if let Err(error) = swarm.behaviour_mut().kad.start_providing(provider_key) {
+        tracing::warn!(%error, "could not start DHT provider publish");
+    }
     Ok(())
 }
 
@@ -499,6 +517,18 @@ fn handle_discovery_query_result(snapshot: &mut DiscoverySnapshot, result: kad::
                 snapshot.insert_descriptor(descriptor);
             }
         }
+        kad::QueryResult::GetProviders(Err(error)) => {
+            tracing::debug!(%error, "DHT provider lookup failed");
+        }
+        kad::QueryResult::GetRecord(Err(error)) => {
+            tracing::debug!(%error, "DHT descriptor lookup failed");
+        }
+        kad::QueryResult::Bootstrap(Ok(ok)) => {
+            tracing::debug!(peer = %ok.peer, remaining = ok.num_remaining, "DHT bootstrap progressed");
+        }
+        kad::QueryResult::Bootstrap(Err(error)) => {
+            tracing::debug!(%error, "DHT bootstrap failed");
+        }
         kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord {
             cache_candidates,
         })) => {
@@ -523,6 +553,10 @@ fn handle_discovery_event_with_snapshot(
     mut snapshot: Option<&mut DiscoverySnapshot>,
 ) -> bool {
     match event {
+        DiscoveryBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. }) => {
+            log_publish_query_result(&result);
+            false
+        }
         DiscoveryBehaviourEvent::Mdns(mdns::Event::Discovered(peers)) => {
             let changed = !peers.is_empty();
             for (peer, addr) in peers {
@@ -544,6 +578,30 @@ fn handle_discovery_event_with_snapshot(
     }
 }
 
+fn log_publish_query_result(result: &kad::QueryResult) {
+    match result {
+        kad::QueryResult::PutRecord(Ok(ok)) => {
+            tracing::debug!(key = ?ok.key, "DHT descriptor published");
+        }
+        kad::QueryResult::PutRecord(Err(error)) => {
+            tracing::warn!(%error, "DHT descriptor publish failed");
+        }
+        kad::QueryResult::StartProviding(Ok(ok)) => {
+            tracing::debug!(key = ?ok.key, "DHT provider record published");
+        }
+        kad::QueryResult::StartProviding(Err(error)) => {
+            tracing::warn!(%error, "DHT provider record publish failed");
+        }
+        kad::QueryResult::Bootstrap(Ok(ok)) => {
+            tracing::debug!(peer = %ok.peer, remaining = ok.num_remaining, "DHT bootstrap progressed");
+        }
+        kad::QueryResult::Bootstrap(Err(error)) => {
+            tracing::debug!(%error, "DHT bootstrap failed");
+        }
+        _ => {}
+    }
+}
+
 fn apply_bootstrap(swarm: &mut Swarm<DiscoveryBehaviour>, config: &DiscoveryConfig) {
     for raw in &config.bootstrap_peers {
         let Ok(addr) = raw.parse::<Multiaddr>() else {
@@ -553,6 +611,9 @@ fn apply_bootstrap(swarm: &mut Swarm<DiscoveryBehaviour>, config: &DiscoveryConf
             swarm.behaviour_mut().kad.add_address(&peer, without_peer);
         }
         let _ = swarm.dial(addr);
+    }
+    if let Err(error) = swarm.behaviour_mut().kad.bootstrap() {
+        tracing::debug!(%error, "could not start DHT bootstrap");
     }
 }
 

@@ -140,6 +140,9 @@ pub(crate) fn apply_bootstrap(swarm: &mut Swarm<TransferBehaviour>, config: &Dis
         }
         let _ = swarm.dial(addr);
     }
+    if let Err(error) = swarm.behaviour_mut().kad.bootstrap() {
+        tracing::debug!(%error, "could not start DHT bootstrap");
+    }
 }
 
 fn split_peer_addr(mut addr: libp2p::Multiaddr) -> Option<(PeerId, libp2p::Multiaddr)> {

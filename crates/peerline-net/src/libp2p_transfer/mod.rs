@@ -9,7 +9,7 @@ mod session;
 mod tests;
 
 use crate::discovery::DiscoveryConfig;
-use peerline_core::{Compression, HumanCode, HumanName, PeerlineEvent};
+use peerline_core::{Compression, ConnectionRoute, HumanCode, HumanName, PeerlineEvent};
 use std::{net::SocketAddr, path::PathBuf};
 
 pub(crate) const LIBP2P_ROUTE_LABEL: &str = "libp2p-request-response";
@@ -22,7 +22,8 @@ pub struct Libp2pSendOptions {
     pub code: HumanCode,
     pub paths: Vec<PathBuf>,
     pub compression: Compression,
-    pub route_label: String,
+    pub route: ConnectionRoute,
+    pub events: Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
 }
 
 #[derive(Clone, Debug)]

@@ -1,17 +1,20 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use peerline_core::{
-    Compression, ConfigStore, DEFAULT_DIRECT_PORT, HumanCode, HumanName, parse_ip_endpoint,
+    Compression, ConfigStore, DEFAULT_DIRECT_PORT, DEFAULT_DIRECT_PORT_WINDOW, HumanCode,
+    HumanName, PeerlineEvent, TransferStage, parse_ip_endpoint,
 };
 use peerline_net::{
     Candidate, Libp2pRecvOptions, Libp2pSendOptions, ReceivedTransfer, RecvOptions, RouteKind,
-    SendOptions,
+    SendOptions, bind_direct_listener,
 };
 use std::{
+    future::Future,
     io::IsTerminal,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
+    pin::Pin,
 };
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{sync::watch, task::JoinHandle};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -115,8 +118,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     }
 
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), args.port);
-    let listener = TcpListener::bind(bind).await?;
-    let actual_bind = listener.local_addr()?;
+    let (listener, actual_bind) = bind_direct_listener(bind).await?;
     let destination = std::env::current_dir()?;
     let discovery = peerline_net::DiscoveryConfig {
         allow_relay_data_fallback: args.allow_relay_fallback,
@@ -129,8 +131,9 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     println!("direct: {actual_bind}");
     println!("waiting for one transfer over direct TCP or libp2p...");
 
-    let (events, tui_task) = if !args.no_tui && std::io::stdout().is_terminal() {
+    let (events, tui_task, mut quit_rx) = if !args.no_tui && std::io::stdout().is_terminal() {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (quit_tx, quit_rx) = watch::channel(false);
         let view = peerline_tui::RecvView {
             name: name.clone(),
             code: code.clone(),
@@ -139,13 +142,17 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
             stage: peerline_core::TransferStage::Discovering,
             progress: None,
         };
-        let task = tokio::spawn(peerline_tui::render_once(view, receiver));
-        (Some(sender), Some(task))
+        let task = tokio::spawn(peerline_tui::render_once_with_quit(
+            view,
+            receiver,
+            Some(quit_tx),
+        ));
+        (Some(sender), Some(task), Some(quit_rx))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
-    let direct_task = tokio::spawn(peerline_net::recv_once_bound(
+    let direct_fut = Box::pin(peerline_net::recv_once_bound(
         listener,
         RecvOptions {
             name: name.clone(),
@@ -156,7 +163,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
             events: events.clone(),
         },
     ));
-    let libp2p_task = tokio::spawn(peerline_net::recv_libp2p(Libp2pRecvOptions {
+    let libp2p_fut = Box::pin(peerline_net::recv_libp2p(Libp2pRecvOptions {
         name,
         code,
         direct_bind: actual_bind,
@@ -165,20 +172,28 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
         discovery,
         events: events.clone(),
     }));
-    let received = match wait_for_receiver(direct_task, libp2p_task).await {
-        Ok(received) => received,
-        Err(error) => {
-            if let Some(sender) = events.as_ref() {
-                let _ = sender.send(peerline_core::PeerlineEvent::StageChanged(
-                    peerline_core::TransferStage::Failed(error.to_string()),
-                ));
+
+    let received =
+        match wait_with_quit(wait_for_receiver(direct_fut, libp2p_fut), &mut quit_rx).await {
+            Ok(TaskOutcome::Completed(received)) => received,
+            Ok(TaskOutcome::Quit) => {
+                if let Some(task) = tui_task {
+                    let _ = task.await;
+                }
+                return Ok(());
             }
-            if let Some(task) = tui_task {
-                let _ = task.await;
+            Err(error) => {
+                if let Some(sender) = events.as_ref() {
+                    let _ = sender.send(peerline_core::PeerlineEvent::StageChanged(
+                        peerline_core::TransferStage::Failed(error.to_string()),
+                    ));
+                }
+                if let Some(task) = tui_task {
+                    let _ = task.await;
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
     if let Some(task) = tui_task {
         let _ = task.await;
     }
@@ -189,10 +204,54 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn wait_for_receiver(
-    mut direct_task: JoinHandle<anyhow::Result<ReceivedTransfer>>,
-    mut libp2p_task: JoinHandle<anyhow::Result<ReceivedTransfer>>,
-) -> anyhow::Result<ReceivedTransfer> {
+enum TaskOutcome<T> {
+    Completed(T),
+    Quit,
+}
+
+async fn wait_with_quit<F, T>(
+    future: F,
+    quit_rx: &mut Option<watch::Receiver<bool>>,
+) -> anyhow::Result<TaskOutcome<T>>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    tokio::pin!(future);
+
+    loop {
+        if let Some(rx) = quit_rx.as_mut() {
+            tokio::select! {
+                result = &mut future => {
+                    return result.map(TaskOutcome::Completed);
+                }
+                quit = wait_for_quit(rx) => {
+                    if quit {
+                        return Ok(TaskOutcome::Quit);
+                    }
+                    *quit_rx = None;
+                }
+            }
+        } else {
+            return future.await.map(TaskOutcome::Completed);
+        }
+    }
+}
+
+async fn wait_for_quit(rx: &mut watch::Receiver<bool>) -> bool {
+    match rx.changed().await {
+        Ok(()) => *rx.borrow(),
+        Err(_) => false,
+    }
+}
+
+async fn wait_for_receiver<D, L>(
+    mut direct_fut: Pin<Box<D>>,
+    mut libp2p_fut: Pin<Box<L>>,
+) -> anyhow::Result<ReceivedTransfer>
+where
+    D: Future<Output = anyhow::Result<ReceivedTransfer>>,
+    L: Future<Output = anyhow::Result<ReceivedTransfer>>,
+{
     let mut direct_done = false;
     let mut libp2p_done = false;
     let mut last_error = None;
@@ -203,41 +262,27 @@ async fn wait_for_receiver(
         }
 
         tokio::select! {
-            result = &mut direct_task, if !direct_done => {
+            result = direct_fut.as_mut(), if !direct_done => {
                 direct_done = true;
                 match result {
-                    Ok(Ok(received)) => {
-                        if !libp2p_done {
-                            libp2p_task.abort();
-                            let _ = libp2p_task.await;
-                        }
+                    Ok(received) => {
                         return Ok(received);
                     }
-                    Ok(Err(error)) => {
+                    Err(error) => {
                         tracing::warn!(%error, "direct receiver path stopped");
                         last_error = Some(error);
                     }
-                    Err(error) => {
-                        last_error = Some(anyhow::anyhow!("direct receiver task failed: {error}"));
-                    }
                 }
             }
-            result = &mut libp2p_task, if !libp2p_done => {
+            result = libp2p_fut.as_mut(), if !libp2p_done => {
                 libp2p_done = true;
                 match result {
-                    Ok(Ok(received)) => {
-                        if !direct_done {
-                            direct_task.abort();
-                            let _ = direct_task.await;
-                        }
+                    Ok(received) => {
                         return Ok(received);
                     }
-                    Ok(Err(error)) => {
+                    Err(error) => {
                         tracing::warn!(%error, "libp2p receiver path stopped");
                         last_error = Some(error);
-                    }
-                    Err(error) => {
-                        last_error = Some(anyhow::anyhow!("libp2p receiver task failed: {error}"));
                     }
                 }
             }
@@ -253,56 +298,208 @@ fn tracing_filter() -> tracing_subscriber::EnvFilter {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error,peerline=info"))
 }
 
-async fn send(args: SendArgs) -> anyhow::Result<()> {
-    if let Some(endpoint) = direct_endpoint_arg(&args) {
-        let code = match args.code {
-            Some(code) => HumanCode::parse(code)?,
-            None => {
-                let code = rpassword::prompt_password("code: ")?;
-                HumanCode::parse(code)?
-            }
-        };
-        let paths = args
-            .args
-            .iter()
-            .skip(1)
-            .map(PathBuf::from)
-            .collect::<Vec<_>>();
-        if paths.is_empty() {
-            anyhow::bail!("send <ip> requires at least one file or folder path");
-        }
-        let sent = peerline_net::send_direct(SendOptions {
-            endpoint,
-            name: None,
-            code,
-            paths,
-            compression: args.compression.into(),
-        })
-        .await?;
-        println!(
-            "sent {} file(s), {} bytes to {}",
-            sent.files, sent.bytes, sent.endpoint
-        );
-        return Ok(());
+fn spawn_send_tui(
+    target_label: &str,
+    target: String,
+    code: HumanCode,
+    route_status: String,
+    quit_signal: Option<watch::Sender<bool>>,
+) -> (
+    Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
+    Option<JoinHandle<anyhow::Result<()>>>,
+) {
+    if !std::io::stdout().is_terminal() {
+        return (None, None);
     }
 
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let view = peerline_tui::SendView {
+        target_label: target_label.to_string(),
+        target,
+        code,
+        route_status,
+        stage: TransferStage::Discovering,
+        progress: None,
+    };
+    let task = tokio::spawn(peerline_tui::render_send_once_with_quit(
+        view,
+        receiver,
+        quit_signal,
+    ));
+    (Some(sender), Some(task))
+}
+
+async fn send(args: SendArgs) -> anyhow::Result<()> {
+    if let Some(target) = direct_endpoint_arg(&args) {
+        return send_direct_mode(args, target).await;
+    }
+
+    send_named_mode(args).await
+}
+
+async fn send_direct_mode(args: SendArgs, target: DirectTarget) -> anyhow::Result<()> {
+    let code = match args.code {
+        Some(code) => HumanCode::parse(code)?,
+        None => {
+            let code = rpassword::prompt_password("code: ")?;
+            HumanCode::parse(code)?
+        }
+    };
+    let paths = args
+        .args
+        .iter()
+        .skip(1)
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        anyhow::bail!("send <ip> requires at least one file or folder path");
+    }
+    let (target_label, target_value) = match target {
+        DirectTarget::Exact(endpoint) => ("endpoint", endpoint.to_string()),
+        DirectTarget::Ip(ip) => ("ip", ip.to_string()),
+    };
+    let (quit_signal, mut quit_rx) = if std::io::stdout().is_terminal() {
+        let (tx, rx) = watch::channel(false);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let (events, tui_task) = spawn_send_tui(
+        target_label,
+        target_value,
+        code.clone(),
+        match target {
+            DirectTarget::Exact(endpoint) => format!("dialing {}", endpoint),
+            DirectTarget::Ip(_) => format!(
+                "probing direct ports {}..{}",
+                DEFAULT_DIRECT_PORT,
+                DEFAULT_DIRECT_PORT.saturating_add(DEFAULT_DIRECT_PORT_WINDOW.saturating_sub(1))
+            ),
+        },
+        quit_signal,
+    );
+    let compression = args.compression.into();
+    let send_events = events.clone();
+    let send_future = async move {
+        match target {
+            DirectTarget::Exact(endpoint) => {
+                peerline_net::send_direct(SendOptions {
+                    endpoint,
+                    name: None,
+                    code,
+                    paths,
+                    compression,
+                    events: send_events,
+                })
+                .await
+            }
+            DirectTarget::Ip(ip) => {
+                peerline_net::send_direct_probe(SendOptions {
+                    endpoint: SocketAddr::new(ip, DEFAULT_DIRECT_PORT),
+                    name: None,
+                    code,
+                    paths,
+                    compression,
+                    events: send_events,
+                })
+                .await
+            }
+        }
+    };
+
+    match wait_with_quit(send_future, &mut quit_rx).await {
+        Ok(TaskOutcome::Completed(sent)) => {
+            if let Some(task) = tui_task {
+                let _ = task.await;
+            }
+            println!(
+                "sent {} file(s), {} bytes to {}",
+                sent.files, sent.bytes, sent.endpoint
+            );
+            Ok(())
+        }
+        Ok(TaskOutcome::Quit) => {
+            if let Some(task) = tui_task {
+                let _ = task.await;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(sender) = events.as_ref() {
+                let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
+                    error.to_string(),
+                )));
+            }
+            if let Some(task) = tui_task {
+                let _ = task.await;
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
     let compression = args.compression.into();
     let allow_relay_fallback = args.allow_relay_fallback;
     let (name, code, paths) = resolve_named_send(args)?;
     if code.is_low_entropy() {
         eprintln!("warning: code entropy looks low; generated codes are safer on public networks");
     }
-    println!("discovering {name} through libp2p Kademlia/mDNS...");
+    let (quit_signal, mut quit_rx) = if std::io::stdout().is_terminal() {
+        let (tx, rx) = watch::channel(false);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let (events, tui_task) = spawn_send_tui(
+        "peer",
+        name.to_string(),
+        code.clone(),
+        "discovering routes through libp2p Kademlia/mDNS...".into(),
+        quit_signal,
+    );
+    if events.is_none() {
+        println!("discovering {name} through libp2p Kademlia/mDNS...");
+    }
     let discovery = peerline_net::DiscoveryConfig {
         allow_relay_data_fallback: allow_relay_fallback,
         ..Default::default()
     };
-    let candidates =
-        peerline_net::discovery::discover_peer_candidates(&name, &code, discovery.clone()).await?;
+    let discovery_future =
+        peerline_net::discovery::discover_peer_candidates(&name, &code, discovery.clone());
+    let candidates = match wait_with_quit(discovery_future, &mut quit_rx).await {
+        Ok(TaskOutcome::Completed(candidates)) => candidates,
+        Ok(TaskOutcome::Quit) => {
+            if let Some(task) = tui_task {
+                let _ = task.await;
+            }
+            return Ok(());
+        }
+        Err(error) => {
+            if let Some(sender) = events.as_ref() {
+                let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
+                    error.to_string(),
+                )));
+            }
+            if let Some(task) = tui_task {
+                let _ = task.await;
+            }
+            return Err(error);
+        }
+    };
     if candidates.is_empty() {
-        anyhow::bail!(
+        let error = anyhow::anyhow!(
             "could not discover a route for {name}; use `peerline send <ip> <path...> --code=<code>` if you know the receiver address"
         );
+        if let Some(sender) = events.as_ref() {
+            let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
+                error.to_string(),
+            )));
+        }
+        if let Some(task) = tui_task {
+            let _ = task.await;
+        }
+        return Err(error);
     }
 
     let mut last_error = None;
@@ -311,22 +508,62 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
             continue;
         }
 
-        match send_candidate(&candidate, &name, &code, &paths, compression).await {
-            Ok(sent) => {
+        if let Some(sender) = events.as_ref() {
+            let _ = sender.send(PeerlineEvent::Message(format!(
+                "trying {} via {}",
+                candidate.peer_id,
+                route_label(&candidate.route)
+            )));
+        }
+
+        let attempt = send_candidate(
+            &candidate,
+            &name,
+            &code,
+            &paths,
+            compression,
+            events.clone(),
+        );
+
+        match wait_with_quit(attempt, &mut quit_rx).await {
+            Ok(TaskOutcome::Completed(sent)) => {
+                if let Some(task) = tui_task {
+                    let _ = task.await;
+                }
                 println!(
                     "sent {} file(s), {} bytes to {}",
                     sent.files, sent.bytes, sent.endpoint
                 );
                 return Ok(());
             }
-            Err(error) => last_error = Some(error),
+            Ok(TaskOutcome::Quit) => {
+                if let Some(task) = tui_task {
+                    let _ = task.await;
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                if let Some(sender) = events.as_ref() {
+                    let _ = sender.send(PeerlineEvent::Message(error.to_string()));
+                }
+                last_error = Some(error);
+            }
         }
     }
 
     let error = last_error
         .map(|error| error.to_string())
         .unwrap_or_else(|| "no usable endpoint".into());
-    anyhow::bail!("discovered {name}, but all routes failed: {error}");
+    let final_error = anyhow::anyhow!("discovered {name}, but all routes failed: {error}");
+    if let Some(sender) = events.as_ref() {
+        let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
+            final_error.to_string(),
+        )));
+    }
+    if let Some(task) = tui_task {
+        let _ = task.await;
+    }
+    Err(final_error)
 }
 
 async fn send_candidate(
@@ -335,6 +572,7 @@ async fn send_candidate(
     code: &HumanCode,
     paths: &[PathBuf],
     compression: Compression,
+    events: Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
 ) -> anyhow::Result<peerline_net::SentTransfer> {
     match candidate.route {
         RouteKind::LanDirect | RouteKind::PublicDirect => {
@@ -349,6 +587,7 @@ async fn send_candidate(
                 code: code.clone(),
                 paths: paths.to_vec(),
                 compression,
+                events,
             })
             .await
         }
@@ -369,7 +608,8 @@ async fn send_candidate(
                 code: code.clone(),
                 paths: paths.to_vec(),
                 compression,
-                route_label: route_label(&candidate.route).into(),
+                route: candidate.route.connection_route(),
+                events,
             })
             .await
         }
@@ -401,11 +641,24 @@ fn set(args: SetArgs) -> anyhow::Result<()> {
     }
 }
 
-fn direct_endpoint_arg(args: &SendArgs) -> Option<SocketAddr> {
+#[derive(Debug, Clone, Copy)]
+enum DirectTarget {
+    Exact(SocketAddr),
+    Ip(IpAddr),
+}
+
+fn direct_endpoint_arg(args: &SendArgs) -> Option<DirectTarget> {
     if args.name.is_some() {
         return None;
     }
-    args.args.first().and_then(|value| parse_ip_endpoint(value))
+    let value = args.args.first()?;
+    if let Ok(endpoint) = value.parse::<SocketAddr>() {
+        return Some(DirectTarget::Exact(endpoint));
+    }
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Some(DirectTarget::Ip(ip));
+    }
+    None
 }
 
 fn resolve_recv_identity(
@@ -491,6 +744,33 @@ mod tests {
 
         let (_, _, paths) = resolve_named_send(args).unwrap();
         assert_eq!(paths, vec![PathBuf::from("127.0.0.1")]);
+    }
+
+    #[test]
+    fn direct_endpoint_arg_distinguishes_ip_and_ip_port() {
+        let ip_only = SendArgs {
+            args: vec!["127.0.0.1".into()],
+            name: None,
+            code: Some("rose-lime-iris-jade-1234".into()),
+            compression: CompressionArg::Auto,
+            allow_relay_fallback: false,
+        };
+        assert!(matches!(
+            direct_endpoint_arg(&ip_only),
+            Some(DirectTarget::Ip(ip)) if ip == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        ));
+
+        let ip_port = SendArgs {
+            args: vec!["127.0.0.1:43117".into()],
+            name: None,
+            code: Some("rose-lime-iris-jade-1234".into()),
+            compression: CompressionArg::Auto,
+            allow_relay_fallback: false,
+        };
+        assert!(matches!(
+            direct_endpoint_arg(&ip_port),
+            Some(DirectTarget::Exact(endpoint)) if endpoint == SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), DEFAULT_DIRECT_PORT)
+        ));
     }
 
     #[test]

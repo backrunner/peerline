@@ -23,7 +23,7 @@ Peerline has two roles:
 
 For named transfers, the receiver publishes a short-lived descriptor keyed by the shared name and code. The sender derives the same lookup key, discovers candidate routes, and tries them in order. Peerline prefers direct LAN or public TCP endpoints first, then libp2p routes such as DCUtR and WebRTC TURN. Relay data fallback is available only when explicitly enabled.
 
-For direct transfers, the sender can skip discovery and dial an IP address or `host:port` directly. This is useful on the same network, over VPNs, or whenever the receiver already knows which address the sender should use.
+For direct transfers, the sender can skip discovery and dial an IP address or `host:port` directly. This is useful on the same network, over VPNs, or whenever the receiver already knows which address the sender should use. If you only provide an IP, Peerline probes the default direct window `43117-43121`.
 
 During a transfer, Peerline scans the requested paths into a manifest, preserves directories with safe relative paths, compresses when useful, and streams the archive to the receiver. The receiver verifies file sizes and BLAKE3 hashes before writing files into the current directory. Existing files are kept by default; conflicting names receive a non-overwriting suffix unless `--overwrite` is used.
 
@@ -71,8 +71,8 @@ The receiver prints values like:
 
 ```text
 peerline recv
-name: river-mango-42
-code: rose-lime-iris-jade-1234
+name: frost-827
+code: fig-mint-1234-5678
 direct: 0.0.0.0:43117
 waiting for one transfer over direct TCP or libp2p...
 ```
@@ -80,31 +80,31 @@ waiting for one transfer over direct TCP or libp2p...
 Send a file, multiple files, or a folder by name and code:
 
 ```sh
-peerline send river-mango-42 rose-lime-iris-jade-1234 ./file.txt
-peerline send river-mango-42 rose-lime-iris-jade-1234 ./file.txt ./notes.md ./photos
+peerline send frost-827 fig-mint-1234-5678 ./file.txt
+peerline send frost-827 fig-mint-1234-5678 ./file.txt ./notes.md ./photos
 ```
 
 Receive with a saved name:
 
 ```sh
-peerline set name river-mango-42
+peerline set name frost-827
 peerline recv
 ```
 
 After a name is saved, you can receive with only a fresh code:
 
 ```sh
-peerline recv rose-lime-iris-jade-1234
+peerline recv fig-mint-1234-5678
 ```
 
 Use a direct IP address when discovery is not needed:
 
 ```sh
-peerline send 192.168.1.23:43117 ./file.txt --code=rose-lime-iris-jade-1234
-peerline send 192.168.1.23 ./folder --code=rose-lime-iris-jade-1234
+peerline send 192.168.1.23:43117 ./file.txt --code=fig-mint-1234-5678
+peerline send 192.168.1.23 ./folder --code=fig-mint-1234-5678
 ```
 
-When the port is omitted, Peerline uses the default direct port `43117`.
+When the port is omitted, Peerline probes the default direct window `43117-43121`.
 
 ## Common Options
 
@@ -116,6 +116,8 @@ peerline recv [NAME_OR_CODE] [CODE] --overwrite
 peerline recv [NAME_OR_CODE] [CODE] --no-tui
 peerline recv [NAME_OR_CODE] [CODE] --allow-relay-fallback
 ```
+
+`--port` starts the 5-port direct window; Peerline will try that port and the next four.
 
 Sender options:
 

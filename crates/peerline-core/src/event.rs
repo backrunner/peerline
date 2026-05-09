@@ -27,6 +27,7 @@ pub enum PeerlineEvent {
     StageChanged(TransferStage),
     TransferStarted {
         id: TransferId,
+        peer: String,
         files: usize,
         bytes: u64,
     },

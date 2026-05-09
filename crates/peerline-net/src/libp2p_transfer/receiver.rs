@@ -13,7 +13,7 @@ use crate::{
 };
 use futures::StreamExt;
 use libp2p::{
-    PeerId, Swarm, identify, mdns, relay,
+    PeerId, Swarm, identify, kad, mdns, relay,
     request_response::{self, Event as RequestResponseEvent, Message as RequestResponseMessage},
     swarm::SwarmEvent,
 };
@@ -118,6 +118,9 @@ pub(crate) async fn recv_libp2p(
                             );
                         }
                     }
+                    SwarmEvent::Behaviour(TransferBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
+                        log_dht_publish_result(&result);
+                    }
                     SwarmEvent::NewListenAddr { .. }
                     | SwarmEvent::ConnectionEstablished { .. }
                     | SwarmEvent::ExternalAddrConfirmed { .. }
@@ -133,6 +136,30 @@ pub(crate) async fn recv_libp2p(
                 }
             }
         }
+    }
+}
+
+fn log_dht_publish_result(result: &kad::QueryResult) {
+    match result {
+        kad::QueryResult::PutRecord(Ok(ok)) => {
+            tracing::debug!(key = ?ok.key, "DHT descriptor published");
+        }
+        kad::QueryResult::PutRecord(Err(error)) => {
+            tracing::warn!(%error, "DHT descriptor publish failed");
+        }
+        kad::QueryResult::StartProviding(Ok(ok)) => {
+            tracing::debug!(key = ?ok.key, "DHT provider record published");
+        }
+        kad::QueryResult::StartProviding(Err(error)) => {
+            tracing::warn!(%error, "DHT provider record publish failed");
+        }
+        kad::QueryResult::Bootstrap(Ok(ok)) => {
+            tracing::debug!(peer = %ok.peer, remaining = ok.num_remaining, "DHT bootstrap progressed");
+        }
+        kad::QueryResult::Bootstrap(Err(error)) => {
+            tracing::debug!(%error, "DHT bootstrap failed");
+        }
+        _ => {}
     }
 }
 
@@ -249,6 +276,7 @@ fn handle_inbound_request(
                 &options.events,
                 PeerlineEvent::TransferStarted {
                     id: transfer_id,
+                    peer: peer.to_string(),
                     files,
                     bytes,
                 },
