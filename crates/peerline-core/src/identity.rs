@@ -5,6 +5,7 @@ use std::{fmt, net::SocketAddr, str::FromStr};
 use thiserror::Error;
 
 pub const DEFAULT_DIRECT_PORT: u16 = 43_117;
+pub const DEFAULT_DIRECT_PORT_WINDOW: u16 = 5;
 
 const WORDS: &[&str] = &[
     "amber", "anchor", "apple", "april", "ash", "atlas", "aurora", "autumn", "basil", "beacon",
@@ -56,10 +57,9 @@ impl HumanName {
 
     pub fn generate() -> Self {
         let mut rng = rand::thread_rng();
-        let first = WORDS.choose(&mut rng).expect("word list is non-empty");
-        let second = WORDS.choose(&mut rng).expect("word list is non-empty");
-        let number: u16 = rng.gen_range(10..=99);
-        Self(format!("{first}-{second}-{number}"))
+        let word = random_word(&mut rng);
+        let number: u16 = rng.gen_range(100..=999);
+        Self(format!("{word}-{number}"))
     }
 
     pub fn as_str(&self) -> &str {
@@ -74,14 +74,11 @@ impl HumanCode {
 
     pub fn generate() -> Self {
         let mut rng = rand::thread_rng();
-        let parts = (0..4)
-            .map(|_| *WORDS.choose(&mut rng).expect("word list is non-empty"))
-            .collect::<Vec<_>>();
-        let number: u16 = rng.gen_range(1000..=9999);
-        Self(format!(
-            "{}-{}-{}-{}-{number}",
-            parts[0], parts[1], parts[2], parts[3]
-        ))
+        let first = random_word(&mut rng);
+        let second = random_word(&mut rng);
+        let first_number: u16 = rng.gen_range(1000..=9999);
+        let second_number: u16 = rng.gen_range(1000..=9999);
+        Self(format!("{first}-{second}-{first_number}-{second_number}"))
     }
 
     pub fn as_str(&self) -> &str {
@@ -157,6 +154,10 @@ pub fn parse_ip_endpoint(value: &str) -> Option<SocketAddr> {
     None
 }
 
+pub fn direct_port_candidates(start: u16, window: u16) -> impl Iterator<Item = u16> {
+    (0..window).filter_map(move |offset| start.checked_add(offset))
+}
+
 pub fn code_entropy_bits(value: &str) -> f64 {
     let parts = value
         .split('-')
@@ -195,6 +196,10 @@ fn normalize_token(value: &str, max_len: usize) -> Result<String, IdentityError>
     Ok(trimmed)
 }
 
+fn random_word(rng: &mut impl Rng) -> &'static str {
+    WORDS.choose(rng).copied().expect("word list is non-empty")
+}
+
 fn lookup_key(name: &HumanName, code: &HumanCode) -> LookupKey {
     let mut salt_hasher = blake3::Hasher::new();
     salt_hasher.update(b"peerline:dht:salt:v1");
@@ -228,8 +233,26 @@ mod tests {
     }
 
     #[test]
+    fn generated_name_is_compact() {
+        let name = HumanName::generate();
+        let parts = name.as_str().split('-').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 2, "{name}");
+        assert!(parts[0].chars().all(|ch| ch.is_ascii_lowercase()));
+        assert_eq!(parts[1].len(), 3, "{name}");
+        assert!(parts[1].chars().all(|ch| ch.is_ascii_digit()));
+    }
+
+    #[test]
     fn generated_code_meets_entropy_target() {
         let code = HumanCode::generate();
+        let parts = code.as_str().split('-').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 4, "{code}");
+        assert!(parts[0].chars().all(|ch| ch.is_ascii_lowercase()));
+        assert!(parts[1].chars().all(|ch| ch.is_ascii_lowercase()));
+        assert_eq!(parts[2].len(), 4, "{code}");
+        assert_eq!(parts[3].len(), 4, "{code}");
+        assert!(parts[2].chars().all(|ch| ch.is_ascii_digit()));
+        assert!(parts[3].chars().all(|ch| ch.is_ascii_digit()));
         assert!(code.entropy_bits_estimate() >= 40.0, "{code}");
     }
 
@@ -244,5 +267,12 @@ mod tests {
         let endpoint = parse_ip_endpoint("::1").unwrap();
         assert_eq!(endpoint.port(), DEFAULT_DIRECT_PORT);
         assert!(endpoint.is_ipv6());
+    }
+
+    #[test]
+    fn direct_port_candidates_cover_default_window() {
+        let ports = direct_port_candidates(DEFAULT_DIRECT_PORT, DEFAULT_DIRECT_PORT_WINDOW)
+            .collect::<Vec<_>>();
+        assert_eq!(ports, vec![43117, 43118, 43119, 43120, 43121]);
     }
 }
