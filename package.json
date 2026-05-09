@@ -14,7 +14,8 @@
   "scripts": {
     "build": "cargo build --release -p peerline-cli",
     "prepack": "node npm/prepack.js",
-    "test": "cargo test --workspace && node --test npm/peerline.test.js",
+    "release:alpha": "node npm/release-alpha.js",
+    "test": "cargo test --workspace && node --test npm/peerline.test.js npm/release-alpha.test.js",
     "smoke": "node npm/peerline.js --version"
   },
   "publishConfig": {

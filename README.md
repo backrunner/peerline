@@ -24,6 +24,20 @@ Or from source:
 cargo run -p peerline-cli -- --help
 ```
 
+## Release
+
+Alpha releases are published with the bundled npm release script:
+
+```sh
+npm run release:alpha -- --otp=123456
+```
+
+If a publish attempt fails after the version bump commit, retry the current version:
+
+```sh
+npm run release:alpha -- --current --otp=123456
+```
+
 ## Usage
 
 ```sh
