@@ -5,7 +5,7 @@ workers_dev = false
 routes = [{ pattern = "rendezvous.peerline.pwp.sh", custom_domain = true }]
 
 [build]
-command = "cargo install worker-build && worker-build --release --panic-unwind"
+command = "cargo install worker-build --version 0.8.1 --locked --force && worker-build --release --panic-unwind"
 
 [vars]
 PEERLINE_RENDEZVOUS_MAX_TTL_SECS = "180"

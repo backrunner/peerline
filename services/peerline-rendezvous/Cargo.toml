@@ -13,5 +13,7 @@ console_error_panic_hook = "0.1.7"
 peerline-rendezvous-model = { path = "../../crates/peerline-rendezvous-model" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-wasm-bindgen = "0.2.121"
-worker = "0.8.3"
+# Keep this toolchain pair pinned until the wasm-bindgen 0.2.121
+# panic=unwind CLI regression is fixed.
+wasm-bindgen = "=0.2.120"
+worker = "=0.8.1"
