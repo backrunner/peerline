@@ -146,6 +146,7 @@ test("workspace package list covers every local crate in Cargo.lock", () => {
     "peerline-core",
     "peerline-crypto",
     "peerline-net",
+    "peerline-rendezvous-model",
     "peerline-testkit",
     "peerline-transfer",
     "peerline-tui",

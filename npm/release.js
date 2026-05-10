@@ -20,6 +20,7 @@ const workspacePackageNames = [
   "peerline-core",
   "peerline-crypto",
   "peerline-net",
+  "peerline-rendezvous-model",
   "peerline-testkit",
   "peerline-transfer",
   "peerline-tui",
