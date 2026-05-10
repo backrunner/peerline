@@ -12,9 +12,9 @@ use std::{
 
 const DEFAULT_RENDEZVOUS_TTL_SECS: u32 = 120;
 const DEFAULT_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(5);
-const PEERLINE_RENDEZVOUS_HOST_ROOT: &str = "peerline.pwp.sh";
-const PEERLINE_RENDEZVOUS_HOST_ALPHA: &str = "alpha.peerline.pwp.sh";
-const PEERLINE_RENDEZVOUS_HOST_BETA: &str = "beta.peerline.pwp.sh";
+const PEERLINE_RENDEZVOUS_HOST_ROOT: &str = "rendezvous.peerline.pwp.sh";
+const PEERLINE_RENDEZVOUS_HOST_ALPHA: &str = "alpha.rendezvous.peerline.pwp.sh";
+const PEERLINE_RENDEZVOUS_HOST_BETA: &str = "beta.rendezvous.peerline.pwp.sh";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReleaseChannel {
@@ -69,7 +69,7 @@ impl Default for RendezvousConfig {
         let client_identity = client_identity_from_env();
         if endpoints.iter().any(is_default_private_endpoint) && client_identity.is_none() {
             tracing::warn!(
-                "default peerline rendezvous endpoint requires PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM or PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH"
+                "default rendezvous endpoint requires PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM or PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH"
             );
         }
 
@@ -330,9 +330,9 @@ fn auth_token_for_request<'a>(config: &'a RendezvousConfig, _url: &Url) -> Optio
 
 fn default_rendezvous_endpoint() -> &'static str {
     match release_channel_from_version(env!("CARGO_PKG_VERSION")) {
-        ReleaseChannel::Alpha => "https://alpha.peerline.pwp.sh",
-        ReleaseChannel::Beta => "https://beta.peerline.pwp.sh",
-        ReleaseChannel::Stable => "https://peerline.pwp.sh",
+        ReleaseChannel::Alpha => "https://alpha.rendezvous.peerline.pwp.sh",
+        ReleaseChannel::Beta => "https://beta.rendezvous.peerline.pwp.sh",
+        ReleaseChannel::Stable => "https://rendezvous.peerline.pwp.sh",
     }
 }
 

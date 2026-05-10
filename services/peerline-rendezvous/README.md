@@ -36,11 +36,11 @@ cd services/peerline-rendezvous
 npx wrangler deploy
 ```
 
-The default production route is the custom domain `peerline.pwp.sh`.
+The default production route is the custom domain `rendezvous.peerline.pwp.sh`.
 Prerelease deployments use isolated subdomains:
 
-- `alpha` -> `alpha.peerline.pwp.sh`
-- `beta` -> `beta.peerline.pwp.sh`
+- `alpha` -> `alpha.rendezvous.peerline.pwp.sh`
+- `beta` -> `beta.rendezvous.peerline.pwp.sh`
 
 Deploy them with `npx wrangler deploy --env alpha` or `npx wrangler deploy --env beta`.
 

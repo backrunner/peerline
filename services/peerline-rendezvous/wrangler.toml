@@ -2,7 +2,7 @@ name = "peerline-rendezvous"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-05-10"
 workers_dev = false
-routes = [{ pattern = "peerline.pwp.sh", custom_domain = true }]
+routes = [{ pattern = "rendezvous.peerline.pwp.sh", custom_domain = true }]
 
 [build]
 command = "cargo install worker-build && worker-build --release --panic-unwind"
@@ -19,7 +19,7 @@ tag = "v1"
 new_sqlite_classes = ["RendezvousShard"]
 
 [env.alpha]
-routes = [{ pattern = "alpha.peerline.pwp.sh", custom_domain = true }]
+routes = [{ pattern = "alpha.rendezvous.peerline.pwp.sh", custom_domain = true }]
 
 [env.beta]
-routes = [{ pattern = "beta.peerline.pwp.sh", custom_domain = true }]
+routes = [{ pattern = "beta.rendezvous.peerline.pwp.sh", custom_domain = true }]
