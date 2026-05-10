@@ -10,6 +10,7 @@ use super::{
 use crate::{
     discovery::{descriptor_record_key, provider_record_key},
     protocol::{PROTOCOL_VERSION, SecureFrame, WireFrame, decrypt_secure, libp2p_transcript},
+    rendezvous,
 };
 use futures::StreamExt;
 use libp2p::{
@@ -50,22 +51,37 @@ pub(crate) async fn recv_libp2p(
     let mut sessions: HashMap<PeerId, ReceiverSession> = HashMap::new();
     let mut descriptor_interval = time::interval(Duration::from_secs(10));
 
-    publish_receiver_descriptor(
+    let descriptor = publish_receiver_descriptor(
         &mut swarm,
         record_key.clone(),
         provider_key.clone(),
         &options,
     )?;
+    let _ = rendezvous::publish_peer_descriptor(
+        &options.name,
+        &options.code,
+        &descriptor,
+        &options.discovery.rendezvous,
+    )
+    .await;
 
     loop {
         tokio::select! {
             _ = descriptor_interval.tick() => {
-                let _ = publish_receiver_descriptor(
+                if let Ok(descriptor) = publish_receiver_descriptor(
                     &mut swarm,
                     record_key.clone(),
                     provider_key.clone(),
                     &options,
-                );
+                ) {
+                    let _ = rendezvous::publish_peer_descriptor(
+                        &options.name,
+                        &options.code,
+                        &descriptor,
+                        &options.discovery.rendezvous,
+                    )
+                    .await;
+                }
             }
             event = swarm.select_next_some() => {
                 match event {
@@ -91,12 +107,20 @@ pub(crate) async fn recv_libp2p(
                         for addr in info.listen_addrs {
                             swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                         }
-                        let _ = publish_receiver_descriptor(
+                        if let Ok(descriptor) = publish_receiver_descriptor(
                             &mut swarm,
                             record_key.clone(),
                             provider_key.clone(),
                             &options,
-                        );
+                        ) {
+                            let _ = rendezvous::publish_peer_descriptor(
+                                &options.name,
+                                &options.code,
+                                &descriptor,
+                                &options.discovery.rendezvous,
+                            )
+                            .await;
+                        }
                     }
                     SwarmEvent::Behaviour(TransferBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
                         for (peer, addr) in peers {
@@ -110,12 +134,20 @@ pub(crate) async fn recv_libp2p(
                                 | relay::client::Event::OutboundCircuitEstablished { .. }
                                 | relay::client::Event::InboundCircuitEstablished { .. }
                         ) {
-                            let _ = publish_receiver_descriptor(
+                            if let Ok(descriptor) = publish_receiver_descriptor(
                                 &mut swarm,
                                 record_key.clone(),
                                 provider_key.clone(),
                                 &options,
-                            );
+                            ) {
+                                let _ = rendezvous::publish_peer_descriptor(
+                                    &options.name,
+                                    &options.code,
+                                    &descriptor,
+                                    &options.discovery.rendezvous,
+                                )
+                                .await;
+                            }
                         }
                     }
                     SwarmEvent::Behaviour(TransferBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
@@ -125,12 +157,20 @@ pub(crate) async fn recv_libp2p(
                     | SwarmEvent::ConnectionEstablished { .. }
                     | SwarmEvent::ExternalAddrConfirmed { .. }
                     | SwarmEvent::NewExternalAddrCandidate { .. } => {
-                        let _ = publish_receiver_descriptor(
+                        if let Ok(descriptor) = publish_receiver_descriptor(
                             &mut swarm,
                             record_key.clone(),
                             provider_key.clone(),
                             &options,
-                        );
+                        ) {
+                            let _ = rendezvous::publish_peer_descriptor(
+                                &options.name,
+                                &options.code,
+                                &descriptor,
+                                &options.discovery.rendezvous,
+                            )
+                            .await;
+                        }
                     }
                     _ => {}
                 }

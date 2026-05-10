@@ -8,6 +8,8 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
+blake3.workspace = true
 futures.workspace = true
 libp2p.workspace = true
 libp2p-webrtc.workspace = true
@@ -15,9 +17,12 @@ local-ip-address.workspace = true
 rand.workspace = true
 peerline-core = { path = "../peerline-core" }
 peerline-crypto = { path = "../peerline-crypto" }
+peerline-rendezvous-model = { path = "../peerline-rendezvous-model" }
 peerline-transfer = { path = "../peerline-transfer" }
 postcard.workspace = true
+reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

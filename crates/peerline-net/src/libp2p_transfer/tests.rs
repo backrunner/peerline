@@ -1,5 +1,6 @@
 use super::{Libp2pRecvOptions, Libp2pSendOptions, recv_libp2p, send_libp2p};
 use crate::discovery::{DiscoveryConfig, RouteKind};
+use crate::rendezvous::RendezvousConfig;
 use futures::StreamExt;
 use libp2p::{multiaddr::Protocol, swarm::SwarmEvent};
 use peerline_core::{Compression, HumanCode, HumanName};
@@ -52,6 +53,7 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
         allow_loopback_endpoints: false,
         allow_relay_data_fallback: false,
         bootstrap_peers: vec![bootstrap_peer],
+        rendezvous: RendezvousConfig::disabled(),
     };
 
     let recv_task = tokio::spawn(recv_libp2p(Libp2pRecvOptions {

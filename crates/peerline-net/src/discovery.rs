@@ -1,3 +1,4 @@
+use crate::rendezvous::{self, RendezvousConfig};
 use futures::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, identify, kad, mdns, noise, ping,
@@ -5,6 +6,7 @@ use libp2p::{
     yamux,
 };
 use peerline_core::{ConnectionRoute, HumanCode, HumanName, LookupKey, NameCode};
+use peerline_rendezvous_model::PeerDescriptor;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::{
@@ -49,6 +51,7 @@ pub struct DiscoveryConfig {
     pub allow_loopback_endpoints: bool,
     pub allow_relay_data_fallback: bool,
     pub bootstrap_peers: Vec<String>,
+    pub rendezvous: RendezvousConfig,
 }
 
 impl Default for DiscoveryConfig {
@@ -66,6 +69,7 @@ impl Default for DiscoveryConfig {
                     .map(|addr| (*addr).into())
                     .collect()
             }),
+            rendezvous: RendezvousConfig::default(),
         }
     }
 }
@@ -88,64 +92,73 @@ pub fn descriptor_record_key(lookup_key: &LookupKey) -> libp2p::kad::RecordKey {
     libp2p::kad::RecordKey::new(&format!("/peerline/descriptor/v1/{}", lookup_key.hex()))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerDescriptor {
-    pub protocol_version: u16,
-    pub peer_id: String,
-    pub direct_endpoints: Vec<String>,
-    pub libp2p_endpoints: Vec<String>,
-    pub published_unix_ms: u64,
+pub(crate) fn make_peer_descriptor(
+    protocol_version: u16,
+    peer_id: impl Into<String>,
+    direct_endpoints: Vec<String>,
+    libp2p_endpoints: Vec<String>,
+) -> PeerDescriptor {
+    PeerDescriptor {
+        protocol_version,
+        peer_id: peer_id.into(),
+        direct_endpoints,
+        libp2p_endpoints,
+        published_unix_ms: now_unix_ms(),
+    }
 }
 
-impl PeerDescriptor {
-    pub fn direct_endpoint_candidates(&self) -> Vec<SocketAddr> {
-        let mut endpoints = self
-            .direct_endpoints
-            .iter()
-            .filter_map(|endpoint| endpoint.parse().ok())
-            .filter(|endpoint: &SocketAddr| is_usable_endpoint_ip(&endpoint.ip(), true))
-            .collect::<Vec<_>>();
-        endpoints.sort_by_key(direct_endpoint_priority);
-        endpoints.dedup();
-        endpoints
-    }
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
-    pub fn libp2p_endpoint_candidates(&self) -> Vec<Multiaddr> {
-        let mut endpoints = self
-            .libp2p_endpoints
-            .iter()
-            .filter_map(|endpoint| endpoint.parse().ok())
-            .filter(is_dialable_multiaddr)
-            .collect::<Vec<_>>();
-        endpoints.sort_by_key(libp2p_endpoint_priority);
-        endpoints.dedup();
-        endpoints
-    }
+pub(crate) fn direct_endpoint_candidates(descriptor: &PeerDescriptor) -> Vec<SocketAddr> {
+    let mut endpoints = descriptor
+        .direct_endpoints
+        .iter()
+        .filter_map(|endpoint| endpoint.parse().ok())
+        .filter(|endpoint: &SocketAddr| is_usable_endpoint_ip(&endpoint.ip(), true))
+        .collect::<Vec<_>>();
+    endpoints.sort_by_key(direct_endpoint_priority);
+    endpoints.dedup();
+    endpoints
+}
 
-    pub fn candidates(&self) -> Vec<Candidate> {
-        let mut candidates = Vec::new();
-        let peer_id = self.peer_id.clone();
-        let direct = self
-            .direct_endpoint_candidates()
-            .into_iter()
-            .map(|endpoint| Candidate {
-                peer_id: peer_id.clone(),
-                addresses: vec![endpoint.to_string()],
-                route: route_kind_from_direct_endpoint(&endpoint),
-            });
-        candidates.extend(direct);
+pub(crate) fn libp2p_endpoint_candidates(descriptor: &PeerDescriptor) -> Vec<Multiaddr> {
+    let mut endpoints = descriptor
+        .libp2p_endpoints
+        .iter()
+        .filter_map(|endpoint| endpoint.parse().ok())
+        .filter(is_dialable_multiaddr)
+        .collect::<Vec<_>>();
+    endpoints.sort_by_key(libp2p_endpoint_priority);
+    endpoints.dedup();
+    endpoints
+}
 
-        let libp2p = self.libp2p_endpoint_candidates().into_iter().map(|addr| {
-            let route = route_kind_from_multiaddr(&addr);
-            Candidate {
-                peer_id: peer_id.clone(),
-                addresses: vec![addr.to_string()],
-                route,
-            }
+pub(crate) fn descriptor_candidates(descriptor: &PeerDescriptor) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    let peer_id = descriptor.peer_id.clone();
+    let direct = direct_endpoint_candidates(descriptor)
+        .into_iter()
+        .map(|endpoint| Candidate {
+            peer_id: peer_id.clone(),
+            addresses: vec![endpoint.to_string()],
+            route: route_kind_from_direct_endpoint(&endpoint),
         });
-        candidates.extend(libp2p);
-        rank_candidates(candidates)
-    }
+    candidates.extend(direct);
+
+    let libp2p = libp2p_endpoint_candidates(descriptor)
+        .into_iter()
+        .map(|addr| Candidate {
+            peer_id: peer_id.clone(),
+            addresses: vec![addr.to_string()],
+            route: route_kind_from_multiaddr(&addr),
+        });
+    candidates.extend(libp2p);
+    rank_candidates(candidates)
 }
 
 pub struct DiscoveryHandle {
@@ -195,7 +208,7 @@ pub async fn discover_direct_endpoint(
 ) -> anyhow::Result<Option<SocketAddr>> {
     Ok(discover_peer_descriptor(name, code, config)
         .await?
-        .and_then(|descriptor| descriptor.direct_endpoint_candidates().into_iter().next()))
+        .and_then(|descriptor| direct_endpoint_candidates(&descriptor).into_iter().next()))
 }
 
 pub async fn discover_direct_endpoints(
@@ -205,7 +218,7 @@ pub async fn discover_direct_endpoints(
 ) -> anyhow::Result<Vec<SocketAddr>> {
     Ok(discover_peer_descriptor(name, code, config)
         .await?
-        .map(|descriptor| descriptor.direct_endpoint_candidates())
+        .map(|descriptor| direct_endpoint_candidates(&descriptor))
         .unwrap_or_default())
 }
 
@@ -264,9 +277,15 @@ impl DiscoverySnapshot {
     }
 
     fn insert_descriptor(&mut self, descriptor: PeerDescriptor) {
+        let Ok(peer_id) = descriptor.peer_id.parse::<PeerId>() else {
+            return;
+        };
+        let mut descriptor = descriptor;
+        descriptor.published_unix_ms = descriptor.published_unix_ms.min(now_unix_ms());
         match self.descriptors.get(&descriptor.peer_id) {
             Some(current) if current.published_unix_ms > descriptor.published_unix_ms => {}
             _ => {
+                self.observed_peers.insert(peer_id);
                 self.descriptors
                     .insert(descriptor.peer_id.clone(), descriptor);
             }
@@ -277,17 +296,23 @@ impl DiscoverySnapshot {
         self.descriptors.values().cloned().max_by_key(|descriptor| {
             (
                 descriptor.published_unix_ms,
-                descriptor.candidates().len(),
+                descriptor_candidates(descriptor).len(),
                 descriptor.peer_id.clone(),
             )
         })
+    }
+
+    fn has_usable_candidates(&self) -> bool {
+        self.descriptors
+            .values()
+            .any(|descriptor| !descriptor_candidates(descriptor).is_empty())
     }
 
     fn into_candidates(self) -> Vec<Candidate> {
         rank_candidates(
             self.descriptors
                 .into_values()
-                .flat_map(|descriptor| descriptor.candidates()),
+                .flat_map(|descriptor| descriptor_candidates(&descriptor)),
         )
     }
 }
@@ -301,6 +326,30 @@ async fn discover_peer_descriptors(
     let lookup_key = name_code.lookup_key();
     let descriptor_key = descriptor_record_key(&lookup_key);
     let provider_key = provider_record_key(&lookup_key);
+    let mut snapshot = DiscoverySnapshot::new();
+
+    match rendezvous::discover_peer_descriptors(name, code, &config.rendezvous).await {
+        Ok(descriptors) => {
+            if !descriptors.is_empty() {
+                tracing::debug!(
+                    count = descriptors.len(),
+                    "rendezvous discovery returned descriptors"
+                );
+            }
+            for descriptor in descriptors {
+                snapshot.insert_descriptor(descriptor);
+            }
+            if snapshot.is_diverse_enough(config.min_candidate_diversity)
+                && snapshot.has_usable_candidates()
+            {
+                return Ok(Some(snapshot));
+            }
+        }
+        Err(error) => {
+            tracing::debug!(%error, "rendezvous discovery failed");
+        }
+    }
+
     let mut swarm = build_discovery_swarm(false, config.enable_mdns)?;
     apply_bootstrap(&mut swarm, &config);
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
@@ -308,7 +357,6 @@ async fn discover_peer_descriptors(
     let mut query_interval = time::interval(Duration::from_millis(750));
     let deadline = time::sleep(config.lookup_timeout);
     tokio::pin!(deadline);
-    let mut snapshot = DiscoverySnapshot::new();
 
     loop {
         tokio::select! {
@@ -361,47 +409,71 @@ async fn run_descriptor_publisher(
     let allow_loopback = config.allow_loopback_endpoints;
     let mut interval = time::interval(Duration::from_secs(60));
 
-    publish_descriptor(
+    let descriptor = publish_descriptor(
         &mut swarm,
         record_key.clone(),
         provider_key.clone(),
         direct_bind,
         allow_loopback,
     )?;
+    let _ = rendezvous::publish_peer_descriptor(
+        &name_code.name,
+        &name_code.code,
+        &descriptor,
+        &config.rendezvous,
+    )
+    .await;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                publish_descriptor(
+                let descriptor = publish_descriptor(
                     &mut swarm,
                     record_key.clone(),
                     provider_key.clone(),
                     direct_bind,
                     allow_loopback,
                 )?;
+                let _ = rendezvous::publish_peer_descriptor(&name_code.name, &name_code.code, &descriptor, &config.rendezvous).await;
             }
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::Behaviour(event) => {
                         let should_publish = handle_discovery_event(&mut swarm, event);
                         if should_publish {
-                            let _ = publish_descriptor(
+                            if let Ok(descriptor) = publish_descriptor(
                                 &mut swarm,
                                 record_key.clone(),
                                 provider_key.clone(),
                                 direct_bind,
                                 allow_loopback,
-                            );
+                            ) {
+                                let _ = rendezvous::publish_peer_descriptor(
+                                    &name_code.name,
+                                    &name_code.code,
+                                    &descriptor,
+                                    &config.rendezvous,
+                                )
+                                .await;
+                            }
                         }
                     }
                     SwarmEvent::ConnectionEstablished { .. } => {
-                        let _ = publish_descriptor(
+                        if let Ok(descriptor) = publish_descriptor(
                             &mut swarm,
                             record_key.clone(),
                             provider_key.clone(),
                             direct_bind,
                             allow_loopback,
-                        );
+                        ) {
+                            let _ = rendezvous::publish_peer_descriptor(
+                                &name_code.name,
+                                &name_code.code,
+                                &descriptor,
+                                &config.rendezvous,
+                            )
+                            .await;
+                        }
                     }
                     _ => {}
                 }
@@ -458,24 +530,20 @@ fn publish_descriptor(
     provider_key: kad::RecordKey,
     direct_bind: SocketAddr,
     allow_loopback: bool,
-) -> anyhow::Result<()> {
-    let descriptor = PeerDescriptor {
-        protocol_version: 1,
-        peer_id: swarm.local_peer_id().to_string(),
-        direct_endpoints: direct_endpoints(direct_bind, allow_loopback)
+) -> anyhow::Result<PeerDescriptor> {
+    let descriptor = make_peer_descriptor(
+        1,
+        swarm.local_peer_id().to_string(),
+        direct_endpoints(direct_bind, allow_loopback)
             .into_iter()
             .map(|endpoint| endpoint.to_string())
             .collect(),
-        libp2p_endpoints: swarm
+        swarm
             .listeners()
             .chain(swarm.external_addresses())
             .map(ToString::to_string)
             .collect(),
-        published_unix_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64,
-    };
+    );
     let record = kad::Record::new(record_key, postcard::to_allocvec(&descriptor)?);
     if let Err(error) = swarm
         .behaviour_mut()
@@ -487,7 +555,7 @@ fn publish_descriptor(
     if let Err(error) = swarm.behaviour_mut().kad.start_providing(provider_key) {
         tracing::warn!(%error, "could not start DHT provider publish");
     }
-    Ok(())
+    Ok(descriptor)
 }
 
 fn handle_discovery_query_result(snapshot: &mut DiscoverySnapshot, result: kad::QueryResult) {
@@ -824,7 +892,7 @@ mod tests {
             published_unix_ms: 0,
         };
 
-        let endpoints = descriptor.direct_endpoint_candidates();
+        let endpoints = direct_endpoint_candidates(&descriptor);
         assert_eq!(endpoints[0], "192.168.1.20:43117".parse().unwrap());
         assert_eq!(endpoints[1], "203.0.113.7:43117".parse().unwrap());
         assert_eq!(endpoints[2], "127.0.0.1:43117".parse().unwrap());
@@ -909,5 +977,59 @@ mod tests {
             published_unix_ms: 1,
         });
         assert!(snapshot.is_diverse_enough(3));
+    }
+
+    #[test]
+    fn empty_descriptors_do_not_count_as_usable_candidates() {
+        let mut snapshot = DiscoverySnapshot::new();
+        let peer = PeerId::random();
+        snapshot.observe_local_peer(peer);
+        snapshot.insert_descriptor(PeerDescriptor {
+            protocol_version: 1,
+            peer_id: peer.to_string(),
+            direct_endpoints: vec![],
+            libp2p_endpoints: vec![],
+            published_unix_ms: 1,
+        });
+
+        assert!(snapshot.is_diverse_enough(1));
+        assert!(!snapshot.has_usable_candidates());
+    }
+
+    #[test]
+    fn invalid_peer_ids_are_ignored_during_discovery() {
+        let mut snapshot = DiscoverySnapshot::new();
+        snapshot.insert_descriptor(PeerDescriptor {
+            protocol_version: 1,
+            peer_id: "not-a-peer-id".into(),
+            direct_endpoints: vec!["192.168.1.20:43117".into()],
+            libp2p_endpoints: vec![],
+            published_unix_ms: 1,
+        });
+
+        assert!(snapshot.descriptors.is_empty());
+        assert!(snapshot.observed_peers.is_empty());
+    }
+
+    #[test]
+    fn future_timestamps_are_clamped_during_discovery() {
+        let mut snapshot = DiscoverySnapshot::new();
+        let peer = PeerId::random();
+        let before = now_unix_ms();
+        snapshot.insert_descriptor(PeerDescriptor {
+            protocol_version: 1,
+            peer_id: peer.to_string(),
+            direct_endpoints: vec!["192.168.1.20:43117".into()],
+            libp2p_endpoints: vec![],
+            published_unix_ms: u64::MAX,
+        });
+        let after = now_unix_ms();
+
+        let stored = snapshot
+            .descriptors
+            .get(&peer.to_string())
+            .expect("descriptor should be stored");
+        assert!(stored.published_unix_ms <= after);
+        assert!(stored.published_unix_ms >= before);
     }
 }

@@ -4,10 +4,12 @@ members = [
     "crates/peerline-core",
     "crates/peerline-crypto",
     "crates/peerline-net",
+    "crates/peerline-rendezvous-model",
     "crates/peerline-testkit",
     "crates/peerline-transfer",
     "crates/peerline-tui",
 ]
+exclude = ["services/peerline-rendezvous"]
 resolver = "2"
 
 [workspace.package]
@@ -56,6 +58,7 @@ postcard = { version = "1.1.3", features = ["alloc"] }
 proptest = "1.9.0"
 rand = "0.8.5"
 ratatui = "0.29.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rpassword = "7.4.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

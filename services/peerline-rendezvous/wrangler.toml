@@ -1,0 +1,19 @@
+name = "peerline-rendezvous"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-05-10"
+workers_dev = false
+routes = [{ pattern = "peerline.pwp.sh", custom_domain = true }]
+
+[build]
+command = "cargo install worker-build && worker-build --release --panic-unwind"
+
+[vars]
+PEERLINE_RENDEZVOUS_MAX_TTL_SECS = "180"
+PEERLINE_RENDEZVOUS_REQUIRE_MTLS = "1"
+
+[durable_objects]
+bindings = [{ name = "RENDEZVOUS", class_name = "RendezvousShard" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RendezvousShard"]

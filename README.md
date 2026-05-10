@@ -23,6 +23,8 @@ Peerline has two roles:
 
 For named transfers, the receiver publishes a short-lived descriptor keyed by the shared name and code. The sender derives the same lookup key, discovers candidate routes, and tries them in order. Peerline prefers direct LAN or public TCP endpoints first, then libp2p routes such as DCUtR and WebRTC TURN. Relay data fallback is available only when explicitly enabled.
 
+Peerline also probes HTTP rendezvous first, with a default endpoint at `https://peerline.pwp.sh`, then falls back to DHT and mDNS. Official builds use a private mTLS-protected rendezvous endpoint; set `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH` or `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM` to a PEM bundle with the client certificate and private key, or set `PEERLINE_RENDEZVOUS_URLS` / `PEERLINE_RENDEZVOUS_URL` to point at another compatible rendezvous service. Use `PEERLINE_RENDEZVOUS_TOKEN` only when the rendezvous service expects a shared secret.
+
 For direct transfers, the sender can skip discovery and dial an IP address or `host:port` directly. This is useful on the same network, over VPNs, or whenever the receiver already knows which address the sender should use. If you only provide an IP, Peerline probes the default direct window `43117-43121`.
 
 During a transfer, Peerline scans the requested paths into a manifest, preserves directories with safe relative paths, compresses when useful, and streams the archive to the receiver. The receiver verifies file sizes and BLAKE3 hashes before writing files into the current directory. Existing files are kept by default; conflicting names receive a non-overwriting suffix unless `--overwrite` is used.
@@ -135,11 +137,12 @@ Relay fallback must be enabled on both sides when you want Peerline to use relay
 ## Current Status
 
 - Direct IP send and receive works.
-- Named discovery uses saved names, generated codes, OPAQUE PAKE, Kademlia provider records, mDNS, DCUtR, relay fallback, and libp2p-webrtc's built-in ICE servers.
+- Named discovery now uses HTTP rendezvous first, then Kademlia provider records, mDNS, DCUtR, relay fallback, and libp2p-webrtc's built-in ICE servers.
 - Files, multiple files, and folders are archived with safe relative paths, BLAKE3 integrity checks, and streaming zstd/lzma compression support.
 - Conflicts default to non-overwrite behavior, with TUI-driven handling in the receiver flow.
 - The receive side includes a modern terminal UI for identity, route state, and transfer progress.
 - The workspace test suite and E2E coverage are in place.
+- The repository also includes a private Cloudflare Worker rendezvous service in `services/peerline-rendezvous`.
 
 ## License
 

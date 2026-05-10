@@ -1,0 +1,17 @@
+[package]
+name = "peerline-rendezvous-worker"
+version = "0.1.0-alpha.9"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/backrunner/peerline"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+console_error_panic_hook = "0.1.7"
+peerline-rendezvous-model = { path = "../../crates/peerline-rendezvous-model" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+wasm-bindgen = "0.2.121"
+worker = "0.8.3"

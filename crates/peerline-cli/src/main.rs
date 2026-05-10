@@ -455,11 +455,11 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
         "peer",
         name.to_string(),
         code.clone(),
-        "discovering routes through libp2p Kademlia/mDNS...".into(),
+        "discovering routes through rendezvous, DHT, and mDNS...".into(),
         quit_signal,
     );
     if events.is_none() {
-        println!("discovering {name} through libp2p Kademlia/mDNS...");
+        println!("discovering {name} through rendezvous, DHT, and mDNS...");
     }
     let discovery = peerline_net::DiscoveryConfig {
         allow_relay_data_fallback: allow_relay_fallback,
