@@ -509,13 +509,14 @@ async fn run_dashboard(
             }
             _ = tick.tick() => {
                 while crossterm::event::poll(Duration::from_millis(0))? {
-                    if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                        if is_quit_key(key.code) {
+                    match crossterm::event::read()? {
+                        crossterm::event::Event::Key(key) if is_quit_key(key.code) => {
                             if let Some(signal) = quit_signal.as_ref() {
                                 let _ = signal.send(true);
                             }
                             return Ok(());
                         }
+                        _ => {}
                     }
                 }
             }

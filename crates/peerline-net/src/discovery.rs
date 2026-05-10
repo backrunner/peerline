@@ -440,22 +440,22 @@ async fn run_descriptor_publisher(
                 match event {
                     SwarmEvent::Behaviour(event) => {
                         let should_publish = handle_discovery_event(&mut swarm, event);
-                        if should_publish {
-                            if let Ok(descriptor) = publish_descriptor(
+                        if should_publish
+                            && let Ok(descriptor) = publish_descriptor(
                                 &mut swarm,
                                 record_key.clone(),
                                 provider_key.clone(),
                                 direct_bind,
                                 allow_loopback,
-                            ) {
-                                let _ = rendezvous::publish_peer_descriptor(
-                                    &name_code.name,
-                                    &name_code.code,
-                                    &descriptor,
-                                    &config.rendezvous,
-                                )
-                                .await;
-                            }
+                            )
+                        {
+                            let _ = rendezvous::publish_peer_descriptor(
+                                &name_code.name,
+                                &name_code.code,
+                                &descriptor,
+                                &config.rendezvous,
+                            )
+                            .await;
                         }
                     }
                     SwarmEvent::ConnectionEstablished { .. } => {

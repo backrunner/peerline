@@ -133,21 +133,20 @@ pub(crate) async fn recv_libp2p(
                             relay::client::Event::ReservationReqAccepted { .. }
                                 | relay::client::Event::OutboundCircuitEstablished { .. }
                                 | relay::client::Event::InboundCircuitEstablished { .. }
-                        ) {
-                            if let Ok(descriptor) = publish_receiver_descriptor(
+                        ) && let Ok(descriptor) = publish_receiver_descriptor(
                                 &mut swarm,
                                 record_key.clone(),
                                 provider_key.clone(),
                                 &options,
-                            ) {
-                                let _ = rendezvous::publish_peer_descriptor(
-                                    &options.name,
-                                    &options.code,
-                                    &descriptor,
-                                    &options.discovery.rendezvous,
-                                )
-                                .await;
-                            }
+                            )
+                        {
+                            let _ = rendezvous::publish_peer_descriptor(
+                                &options.name,
+                                &options.code,
+                                &descriptor,
+                                &options.discovery.rendezvous,
+                            )
+                            .await;
                         }
                     }
                     SwarmEvent::Behaviour(TransferBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {

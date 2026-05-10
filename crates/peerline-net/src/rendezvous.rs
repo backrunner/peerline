@@ -363,9 +363,7 @@ fn client_identity_from_env() -> Option<RendezvousClientIdentity> {
 
 fn is_default_private_endpoint(url: &Url) -> bool {
     url.scheme() == "https"
-        && url
-            .host_str()
-            .is_some_and(|host| is_peerline_private_host(host))
+        && url.host_str().is_some_and(is_peerline_private_host)
         && url.port_or_known_default() == Some(443)
 }
 
