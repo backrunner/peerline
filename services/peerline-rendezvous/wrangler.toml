@@ -17,3 +17,9 @@ bindings = [{ name = "RENDEZVOUS", class_name = "RendezvousShard" }]
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["RendezvousShard"]
+
+[env.alpha]
+routes = [{ pattern = "alpha.peerline.pwp.sh", custom_domain = true }]
+
+[env.beta]
+routes = [{ pattern = "beta.peerline.pwp.sh", custom_domain = true }]

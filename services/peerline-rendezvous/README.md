@@ -36,6 +36,12 @@ cd services/peerline-rendezvous
 npx wrangler deploy
 ```
 
-The default route is the custom domain `peerline.pwp.sh`.
+The default production route is the custom domain `peerline.pwp.sh`.
+Prerelease deployments use isolated subdomains:
+
+- `alpha` -> `alpha.peerline.pwp.sh`
+- `beta` -> `beta.peerline.pwp.sh`
+
+Deploy them with `npx wrangler deploy --env alpha` or `npx wrangler deploy --env beta`.
 
 The Worker also uses an internal Durable Object rate window. If your Cloudflare account has the Rate Limiting binding enabled, bind it as `RATE_LIMITER`; the Worker will use it before Durable Object routing and continue to enforce the internal limit as a backstop.

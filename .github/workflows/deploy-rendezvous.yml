@@ -1,4 +1,4 @@
-name: Deploy Rendezvous Worker
+name: Deploy Rendezvous Worker (production)
 
 on:
   push:

@@ -10,9 +10,18 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const DEFAULT_RENDEZVOUS_ENDPOINT: &str = "https://peerline.pwp.sh";
 const DEFAULT_RENDEZVOUS_TTL_SECS: u32 = 120;
 const DEFAULT_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(5);
+const PEERLINE_RENDEZVOUS_HOST_ROOT: &str = "peerline.pwp.sh";
+const PEERLINE_RENDEZVOUS_HOST_ALPHA: &str = "alpha.peerline.pwp.sh";
+const PEERLINE_RENDEZVOUS_HOST_BETA: &str = "beta.peerline.pwp.sh";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseChannel {
+    Alpha,
+    Beta,
+    Stable,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RendezvousConfig {
@@ -53,12 +62,14 @@ impl RendezvousConfig {
 impl Default for RendezvousConfig {
     fn default() -> Self {
         let endpoints = rendezvous_endpoints_from_env().unwrap_or_else(|| {
-            vec![Url::parse(DEFAULT_RENDEZVOUS_ENDPOINT).expect("default rendezvous URL is valid")]
+            vec![
+                Url::parse(default_rendezvous_endpoint()).expect("default rendezvous URL is valid"),
+            ]
         });
         let client_identity = client_identity_from_env();
         if endpoints.iter().any(is_default_private_endpoint) && client_identity.is_none() {
             tracing::warn!(
-                "default private rendezvous endpoint requires PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM or PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH"
+                "default peerline rendezvous endpoint requires PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM or PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH"
             );
         }
 
@@ -317,6 +328,23 @@ fn auth_token_for_request<'a>(config: &'a RendezvousConfig, _url: &Url) -> Optio
     config.auth_token.as_deref()
 }
 
+fn default_rendezvous_endpoint() -> &'static str {
+    match release_channel_from_version(env!("CARGO_PKG_VERSION")) {
+        ReleaseChannel::Alpha => "https://alpha.peerline.pwp.sh",
+        ReleaseChannel::Beta => "https://beta.peerline.pwp.sh",
+        ReleaseChannel::Stable => "https://peerline.pwp.sh",
+    }
+}
+
+fn release_channel_from_version(version: &str) -> ReleaseChannel {
+    let prerelease = version.split_once('-').map(|(_, suffix)| suffix);
+    match prerelease.and_then(|suffix| suffix.split('.').next()) {
+        Some("alpha") => ReleaseChannel::Alpha,
+        Some("beta") => ReleaseChannel::Beta,
+        _ => ReleaseChannel::Stable,
+    }
+}
+
 fn client_identity_from_env() -> Option<RendezvousClientIdentity> {
     if let Ok(raw) = std::env::var("PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM") {
         let pem = raw.trim();
@@ -335,8 +363,19 @@ fn client_identity_from_env() -> Option<RendezvousClientIdentity> {
 
 fn is_default_private_endpoint(url: &Url) -> bool {
     url.scheme() == "https"
-        && url.host_str() == Some("peerline.pwp.sh")
+        && url
+            .host_str()
+            .is_some_and(|host| is_peerline_private_host(host))
         && url.port_or_known_default() == Some(443)
+}
+
+fn is_peerline_private_host(host: &str) -> bool {
+    matches!(
+        host,
+        PEERLINE_RENDEZVOUS_HOST_ROOT
+            | PEERLINE_RENDEZVOUS_HOST_ALPHA
+            | PEERLINE_RENDEZVOUS_HOST_BETA
+    )
 }
 
 fn usable_endpoints(config: &RendezvousConfig) -> Vec<&Url> {
@@ -379,11 +418,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_private_endpoint_is_identified_by_origin() {
-        let url = Url::parse("https://peerline.pwp.sh/v1/namespaces/abc/registrations")
-            .expect("valid rendezvous URL");
+    fn default_rendezvous_endpoint_matches_release_channel() {
+        let url = Url::parse(default_rendezvous_endpoint()).expect("valid rendezvous URL");
+
+        match release_channel_from_version(env!("CARGO_PKG_VERSION")) {
+            ReleaseChannel::Alpha => {
+                assert_eq!(url.host_str(), Some(PEERLINE_RENDEZVOUS_HOST_ALPHA))
+            }
+            ReleaseChannel::Beta => assert_eq!(url.host_str(), Some(PEERLINE_RENDEZVOUS_HOST_BETA)),
+            ReleaseChannel::Stable => {
+                assert_eq!(url.host_str(), Some(PEERLINE_RENDEZVOUS_HOST_ROOT))
+            }
+        }
 
         assert!(is_default_private_endpoint(&url));
+    }
+
+    #[test]
+    fn peerline_private_endpoints_are_identified_by_origin() {
+        for host in [
+            PEERLINE_RENDEZVOUS_HOST_ROOT,
+            PEERLINE_RENDEZVOUS_HOST_ALPHA,
+            PEERLINE_RENDEZVOUS_HOST_BETA,
+        ] {
+            let url = Url::parse(&format!("https://{host}/v1/namespaces/abc/registrations"))
+                .expect("valid rendezvous URL");
+
+            assert!(is_default_private_endpoint(&url));
+        }
+
         assert!(!is_default_private_endpoint(
             &Url::parse("https://example.com/v1/namespaces/abc/registrations")
                 .expect("valid rendezvous URL")
@@ -392,7 +455,7 @@ mod tests {
 
     #[test]
     fn default_private_endpoint_is_skipped_without_client_identity() {
-        let private = Url::parse(DEFAULT_RENDEZVOUS_ENDPOINT).expect("valid rendezvous URL");
+        let private = Url::parse(default_rendezvous_endpoint()).expect("valid rendezvous URL");
         let public = Url::parse("https://example.com").expect("valid rendezvous URL");
         let config = RendezvousConfig {
             endpoints: vec![private, public.clone()],

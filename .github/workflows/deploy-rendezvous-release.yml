@@ -1,0 +1,90 @@
+name: Deploy Rendezvous Worker (release)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Release channel for the Worker."
+        required: true
+        type: choice
+        default: alpha
+        options:
+          - alpha
+          - beta
+          - stable
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Resolve release channel
+        id: channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="${{ github.event_name == 'workflow_dispatch' && inputs.channel || '' }}"
+          if [ -z "$channel" ]; then
+            version="$(node -p "require('./package.json').version")"
+            case "$version" in
+              *-alpha.*) channel=alpha ;;
+              *-beta.*) channel=beta ;;
+              *) channel=stable ;;
+            esac
+          fi
+          case "$channel" in
+            alpha|beta|stable) ;;
+            *) echo "unsupported release channel: $channel" >&2; exit 1 ;;
+          esac
+          case "$channel" in
+            alpha) command="deploy --env alpha" ;;
+            beta) command="deploy --env beta" ;;
+            stable) command="deploy" ;;
+          esac
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "command=$command" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Cloudflare credentials
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+
+      - name: Check Worker
+        shell: bash
+        run: cargo check --manifest-path services/peerline-rendezvous/Cargo.toml --target wasm32-unknown-unknown
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: services/peerline-rendezvous
+          command: ${{ steps.channel.outputs.command }}
+          wranglerVersion: "4"
