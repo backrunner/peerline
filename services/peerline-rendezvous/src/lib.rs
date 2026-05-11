@@ -34,31 +34,68 @@ const SIGNATURE_SKEW_MS: i64 = 5 * 60 * 1000;
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
 
-    if matches!(req.method(), Method::Get) && req.path() == "/healthz" {
-        return Response::ok("ok");
+    let telemetry = RequestTelemetry::from_request(&req)?;
+
+    if matches!(req.method(), Method::Get) && telemetry.path == "/healthz" {
+        let response = Response::ok("ok")?;
+        log_request_complete("rendezvous_healthz", &telemetry, response.status_code());
+        return with_observability_headers(response, &telemetry);
     }
 
-    let path = req.path();
-    let Some(namespace) = namespace_from_path(&path) else {
-        return Response::error("not found", 404);
+    let Some(namespace) = namespace_from_path(&telemetry.path) else {
+        return observed_error_response(
+            "rendezvous_edge_rejected",
+            &telemetry,
+            None,
+            "not found",
+            404,
+            serde_json::json!({ "reason": "route_not_found" }),
+        );
     };
     if !is_valid_namespace(namespace) {
-        return Response::error("invalid namespace", 400);
+        return observed_error_response(
+            "rendezvous_edge_rejected",
+            &telemetry,
+            Some(namespace),
+            "invalid namespace",
+            400,
+            serde_json::json!({ "reason": "invalid_namespace" }),
+        );
     }
     if !matches!(req.method(), Method::Get | Method::Post) {
-        return Response::error("method not allowed", 405);
+        return observed_error_response(
+            "rendezvous_edge_rejected",
+            &telemetry,
+            Some(namespace),
+            "method not allowed",
+            405,
+            serde_json::json!({ "reason": "method_not_allowed" }),
+        );
     }
 
     if let Ok(limiter) = env.rate_limiter(RATE_LIMIT_BINDING) {
         let ip = client_ip(&req)?;
         let key = format!("peerline:rendezvous:{namespace}:{}:{ip}", req.method());
         if !limiter.limit(key).await?.success {
-            return Response::error("rate limit exceeded", 429);
+            return observed_error_response(
+                "rendezvous_edge_rate_limited",
+                &telemetry,
+                Some(namespace),
+                "rate limit exceeded",
+                429,
+                serde_json::json!({ "reason": "edge_rate_limit" }),
+            );
         }
     }
 
     let stub = env.durable_object(DO_BINDING)?.get_by_name(namespace)?;
-    stub.fetch_with_request(req).await
+    let response = stub.fetch_with_request(req).await?;
+    log_request_complete(
+        "rendezvous_request_complete",
+        &telemetry,
+        response.status_code(),
+    );
+    with_observability_headers(response, &telemetry)
 }
 
 #[durable_object(fetch)]
@@ -90,45 +127,118 @@ impl DurableObject for RendezvousShard {
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
-        let path = req.path();
-        let Some(namespace) = namespace_from_path(&path) else {
-            return Response::error("not found", 404);
+        let telemetry = RequestTelemetry::from_request(&req)?;
+        let Some(namespace) = namespace_from_path(&telemetry.path) else {
+            return observed_error_response(
+                "rendezvous_do_rejected",
+                &telemetry,
+                None,
+                "not found",
+                404,
+                serde_json::json!({ "reason": "route_not_found" }),
+            );
         };
         if !is_valid_namespace(namespace) {
-            return Response::error("invalid namespace", 400);
+            return observed_error_response(
+                "rendezvous_do_rejected",
+                &telemetry,
+                Some(namespace),
+                "invalid namespace",
+                400,
+                serde_json::json!({ "reason": "invalid_namespace" }),
+            );
         }
 
         match req.method() {
-            Method::Post => self.register(namespace, &mut req).await,
-            Method::Get => self.discover(namespace, &mut req).await,
-            _ => Response::error("method not allowed", 405),
+            Method::Post => self.register(namespace, &mut req, &telemetry).await,
+            Method::Get => self.discover(namespace, &mut req, &telemetry).await,
+            _ => observed_error_response(
+                "rendezvous_do_rejected",
+                &telemetry,
+                Some(namespace),
+                "method not allowed",
+                405,
+                serde_json::json!({ "reason": "method_not_allowed" }),
+            ),
         }
     }
 }
 
 impl RendezvousShard {
-    async fn register(&self, namespace: &str, req: &mut Request) -> Result<Response> {
+    async fn register(
+        &self,
+        namespace: &str,
+        req: &mut Request,
+        telemetry: &RequestTelemetry,
+    ) -> Result<Response> {
         if !is_json_request(req)? {
-            return Response::error("content type must be application/json", 415);
+            return observed_error_response(
+                "rendezvous_register_rejected",
+                telemetry,
+                Some(namespace),
+                "content type must be application/json",
+                415,
+                serde_json::json!({ "reason": "content_type" }),
+            );
         }
 
         let body = req.bytes().await?;
         if body.len() > MAX_REQUEST_BYTES {
-            return Response::error("payload too large", 413);
+            return observed_error_response(
+                "rendezvous_register_rejected",
+                telemetry,
+                Some(namespace),
+                "payload too large",
+                413,
+                serde_json::json!({
+                    "reason": "payload_too_large",
+                    "body_bytes": body.len(),
+                    "max_body_bytes": MAX_REQUEST_BYTES,
+                }),
+            );
         }
-        if let Err(response) = self.verify_request(req, &body) {
-            return Ok(response);
+        if let Err(rejection) = self.verify_request(req, &body) {
+            return observed_rejection_response(
+                "rendezvous_auth_rejected",
+                telemetry,
+                Some(namespace),
+                rejection,
+            );
         }
         if !self.enforce_rate_limit(namespace, req, REGISTER_RATE_LIMIT)? {
-            return Response::error("rate limit exceeded", 429);
+            return observed_error_response(
+                "rendezvous_do_rate_limited",
+                telemetry,
+                Some(namespace),
+                "rate limit exceeded",
+                429,
+                serde_json::json!({
+                    "operation": "register",
+                    "limit": REGISTER_RATE_LIMIT,
+                }),
+            );
         }
 
         let request = match serde_json::from_slice::<RendezvousRegisterRequest>(&body) {
             Ok(request) => request,
-            Err(_) => return Response::error("invalid registration payload", 400),
+            Err(_) => {
+                return observed_error_response(
+                    "rendezvous_register_rejected",
+                    telemetry,
+                    Some(namespace),
+                    "invalid registration payload",
+                    400,
+                    serde_json::json!({ "reason": "invalid_json" }),
+                );
+            }
         };
-        if let Err(response) = validate_descriptor(&request.descriptor) {
-            return Ok(response);
+        if let Err(rejection) = validate_descriptor(&request.descriptor) {
+            return observed_rejection_response(
+                "rendezvous_descriptor_rejected",
+                telemetry,
+                Some(namespace),
+                rejection,
+            );
         }
 
         let now = now_unix_ms();
@@ -139,6 +249,8 @@ impl RendezvousShard {
         let mut descriptor = request.descriptor;
         descriptor.published_unix_ms = now as u64;
         let peer_id = descriptor.peer_id.clone();
+        let direct_endpoint_count = descriptor.direct_endpoints.len();
+        let libp2p_endpoint_count = descriptor.libp2p_endpoints.len();
         let descriptor_json = serde_json::to_string(&descriptor)?;
         self.sql.exec(
             "DELETE FROM registrations WHERE peer_id = ?;",
@@ -151,7 +263,7 @@ impl RendezvousShard {
                  VALUES (?, ?, ?)
                  RETURNING cookie;",
                 vec![
-                    peer_id.into(),
+                    peer_id.clone().into(),
                     expires_unix_ms.into(),
                     descriptor_json.into(),
                 ],
@@ -163,6 +275,21 @@ impl RendezvousShard {
             descriptor,
         };
 
+        log_request_event(
+            LogLevel::Info,
+            "rendezvous_register_ok",
+            telemetry,
+            Some(namespace),
+            serde_json::json!({
+                "peer_id": peer_id,
+                "cookie": row.cookie,
+                "ttl_seconds": ttl_seconds,
+                "direct_endpoint_count": direct_endpoint_count,
+                "libp2p_endpoint_count": libp2p_endpoint_count,
+                "expires_in_ms": expires_unix_ms.saturating_sub(now),
+            }),
+        );
+
         Ok(Response::from_json(&RendezvousRegisterResponse {
             cookie: row.cookie as u64,
             record,
@@ -170,12 +297,32 @@ impl RendezvousShard {
         .with_status(201))
     }
 
-    async fn discover(&self, namespace: &str, req: &mut Request) -> Result<Response> {
-        if let Err(response) = self.verify_request(req, &[]) {
-            return Ok(response);
+    async fn discover(
+        &self,
+        namespace: &str,
+        req: &mut Request,
+        telemetry: &RequestTelemetry,
+    ) -> Result<Response> {
+        if let Err(rejection) = self.verify_request(req, &[]) {
+            return observed_rejection_response(
+                "rendezvous_auth_rejected",
+                telemetry,
+                Some(namespace),
+                rejection,
+            );
         }
         if !self.enforce_rate_limit(namespace, req, DISCOVER_RATE_LIMIT)? {
-            return Response::error("rate limit exceeded", 429);
+            return observed_error_response(
+                "rendezvous_do_rate_limited",
+                telemetry,
+                Some(namespace),
+                "rate limit exceeded",
+                429,
+                serde_json::json!({
+                    "operation": "discover",
+                    "limit": DISCOVER_RATE_LIMIT,
+                }),
+            );
         }
 
         let query = req
@@ -230,50 +377,60 @@ impl RendezvousShard {
             )?
             .one()?;
 
+        log_request_event(
+            LogLevel::Info,
+            "rendezvous_discover_ok",
+            telemetry,
+            Some(namespace),
+            serde_json::json!({
+                "record_count": records.len(),
+                "after_cookie": after_cookie,
+                "limit": limit,
+                "latest_cookie": cookie.cookie,
+            }),
+        );
+
         Response::from_json(&RendezvousDiscoverResponse {
             cookie: cookie.cookie as u64,
             records,
         })
     }
 
-    fn verify_request(&self, req: &Request, body: &[u8]) -> std::result::Result<(), Response> {
+    fn verify_request(&self, req: &Request, body: &[u8]) -> std::result::Result<(), Rejection> {
         self.verify_peerline_version(req)?;
         if let Some(auth) = req.cf().and_then(|cf| cf.tls_client_auth()) {
             return self.verify_tls_client_auth(&auth);
         }
         if self.require_mtls {
-            return Err(error_response("client certificate required", 401));
+            return Err(Rejection::new("client certificate required", 401));
         }
         self.verify_hmac_request(req, body)
     }
 
-    fn verify_peerline_version(&self, req: &Request) -> std::result::Result<(), Response> {
+    fn verify_peerline_version(&self, req: &Request) -> std::result::Result<(), Rejection> {
         if req
             .headers()
             .get(HEADER_VERSION)
-            .map_err(|_| error_response("invalid version header", 400))?
+            .map_err(|_| Rejection::new("invalid version header", 400))?
             .filter(|version| !version.trim().is_empty())
             .is_none()
         {
-            return Err(error_response("missing peerline version", 401));
+            return Err(Rejection::new("missing peerline version", 401));
         }
         Ok(())
     }
 
-    fn verify_tls_client_auth(
-        &self,
-        auth: &TlsClientAuth,
-    ) -> std::result::Result<(), Response> {
+    fn verify_tls_client_auth(&self, auth: &TlsClientAuth) -> std::result::Result<(), Rejection> {
         if auth.cert_presented() != "1" {
-            return Err(error_response("client certificate required", 401));
+            return Err(Rejection::new("client certificate required", 401));
         }
         if !auth.cert_verified().eq_ignore_ascii_case("SUCCESS") {
-            return Err(error_response("invalid client certificate", 401));
+            return Err(Rejection::new("invalid client certificate", 401));
         }
         if let Some(allowed) = &self.allowed_client_cert_fingerprints {
             let fingerprint = normalize_cert_fingerprint(&auth.cert_fingerprint_sha256());
             if !allowed.contains(&fingerprint) {
-                return Err(error_response("unauthorized client certificate", 403));
+                return Err(Rejection::new("unauthorized client certificate", 403));
             }
         }
         Ok(())
@@ -283,9 +440,9 @@ impl RendezvousShard {
         &self,
         req: &Request,
         body: &[u8],
-    ) -> std::result::Result<(), Response> {
+    ) -> std::result::Result<(), Rejection> {
         let Some(token) = self.auth_token.as_deref() else {
-            return Err(error_response(
+            return Err(Rejection::new(
                 "rendezvous auth secret is not configured",
                 500,
             ));
@@ -294,33 +451,33 @@ impl RendezvousShard {
         let timestamp = match req
             .headers()
             .get(HEADER_TIMESTAMP)
-            .map_err(|_| error_response("invalid timestamp header", 400))?
+            .map_err(|_| Rejection::new("invalid timestamp header", 400))?
             .and_then(|value| value.parse::<i64>().ok())
         {
             Some(timestamp) => timestamp,
-            None => return Err(error_response("missing request timestamp", 401)),
+            None => return Err(Rejection::new("missing request timestamp", 401)),
         };
         if now_unix_ms().abs_diff(timestamp) > SIGNATURE_SKEW_MS as u64 {
-            return Err(error_response("stale request timestamp", 401));
+            return Err(Rejection::new("stale request timestamp", 401));
         }
 
         let signature = match req
             .headers()
             .get(HEADER_SIGNATURE)
-            .map_err(|_| error_response("invalid signature header", 400))?
+            .map_err(|_| Rejection::new("invalid signature header", 400))?
         {
             Some(signature) => signature,
-            None => return Err(error_response("missing request signature", 401)),
+            None => return Err(Rejection::new("missing request signature", 401)),
         };
 
         let url = match req.url() {
             Ok(url) => url,
-            Err(_) => return Err(error_response("invalid request URL", 400)),
+            Err(_) => return Err(Rejection::new("invalid request URL", 400)),
         };
         let path = request_path_and_query(url.path(), url.query());
         let method = req.method().to_string();
         if !verify_peerline_request_signature(token, timestamp, &method, &path, body, &signature) {
-            return Err(error_response("invalid request signature", 401));
+            return Err(Rejection::new("invalid request signature", 401));
         }
 
         Ok(())
@@ -385,6 +542,174 @@ struct RegistrationRow {
     descriptor_json: String,
 }
 
+#[derive(Clone, Debug)]
+struct RequestTelemetry {
+    request_id: String,
+    method: String,
+    path: String,
+    namespace: Option<String>,
+    started_unix_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Rejection {
+    message: &'static str,
+    status: u16,
+}
+
+impl RequestTelemetry {
+    fn from_request(req: &Request) -> Result<Self> {
+        let path = req.path();
+        Ok(Self {
+            request_id: request_id(req)?,
+            method: req.method().to_string(),
+            namespace: namespace_from_path(&path).map(str::to_owned),
+            path,
+            started_unix_ms: now_unix_ms(),
+        })
+    }
+
+    fn elapsed_ms(&self) -> i64 {
+        now_unix_ms().saturating_sub(self.started_unix_ms)
+    }
+}
+
+impl Rejection {
+    fn new(message: &'static str, status: u16) -> Self {
+        Self { message, status }
+    }
+
+    fn response(self) -> Result<Response> {
+        Response::error(self.message, self.status)
+    }
+}
+
+fn request_id(req: &Request) -> Result<String> {
+    for header in ["x-request-id", "cf-ray", "traceparent"] {
+        if let Some(value) = req.headers().get(header)? {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+    Ok(format!("peerline-{}", now_unix_ms()))
+}
+
+fn with_observability_headers(
+    mut response: Response,
+    telemetry: &RequestTelemetry,
+) -> Result<Response> {
+    let duration = telemetry.elapsed_ms();
+    response
+        .headers_mut()
+        .set("x-peerline-request-id", &telemetry.request_id)?;
+    response
+        .headers_mut()
+        .set("server-timing", &format!("peerline;dur={duration}"))?;
+    Ok(response)
+}
+
+fn observed_error_response(
+    event: &str,
+    telemetry: &RequestTelemetry,
+    namespace: Option<&str>,
+    message: &'static str,
+    status: u16,
+    details: serde_json::Value,
+) -> Result<Response> {
+    log_request_event(
+        level_for_status(status),
+        event,
+        telemetry,
+        namespace,
+        serde_json::json!({
+            "status": status,
+            "message": message,
+            "details": details,
+        }),
+    );
+    with_observability_headers(Response::error(message, status)?, telemetry)
+}
+
+fn observed_rejection_response(
+    event: &str,
+    telemetry: &RequestTelemetry,
+    namespace: Option<&str>,
+    rejection: Rejection,
+) -> Result<Response> {
+    log_request_event(
+        level_for_status(rejection.status),
+        event,
+        telemetry,
+        namespace,
+        serde_json::json!({
+            "status": rejection.status,
+            "message": rejection.message,
+        }),
+    );
+    with_observability_headers(rejection.response()?, telemetry)
+}
+
+fn log_request_complete(event: &str, telemetry: &RequestTelemetry, status: u16) {
+    log_request_event(
+        level_for_status(status),
+        event,
+        telemetry,
+        None,
+        serde_json::json!({ "status": status }),
+    );
+}
+
+fn log_request_event(
+    level: LogLevel,
+    event: &str,
+    telemetry: &RequestTelemetry,
+    namespace: Option<&str>,
+    fields: serde_json::Value,
+) {
+    let namespace = namespace
+        .map(str::to_owned)
+        .or_else(|| telemetry.namespace.clone());
+    let payload = serde_json::json!({
+        "service": "peerline-rendezvous",
+        "event": event,
+        "request_id": &telemetry.request_id,
+        "method": &telemetry.method,
+        "path": &telemetry.path,
+        "namespace": namespace,
+        "duration_ms": telemetry.elapsed_ms(),
+        "fields": fields,
+    });
+    let line = serde_json::to_string(&payload).unwrap_or_else(|_| {
+        format!(
+            "{{\"service\":\"peerline-rendezvous\",\"event\":\"{event}\",\"request_id\":\"{}\"}}",
+            telemetry.request_id
+        )
+    });
+
+    match level {
+        LogLevel::Info => worker::console_log!("{line}"),
+        LogLevel::Warn => worker::console_warn!("{line}"),
+        LogLevel::Error => worker::console_error!("{line}"),
+    }
+}
+
+fn level_for_status(status: u16) -> LogLevel {
+    match status {
+        500..=599 => LogLevel::Error,
+        400..=499 => LogLevel::Warn,
+        _ => LogLevel::Info,
+    }
+}
+
 fn install_schema(sql: &SqlStorage) {
     sql.exec(
         "CREATE TABLE IF NOT EXISTS registrations(
@@ -419,27 +744,23 @@ fn install_schema(sql: &SqlStorage) {
     .expect("install rendezvous rate limit table");
 }
 
-fn error_response(message: &str, status: u16) -> Response {
-    Response::error(message, status).expect("valid error response")
-}
-
-fn validate_descriptor(descriptor: &PeerDescriptor) -> std::result::Result<(), Response> {
+fn validate_descriptor(descriptor: &PeerDescriptor) -> std::result::Result<(), Rejection> {
     if descriptor.protocol_version != DESCRIPTOR_PROTOCOL_VERSION {
-        return Err(error_response(
+        return Err(Rejection::new(
             "unsupported descriptor protocol version",
             400,
         ));
     }
     if descriptor.peer_id.is_empty() || descriptor.peer_id.len() > 128 {
-        return Err(error_response("invalid peer id", 400));
+        return Err(Rejection::new("invalid peer id", 400));
     }
     if descriptor.direct_endpoints.is_empty() && descriptor.libp2p_endpoints.is_empty() {
-        return Err(error_response("no advertised endpoints", 400));
+        return Err(Rejection::new("no advertised endpoints", 400));
     }
     if descriptor.direct_endpoints.len() > MAX_DIRECT_ENDPOINTS
         || descriptor.libp2p_endpoints.len() > MAX_LIBP2P_ENDPOINTS
     {
-        return Err(error_response("too many advertised endpoints", 400));
+        return Err(Rejection::new("too many advertised endpoints", 400));
     }
     if descriptor
         .direct_endpoints
@@ -447,7 +768,7 @@ fn validate_descriptor(descriptor: &PeerDescriptor) -> std::result::Result<(), R
         .chain(descriptor.libp2p_endpoints.iter())
         .any(|endpoint| endpoint.is_empty() || endpoint.len() > MAX_ENDPOINT_LEN)
     {
-        return Err(error_response("invalid advertised endpoint", 400));
+        return Err(Rejection::new("invalid advertised endpoint", 400));
     }
 
     Ok(())
@@ -529,8 +850,7 @@ fn normalize_cert_fingerprint(raw: &str) -> String {
 }
 
 fn fingerprints_from_raw(raw: &str) -> HashSet<String> {
-    raw
-        .split(|ch: char| ch == ',' || ch.is_whitespace())
+    raw.split(|ch: char| ch == ',' || ch.is_whitespace())
         .map(normalize_cert_fingerprint)
         .filter(|fingerprint| fingerprint.len() == 64)
         .collect::<HashSet<_>>()
@@ -546,10 +866,7 @@ mod tests {
 
     #[test]
     fn normalizes_certificate_fingerprints() {
-        assert_eq!(
-            normalize_cert_fingerprint("AA:bb cc-dd"),
-            "aabbccdd"
-        );
+        assert_eq!(normalize_cert_fingerprint("AA:bb cc-dd"), "aabbccdd");
     }
 
     #[test]

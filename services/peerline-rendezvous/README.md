@@ -8,6 +8,17 @@ Private HTTP rendezvous service for Peerline named transfers. It runs on Cloudfl
 - `POST /v1/namespaces/:namespace/registrations`
 - `GET /v1/namespaces/:namespace/registrations?after_cookie=...&limit=...`
 
+## Observability
+
+The Worker emits structured JSON logs to Cloudflare Logs/Tail for request completion,
+edge and Durable Object rate limits, authentication failures, descriptor validation
+failures, successful registrations, and successful discovery lookups.
+
+Responses include:
+
+- `x-peerline-request-id`: copied from `x-request-id`, `cf-ray`, or `traceparent` when present.
+- `server-timing`: total Worker handling time in milliseconds.
+
 Clients always send:
 
 - `x-peerline-version`
