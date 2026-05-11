@@ -57,13 +57,12 @@ pub(crate) async fn recv_libp2p(
         provider_key.clone(),
         &options,
     )?;
-    let _ = rendezvous::publish_peer_descriptor(
-        &options.name,
-        &options.code,
-        &descriptor,
-        &options.discovery.rendezvous,
-    )
-    .await;
+    rendezvous::publish_peer_descriptor_background(
+        options.name.clone(),
+        options.code.clone(),
+        descriptor,
+        options.discovery.rendezvous.clone(),
+    );
 
     loop {
         tokio::select! {
@@ -74,13 +73,12 @@ pub(crate) async fn recv_libp2p(
                     provider_key.clone(),
                     &options,
                 ) {
-                    let _ = rendezvous::publish_peer_descriptor(
-                        &options.name,
-                        &options.code,
-                        &descriptor,
-                        &options.discovery.rendezvous,
+                    rendezvous::publish_peer_descriptor_background(
+                        options.name.clone(),
+                        options.code.clone(),
+                        descriptor,
+                        options.discovery.rendezvous.clone(),
                     )
-                    .await;
                 }
             }
             event = swarm.select_next_some() => {
@@ -113,13 +111,12 @@ pub(crate) async fn recv_libp2p(
                             provider_key.clone(),
                             &options,
                         ) {
-                            let _ = rendezvous::publish_peer_descriptor(
-                                &options.name,
-                                &options.code,
-                                &descriptor,
-                                &options.discovery.rendezvous,
+                            rendezvous::publish_peer_descriptor_background(
+                                options.name.clone(),
+                                options.code.clone(),
+                                descriptor,
+                                options.discovery.rendezvous.clone(),
                             )
-                            .await;
                         }
                     }
                     SwarmEvent::Behaviour(TransferBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
@@ -140,13 +137,12 @@ pub(crate) async fn recv_libp2p(
                                 &options,
                             )
                         {
-                            let _ = rendezvous::publish_peer_descriptor(
-                                &options.name,
-                                &options.code,
-                                &descriptor,
-                                &options.discovery.rendezvous,
+                            rendezvous::publish_peer_descriptor_background(
+                                options.name.clone(),
+                                options.code.clone(),
+                                descriptor,
+                                options.discovery.rendezvous.clone(),
                             )
-                            .await;
                         }
                     }
                     SwarmEvent::Behaviour(TransferBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
@@ -162,13 +158,12 @@ pub(crate) async fn recv_libp2p(
                             provider_key.clone(),
                             &options,
                         ) {
-                            let _ = rendezvous::publish_peer_descriptor(
-                                &options.name,
-                                &options.code,
-                                &descriptor,
-                                &options.discovery.rendezvous,
+                            rendezvous::publish_peer_descriptor_background(
+                                options.name.clone(),
+                                options.code.clone(),
+                                descriptor,
+                                options.discovery.rendezvous.clone(),
                             )
-                            .await;
                         }
                     }
                     _ => {}
@@ -181,13 +176,24 @@ pub(crate) async fn recv_libp2p(
 fn log_dht_publish_result(result: &kad::QueryResult) {
     match result {
         kad::QueryResult::PutRecord(Ok(ok)) => {
-            tracing::debug!(key = ?ok.key, "DHT descriptor published");
+            tracing::info!(key = ?ok.key, "DHT descriptor published");
+        }
+        kad::QueryResult::PutRecord(Err(kad::PutRecordError::QuorumFailed {
+            success,
+            quorum,
+            ..
+        })) if success.is_empty() => {
+            tracing::debug!(
+                stored = success.len(),
+                needed = %quorum,
+                "DHT descriptor publish waiting for peers"
+            );
         }
         kad::QueryResult::PutRecord(Err(error)) => {
             tracing::warn!(%error, "DHT descriptor publish failed");
         }
         kad::QueryResult::StartProviding(Ok(ok)) => {
-            tracing::debug!(key = ?ok.key, "DHT provider record published");
+            tracing::info!(key = ?ok.key, "DHT provider record published");
         }
         kad::QueryResult::StartProviding(Err(error)) => {
             tracing::warn!(%error, "DHT provider record publish failed");

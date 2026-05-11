@@ -145,6 +145,12 @@ pub async fn publish_peer_descriptor(
         {
             Ok(response) if response.status().is_success() => {
                 published += 1;
+                tracing::info!(
+                    endpoint = %endpoint,
+                    namespace = %namespace,
+                    peer_id = %descriptor.peer_id,
+                    "rendezvous registration accepted"
+                );
             }
             Ok(response) => {
                 tracing::debug!(
@@ -164,6 +170,19 @@ pub async fn publish_peer_descriptor(
     }
 
     Ok(())
+}
+
+pub fn publish_peer_descriptor_background(
+    name: HumanName,
+    code: HumanCode,
+    descriptor: PeerDescriptor,
+    config: RendezvousConfig,
+) {
+    std::mem::drop(tokio::spawn(async move {
+        if let Err(error) = publish_peer_descriptor(&name, &code, &descriptor, &config).await {
+            tracing::warn!(%error, "rendezvous registration failed");
+        }
+    }));
 }
 
 pub async fn discover_peer_descriptors(

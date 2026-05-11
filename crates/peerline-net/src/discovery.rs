@@ -327,28 +327,19 @@ async fn discover_peer_descriptors(
     let descriptor_key = descriptor_record_key(&lookup_key);
     let provider_key = provider_record_key(&lookup_key);
     let mut snapshot = DiscoverySnapshot::new();
-
-    match rendezvous::discover_peer_descriptors(name, code, &config.rendezvous).await {
-        Ok(descriptors) => {
-            if !descriptors.is_empty() {
-                tracing::debug!(
-                    count = descriptors.len(),
-                    "rendezvous discovery returned descriptors"
-                );
-            }
-            for descriptor in descriptors {
-                snapshot.insert_descriptor(descriptor);
-            }
-            if snapshot.is_diverse_enough(config.min_candidate_diversity)
-                && snapshot.has_usable_candidates()
-            {
-                return Ok(Some(snapshot));
-            }
-        }
-        Err(error) => {
-            tracing::debug!(%error, "rendezvous discovery failed");
-        }
-    }
+    let rendezvous_name = name.clone();
+    let rendezvous_code = code.clone();
+    let rendezvous_config = config.rendezvous.clone();
+    let rendezvous_lookup = async move {
+        rendezvous::discover_peer_descriptors(
+            &rendezvous_name,
+            &rendezvous_code,
+            &rendezvous_config,
+        )
+        .await
+    };
+    tokio::pin!(rendezvous_lookup);
+    let mut rendezvous_done = false;
 
     let mut swarm = build_discovery_swarm(false, config.enable_mdns)?;
     apply_bootstrap(&mut swarm, &config);
@@ -361,6 +352,32 @@ async fn discover_peer_descriptors(
     loop {
         tokio::select! {
             _ = &mut deadline => break,
+            result = &mut rendezvous_lookup, if !rendezvous_done => {
+                rendezvous_done = true;
+                match result {
+                    Ok(descriptors) => {
+                        if descriptors.is_empty() {
+                            tracing::debug!("rendezvous discovery returned no descriptors");
+                        } else {
+                            tracing::info!(
+                                count = descriptors.len(),
+                                "rendezvous discovery returned descriptors"
+                            );
+                        }
+                        for descriptor in descriptors {
+                            snapshot.insert_descriptor(descriptor);
+                        }
+                        if snapshot.is_diverse_enough(config.min_candidate_diversity)
+                            && snapshot.has_usable_candidates()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "rendezvous discovery failed");
+                    }
+                }
+            }
             _ = query_interval.tick() => {
                 let _ = swarm.behaviour_mut().kad.get_providers(provider_key.clone());
                 let _ = swarm.behaviour_mut().kad.get_record(descriptor_key.clone());
@@ -416,13 +433,12 @@ async fn run_descriptor_publisher(
         direct_bind,
         allow_loopback,
     )?;
-    let _ = rendezvous::publish_peer_descriptor(
-        &name_code.name,
-        &name_code.code,
-        &descriptor,
-        &config.rendezvous,
-    )
-    .await;
+    rendezvous::publish_peer_descriptor_background(
+        name_code.name.clone(),
+        name_code.code.clone(),
+        descriptor,
+        config.rendezvous.clone(),
+    );
 
     loop {
         tokio::select! {
@@ -434,7 +450,12 @@ async fn run_descriptor_publisher(
                     direct_bind,
                     allow_loopback,
                 )?;
-                let _ = rendezvous::publish_peer_descriptor(&name_code.name, &name_code.code, &descriptor, &config.rendezvous).await;
+                rendezvous::publish_peer_descriptor_background(
+                    name_code.name.clone(),
+                    name_code.code.clone(),
+                    descriptor,
+                    config.rendezvous.clone(),
+                );
             }
             event = swarm.select_next_some() => {
                 match event {
@@ -449,13 +470,12 @@ async fn run_descriptor_publisher(
                                 allow_loopback,
                             )
                         {
-                            let _ = rendezvous::publish_peer_descriptor(
-                                &name_code.name,
-                                &name_code.code,
-                                &descriptor,
-                                &config.rendezvous,
+                            rendezvous::publish_peer_descriptor_background(
+                                name_code.name.clone(),
+                                name_code.code.clone(),
+                                descriptor,
+                                config.rendezvous.clone(),
                             )
-                            .await;
                         }
                     }
                     SwarmEvent::ConnectionEstablished { .. } => {
@@ -466,13 +486,12 @@ async fn run_descriptor_publisher(
                             direct_bind,
                             allow_loopback,
                         ) {
-                            let _ = rendezvous::publish_peer_descriptor(
-                                &name_code.name,
-                                &name_code.code,
-                                &descriptor,
-                                &config.rendezvous,
+                            rendezvous::publish_peer_descriptor_background(
+                                name_code.name.clone(),
+                                name_code.code.clone(),
+                                descriptor,
+                                config.rendezvous.clone(),
                             )
-                            .await;
                         }
                     }
                     _ => {}
@@ -543,6 +562,12 @@ fn publish_descriptor(
             .chain(swarm.external_addresses())
             .map(ToString::to_string)
             .collect(),
+    );
+    tracing::debug!(
+        peer_id = %descriptor.peer_id,
+        direct_endpoints = descriptor.direct_endpoints.len(),
+        libp2p_endpoints = descriptor.libp2p_endpoints.len(),
+        "publishing peer descriptor through DHT and rendezvous"
     );
     let record = kad::Record::new(record_key, postcard::to_allocvec(&descriptor)?);
     if let Err(error) = swarm
@@ -649,13 +674,24 @@ fn handle_discovery_event_with_snapshot(
 fn log_publish_query_result(result: &kad::QueryResult) {
     match result {
         kad::QueryResult::PutRecord(Ok(ok)) => {
-            tracing::debug!(key = ?ok.key, "DHT descriptor published");
+            tracing::info!(key = ?ok.key, "DHT descriptor published");
+        }
+        kad::QueryResult::PutRecord(Err(kad::PutRecordError::QuorumFailed {
+            success,
+            quorum,
+            ..
+        })) if success.is_empty() => {
+            tracing::debug!(
+                stored = success.len(),
+                needed = %quorum,
+                "DHT descriptor publish waiting for peers"
+            );
         }
         kad::QueryResult::PutRecord(Err(error)) => {
             tracing::warn!(%error, "DHT descriptor publish failed");
         }
         kad::QueryResult::StartProviding(Ok(ok)) => {
-            tracing::debug!(key = ?ok.key, "DHT provider record published");
+            tracing::info!(key = ?ok.key, "DHT provider record published");
         }
         kad::QueryResult::StartProviding(Err(error)) => {
             tracing::warn!(%error, "DHT provider record publish failed");

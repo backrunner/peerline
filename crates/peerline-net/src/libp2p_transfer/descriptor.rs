@@ -28,6 +28,12 @@ pub(crate) fn publish_receiver_descriptor(
             .map(ToString::to_string)
             .collect(),
     );
+    tracing::debug!(
+        peer_id = %descriptor.peer_id,
+        direct_endpoints = descriptor.direct_endpoints.len(),
+        libp2p_endpoints = descriptor.libp2p_endpoints.len(),
+        "publishing receiver descriptor through DHT and rendezvous"
+    );
     let record = kad::Record::new(record_key, postcard::to_allocvec(&descriptor)?);
     if let Err(error) = swarm
         .behaviour_mut()

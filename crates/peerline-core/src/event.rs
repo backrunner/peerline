@@ -23,6 +23,15 @@ pub enum TransferStage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerlineLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerlineEvent {
     StageChanged(TransferStage),
     TransferStarted {
@@ -37,4 +46,9 @@ pub enum PeerlineEvent {
         bytes_total: u64,
     },
     Message(String),
+    Log {
+        level: PeerlineLogLevel,
+        target: String,
+        message: String,
+    },
 }

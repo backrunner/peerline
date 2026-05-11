@@ -1,20 +1,24 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use peerline_core::{
     Compression, ConfigStore, DEFAULT_DIRECT_PORT, DEFAULT_DIRECT_PORT_WINDOW, HumanCode,
-    HumanName, PeerlineEvent, TransferStage, parse_ip_endpoint,
+    HumanName, PeerlineEvent, PeerlineLogLevel, TransferStage, parse_ip_endpoint,
 };
 use peerline_net::{
     Candidate, Libp2pRecvOptions, Libp2pSendOptions, ReceivedTransfer, RecvOptions, RouteKind,
     SendOptions, bind_direct_listener,
 };
 use std::{
+    fmt,
     future::Future,
     io::IsTerminal,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
+    sync::{Mutex, OnceLock},
 };
 use tokio::{sync::watch, task::JoinHandle};
+use tracing::{Event, Level, Subscriber, field::Field};
+use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -23,6 +27,8 @@ use tokio::{sync::watch, task::JoinHandle};
     about = "P2P post-quantum encrypted file transfer"
 )]
 struct Cli {
+    #[arg(long, global = true)]
+    debug: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -96,12 +102,8 @@ impl From<CompressionArg> for Compression {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_filter())
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+    init_tracing(cli.debug);
     match cli.command {
         Command::Recv(args) => recv(args).await,
         Command::Send(args) => send(args).await,
@@ -113,17 +115,10 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     let store = ConfigStore::user_default()?;
     let config = store.load()?;
     let (name, code) = resolve_recv_identity(config.name, args.first, args.second)?;
-    if code.is_low_entropy() {
-        eprintln!("warning: code entropy looks low; generated codes are safer on public networks");
-    }
 
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), args.port);
     let (listener, actual_bind) = bind_direct_listener(bind).await?;
     let destination = std::env::current_dir()?;
-    let discovery = peerline_net::DiscoveryConfig {
-        allow_relay_data_fallback: args.allow_relay_fallback,
-        ..Default::default()
-    };
 
     println!("peerline recv");
     println!("name: {name}");
@@ -133,6 +128,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
 
     let (events, tui_task, mut quit_rx) = if !args.no_tui && std::io::stdout().is_terminal() {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        register_activity_log_sender(&sender);
         let (quit_tx, quit_rx) = watch::channel(false);
         let view = peerline_tui::RecvView {
             name: name.clone(),
@@ -150,6 +146,13 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
         (Some(sender), Some(task), Some(quit_rx))
     } else {
         (None, None, None)
+    };
+    if code.is_low_entropy() {
+        tracing::warn!("code entropy looks low; generated codes are safer on public networks");
+    }
+    let discovery = peerline_net::DiscoveryConfig {
+        allow_relay_data_fallback: args.allow_relay_fallback,
+        ..Default::default()
     };
 
     let direct_fut = Box::pin(peerline_net::recv_once_bound(
@@ -293,9 +296,107 @@ where
         .unwrap_or_else(|| anyhow::anyhow!("receiver stopped without a completed transfer")))
 }
 
-fn tracing_filter() -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error,peerline=info"))
+fn init_tracing(debug: bool) {
+    tracing_subscriber::registry()
+        .with(tracing_filter(debug))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(true),
+        )
+        .with(ActivityLogLayer)
+        .init();
+}
+
+fn tracing_filter(debug: bool) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(if debug {
+            "error,peerline=debug"
+        } else {
+            "error,peerline=info"
+        })
+    })
+}
+
+static ACTIVITY_LOG_SENDERS: OnceLock<
+    Mutex<Vec<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>>,
+> = OnceLock::new();
+
+fn register_activity_log_sender(sender: &tokio::sync::mpsc::UnboundedSender<PeerlineEvent>) {
+    ACTIVITY_LOG_SENDERS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("activity log sender registry lock should not be poisoned")
+        .push(sender.clone());
+}
+
+struct ActivityLogLayer;
+
+impl<S> Layer<S> for ActivityLogLayer
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let Some(senders) = ACTIVITY_LOG_SENDERS.get() else {
+            return;
+        };
+        let metadata = event.metadata();
+        let mut visitor = LogFieldVisitor::default();
+        event.record(&mut visitor);
+        let mut message = visitor
+            .message
+            .unwrap_or_else(|| metadata.name().to_string());
+        if !visitor.fields.is_empty() {
+            message.push(' ');
+            message.push_str(&visitor.fields.join(" "));
+        }
+        let log_event = PeerlineEvent::Log {
+            level: peerline_log_level(metadata.level()),
+            target: metadata.target().to_string(),
+            message,
+        };
+
+        let mut senders = senders
+            .lock()
+            .expect("activity log sender registry lock should not be poisoned");
+        senders.retain(|sender| sender.send(log_event.clone()).is_ok());
+    }
+}
+
+#[derive(Default)]
+struct LogFieldVisitor {
+    message: Option<String>,
+    fields: Vec<String>,
+}
+
+impl tracing::field::Visit for LogFieldVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.record_value(field, value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.record_value(field, format!("{value:?}"));
+    }
+}
+
+impl LogFieldVisitor {
+    fn record_value(&mut self, field: &Field, value: String) {
+        if field.name() == "message" {
+            self.message = Some(value);
+        } else {
+            self.fields.push(format!("{}={}", field.name(), value));
+        }
+    }
+}
+
+fn peerline_log_level(level: &Level) -> PeerlineLogLevel {
+    match *level {
+        Level::ERROR => PeerlineLogLevel::Error,
+        Level::WARN => PeerlineLogLevel::Warn,
+        Level::INFO => PeerlineLogLevel::Info,
+        Level::DEBUG => PeerlineLogLevel::Debug,
+        Level::TRACE => PeerlineLogLevel::Trace,
+    }
 }
 
 fn spawn_send_tui(
@@ -313,6 +414,7 @@ fn spawn_send_tui(
     }
 
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    register_activity_log_sender(&sender);
     let view = peerline_tui::SendView {
         target_label: target_label.to_string(),
         target,
@@ -442,9 +544,6 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
     let compression = args.compression.into();
     let allow_relay_fallback = args.allow_relay_fallback;
     let (name, code, paths) = resolve_named_send(args)?;
-    if code.is_low_entropy() {
-        eprintln!("warning: code entropy looks low; generated codes are safer on public networks");
-    }
     let (quit_signal, mut quit_rx) = if std::io::stdout().is_terminal() {
         let (tx, rx) = watch::channel(false);
         (Some(tx), Some(rx))
@@ -461,46 +560,44 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
     if events.is_none() {
         println!("discovering {name} through rendezvous, DHT, and mDNS...");
     }
+    if code.is_low_entropy() {
+        tracing::warn!("code entropy looks low; generated codes are safer on public networks");
+    }
     let discovery = peerline_net::DiscoveryConfig {
         allow_relay_data_fallback: allow_relay_fallback,
         ..Default::default()
     };
-    let discovery_future =
-        peerline_net::discovery::discover_peer_candidates(&name, &code, discovery.clone());
-    let candidates = match wait_with_quit(discovery_future, &mut quit_rx).await {
-        Ok(TaskOutcome::Completed(candidates)) => candidates,
-        Ok(TaskOutcome::Quit) => {
-            if let Some(task) = tui_task {
-                let _ = task.await;
+    let candidates = loop {
+        tracing::info!(peer = %name, "discovering routes through rendezvous, DHT, and mDNS");
+        let discovery_future =
+            peerline_net::discovery::discover_peer_candidates(&name, &code, discovery.clone());
+        match wait_with_quit(discovery_future, &mut quit_rx).await {
+            Ok(TaskOutcome::Completed(candidates)) if !candidates.is_empty() => break candidates,
+            Ok(TaskOutcome::Completed(_)) => {
+                tracing::error!(
+                    peer = %name,
+                    "could not discover a route yet; still searching"
+                );
             }
-            return Ok(());
-        }
-        Err(error) => {
-            if let Some(sender) = events.as_ref() {
-                let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
-                    error.to_string(),
-                )));
+            Ok(TaskOutcome::Quit) => {
+                if let Some(task) = tui_task {
+                    let _ = task.await;
+                }
+                return Ok(());
             }
-            if let Some(task) = tui_task {
-                let _ = task.await;
+            Err(error) => {
+                if let Some(sender) = events.as_ref() {
+                    let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
+                        error.to_string(),
+                    )));
+                }
+                if let Some(task) = tui_task {
+                    let _ = task.await;
+                }
+                return Err(error);
             }
-            return Err(error);
         }
     };
-    if candidates.is_empty() {
-        let error = anyhow::anyhow!(
-            "could not discover a route for {name}; use `peerline send <ip> <path...> --code=<code>` if you know the receiver address"
-        );
-        if let Some(sender) = events.as_ref() {
-            let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
-                error.to_string(),
-            )));
-        }
-        if let Some(task) = tui_task {
-            let _ = task.await;
-        }
-        return Err(error);
-    }
 
     let mut last_error = None;
     for candidate in candidates {

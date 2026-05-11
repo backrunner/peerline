@@ -1,4 +1,6 @@
-use peerline_core::{ConnectionRoute, HumanCode, HumanName, PeerlineEvent, TransferStage};
+use peerline_core::{
+    ConnectionRoute, HumanCode, HumanName, PeerlineEvent, PeerlineLogLevel, TransferStage,
+};
 use ratatui::style::{Color, Modifier, Style};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -157,6 +159,12 @@ fn apply_event<T: TransferView>(view: &mut T, event: PeerlineEvent) -> bool {
         }
         PeerlineEvent::Message(message) => {
             *view.route_status_mut() = message;
+            false
+        }
+        PeerlineEvent::Log { level, message, .. } => {
+            if matches!(level, PeerlineLogLevel::Error | PeerlineLogLevel::Warn) {
+                *view.route_status_mut() = message;
+            }
             false
         }
     }

@@ -1,5 +1,5 @@
 use super::{RecvView, SendView, stage_label, stage_style};
-use peerline_core::{PeerlineEvent, TransferId, TransferStage};
+use peerline_core::{PeerlineEvent, PeerlineLogLevel, TransferId, TransferStage};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -213,6 +213,24 @@ impl Dashboard {
                     }
                     self.status = message;
                 } else {
+                    self.status = message;
+                }
+                false
+            }
+            PeerlineEvent::Log {
+                level,
+                target,
+                message,
+            } => {
+                let kind = log_level_kind(&level);
+                self.push_log(kind, message.clone(), Some(target));
+                if matches!(level, PeerlineLogLevel::Error | PeerlineLogLevel::Warn) {
+                    if let Some(id) = self.active_transfer
+                        && let Some(row) = self.transfer_mut(id)
+                    {
+                        row.status = message.clone();
+                        row.updated_at = now;
+                    }
                     self.status = message;
                 }
                 false
@@ -510,7 +528,7 @@ async fn run_dashboard(
             _ = tick.tick() => {
                 while crossterm::event::poll(Duration::from_millis(0))? {
                     match crossterm::event::read()? {
-                        crossterm::event::Event::Key(key) if is_quit_key(key.code) => {
+                        crossterm::event::Event::Key(key) if is_quit_key(key) => {
                             if let Some(signal) = quit_signal.as_ref() {
                                 let _ = signal.send(true);
                             }
@@ -538,6 +556,15 @@ fn stage_kind(stage: &TransferStage) -> LogKind {
     }
 }
 
+fn log_level_kind(level: &PeerlineLogLevel) -> LogKind {
+    match level {
+        PeerlineLogLevel::Error => LogKind::Error,
+        PeerlineLogLevel::Warn => LogKind::Warn,
+        PeerlineLogLevel::Info => LogKind::Info,
+        PeerlineLogLevel::Debug | PeerlineLogLevel::Trace => LogKind::Status,
+    }
+}
+
 fn transfer_style(stage: &TransferStage, active: bool) -> Style {
     let mut style = stage_style(stage);
     if active {
@@ -546,10 +573,16 @@ fn transfer_style(stage: &TransferStage, active: bool) -> Style {
     style
 }
 
-fn is_quit_key(code: crossterm::event::KeyCode) -> bool {
+fn is_quit_key(key: crossterm::event::KeyEvent) -> bool {
     matches!(
-        code,
+        key.code,
         crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc
+    ) || matches!(
+        key.code,
+        crossterm::event::KeyCode::Char('c')
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
     )
 }
 
@@ -564,6 +597,10 @@ fn render_log_item(entry: LogEntry) -> ListItem<'static> {
             Style::default().fg(Color::Gray),
         ));
     }
+    spans.push(Span::styled(
+        format!("[{}] ", log_kind_label(entry.kind)),
+        log_kind_style(entry.kind),
+    ));
     let text_style = match entry.kind {
         LogKind::Info => Style::default().fg(Color::White),
         LogKind::Success => Style::default().fg(Color::Green),
@@ -573,6 +610,26 @@ fn render_log_item(entry: LogEntry) -> ListItem<'static> {
     };
     spans.push(Span::styled(entry.text, text_style));
     ListItem::new(Line::from(spans))
+}
+
+fn log_kind_label(kind: LogKind) -> &'static str {
+    match kind {
+        LogKind::Info => "info",
+        LogKind::Success => "ok",
+        LogKind::Warn => "warn",
+        LogKind::Error => "error",
+        LogKind::Status => "status",
+    }
+}
+
+fn log_kind_style(kind: LogKind) -> Style {
+    match kind {
+        LogKind::Info => Style::default().fg(Color::White),
+        LogKind::Success => Style::default().fg(Color::Green),
+        LogKind::Warn => Style::default().fg(Color::Yellow),
+        LogKind::Error => Style::default().fg(Color::Red),
+        LogKind::Status => Style::default().fg(Color::Cyan),
+    }
 }
 
 fn label_span(label: &str) -> Span<'static> {
@@ -720,8 +777,21 @@ mod tests {
 
     #[test]
     fn q_and_escape_are_quit_keys() {
-        assert!(is_quit_key(crossterm::event::KeyCode::Char('q')));
-        assert!(is_quit_key(crossterm::event::KeyCode::Esc));
-        assert!(!is_quit_key(crossterm::event::KeyCode::Char('x')));
+        assert!(is_quit_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert!(is_quit_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert!(is_quit_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )));
+        assert!(!is_quit_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
     }
 }
