@@ -250,7 +250,7 @@ jobs:
       - name: Cleanup older prereleases
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_CLEANUP_TOKEN || github.token }}
         run: |
           set -euo pipefail
           version="$(node -p "require('./package.json').version")"
@@ -271,9 +271,16 @@ jobs:
             if [ -z "$stale_tag" ]; then
               continue
             fi
-            if gh release view "$stale_tag" >/dev/null 2>&1; then
-              gh release delete "$stale_tag" --yes --cleanup-tag
-            else
-              git push origin ":refs/tags/$stale_tag"
+            release_id=""
+            if release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$stale_tag" 2>/tmp/release-cleanup.err)"; then
+              release_id="$(node -e 'const fs = require("fs"); const release = JSON.parse(fs.readFileSync(0, "utf8")); process.stdout.write(String(release.id || ""));' <<<"$release_json")"
+            fi
+            if [ -n "$release_id" ]; then
+              if ! gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$release_id"; then
+                echo "::warning::failed to delete stale release $stale_tag"
+              fi
+            fi
+            if ! git push origin ":refs/tags/$stale_tag"; then
+              echo "::warning::failed to delete stale tag $stale_tag"
             fi
           done < stale-tags.txt
