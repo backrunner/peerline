@@ -74,3 +74,6 @@ walkdir = "2.5.0"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 zeroize = { version = "1.8.2", features = ["derive"] }
 zstd = "0.13.3"
+
+[profile.release]
+strip = "symbols"

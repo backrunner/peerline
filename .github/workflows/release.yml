@@ -246,3 +246,34 @@ jobs:
           for asset in "${assets[@]}"; do
             gh release upload "$tag" "$asset" --clobber
           done
+
+      - name: Cleanup older prereleases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          current_tag="v$version"
+          case "$version" in
+            *-alpha.*) tag_pattern='^v[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$' ;;
+            *-beta.*) tag_pattern='^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$' ;;
+            *) exit 0 ;;
+          esac
+
+          {
+            gh release list --limit 100 --json tagName,isPrerelease \
+              --jq '.[] | select(.isPrerelease) | .tagName'
+            git ls-remote --tags origin 'v*' | awk -F/ '{print $NF}'
+          } | sort -u | grep -E "$tag_pattern" | grep -vFx "$current_tag" > stale-tags.txt || true
+
+          while IFS= read -r stale_tag; do
+            if [ -z "$stale_tag" ]; then
+              continue
+            fi
+            if gh release view "$stale_tag" >/dev/null 2>&1; then
+              gh release delete "$stale_tag" --yes --cleanup-tag
+            else
+              git push origin ":refs/tags/$stale_tag"
+            fi
+          done < stale-tags.txt

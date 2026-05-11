@@ -5,9 +5,9 @@ workers_dev = false
 routes = [{ pattern = "rendezvous.peerline.pwp.sh", custom_domain = true }]
 
 [build]
-# Keep panic-unwind, but skip worker-build's reset-state path until the
-# wasm-bindgen CLI regression is fixed upstream.
-command = "cargo install worker-build --version 0.8.3 --locked --force && worker-build --release --panic-unwind --no-panic-recovery"
+# Avoid worker-build's nightly panic-unwind path; it currently generates wasm
+# that wasm-bindgen can panic on in Linux CI.
+command = "cargo install worker-build --version 0.8.3 --locked --force && worker-build --release --no-panic-recovery"
 
 [vars]
 PEERLINE_RENDEZVOUS_MAX_TTL_SECS = "180"
