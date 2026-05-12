@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
 use std::{
     collections::VecDeque,
@@ -243,32 +243,33 @@ impl Dashboard {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(6),
-                Constraint::Min(10),
-                Constraint::Length(8),
+                Constraint::Length(5),
+                Constraint::Min(8),
                 Constraint::Length(1),
             ])
             .split(area);
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Ratio(6, 11), Constraint::Ratio(5, 11)])
+            .split(chunks[1]);
 
         self.draw_header(frame, chunks[0]);
-        self.draw_transfers(frame, chunks[1]);
-        self.draw_logs(frame, chunks[2]);
-        self.draw_footer(frame, chunks[3]);
+        self.draw_transfers(frame, body[0]);
+        self.draw_logs(frame, body[1]);
+        self.draw_footer(frame, chunks[2]);
     }
 
     fn draw_header(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let mut lines = vec![
-            self.title_line(),
-            self.meta_line(),
-            self.stage_line(),
-            self.count_line(),
+            self.title_line(area.width),
+            self.meta_line(area.width),
+            self.state_line(area.width),
         ];
         if lines.is_empty() {
             lines.push(Line::from(""));
         }
-        let header = Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::new().title(self.title()).borders(Borders::ALL));
+        let header =
+            Paragraph::new(lines).block(Block::new().title(self.title()).borders(Borders::ALL));
         frame.render_widget(header, area);
     }
 
@@ -282,6 +283,11 @@ impl Dashboard {
             return;
         }
 
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let peer_width = if inner_width >= 96 { 24 } else { 18 };
+        let status_width = inner_width
+            .saturating_sub(peer_width + 5 + 10 + 14 + 12 + 5)
+            .max(10);
         let rows = self
             .transfers
             .iter()
@@ -290,15 +296,15 @@ impl Dashboard {
                 let active = self.active_transfer == Some(transfer.id);
                 let style = transfer_style(&transfer.stage, active);
                 Row::new(vec![
-                    Cell::from(truncate_middle(&transfer.peer, 24)),
+                    Cell::from(truncate_middle(&transfer.peer, peer_width)),
                     Cell::from(transfer.files.to_string()),
                     Cell::from(format_bytes(transfer.bytes)),
                     Cell::from(transfer.progress.map_or_else(
                         || "0%".to_string(),
-                        |(done, total)| format_progress(done, total),
+                        |(done, total)| truncate_end(&format_progress(done, total), 14),
                     )),
-                    Cell::from(stage_label(&transfer.stage)),
-                    Cell::from(truncate_middle(&transfer.status, 32)),
+                    Cell::from(truncate_end(&stage_label(&transfer.stage), 12)),
+                    Cell::from(truncate_end(&transfer.status, status_width)),
                 ])
                 .style(style)
             })
@@ -307,12 +313,12 @@ impl Dashboard {
         let table = Table::new(
             rows,
             [
-                Constraint::Length(24),
-                Constraint::Length(6),
-                Constraint::Length(12),
-                Constraint::Length(20),
+                Constraint::Length(peer_width as u16),
+                Constraint::Length(5),
+                Constraint::Length(10),
                 Constraint::Length(14),
-                Constraint::Min(16),
+                Constraint::Length(12),
+                Constraint::Min(10),
             ],
         )
         .header(
@@ -342,30 +348,40 @@ impl Dashboard {
         }
 
         let visible_rows = area.height.saturating_sub(2) as usize;
-        let mut items = self
+        let content_width = area.width.saturating_sub(2) as usize;
+        let mut lines = self
             .logs
             .iter()
-            .rev()
-            .take(visible_rows.max(1))
-            .cloned()
+            .flat_map(|entry| render_log_lines(entry, content_width))
             .collect::<Vec<_>>();
-        items.reverse();
+        if lines.len() > visible_rows {
+            lines = lines.split_off(lines.len() - visible_rows);
+        }
 
-        let list = List::new(items.into_iter().map(render_log_item).collect::<Vec<_>>())
-            .block(block)
-            .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-        frame.render_widget(list, area);
+        frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
     fn draw_footer(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let summary = truncate_end(
+            &format!(
+                "transfers {}  active {}  done {}  failed {}  logs {}",
+                self.transfers.len(),
+                self.active_transfer_count(),
+                self.complete_transfer_count(),
+                self.failed_transfer_count(),
+                self.logs.len(),
+            ),
+            area.width.saturating_sub(10) as usize,
+        );
         let footer = Paragraph::new(Line::from(vec![
             Span::styled(
-                "q / Esc",
+                "q/Esc",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" quit", Style::default().fg(Color::Gray)),
+            Span::styled(" quit  ", Style::default().fg(Color::Gray)),
+            Span::styled(summary, Style::default().fg(Color::DarkGray)),
         ]));
         frame.render_widget(footer, area);
     }
@@ -377,7 +393,16 @@ impl Dashboard {
         }
     }
 
-    fn title_line(&self) -> Line<'_> {
+    fn title_line(&self, width: u16) -> Line<'static> {
+        let summary = format!(
+            "{} transfer(s) | {} active | {} done | {} failed",
+            self.transfers.len(),
+            self.active_transfer_count(),
+            self.complete_transfer_count(),
+            self.failed_transfer_count(),
+        );
+        let title_width = self.title().chars().count() + 2;
+        let summary_width = (width as usize).saturating_sub(title_width).max(1);
         Line::from(vec![
             Span::styled(
                 self.title(),
@@ -387,23 +412,33 @@ impl Dashboard {
             ),
             Span::raw("  "),
             Span::styled(
-                format!("{} transfer(s)", self.transfers.len()),
+                truncate_end(&summary, summary_width),
                 Style::default().fg(Color::Gray),
             ),
         ])
     }
 
-    fn meta_line(&self) -> Line<'_> {
+    fn meta_line(&self, width: u16) -> Line<'static> {
+        let content_width = width.saturating_sub(2) as usize;
         match &self.kind {
             DashboardKind::Recv { name, code, bind } => Line::from(vec![
                 label_span("name"),
-                Span::styled(name.as_str(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    truncate_middle(name.as_str(), field_width(content_width, 22)),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 label_span("code"),
-                Span::styled(code.as_str(), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    truncate_middle(code.as_str(), field_width(content_width, 24)),
+                    Style::default().fg(Color::Yellow),
+                ),
                 Span::raw("  "),
                 label_span("listen"),
-                Span::styled(bind.as_str(), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    truncate_middle(bind.as_str(), field_width(content_width, 24)),
+                    Style::default().fg(Color::Cyan),
+                ),
             ]),
             DashboardKind::Send {
                 target_label,
@@ -412,29 +447,40 @@ impl Dashboard {
             } => Line::from(vec![
                 label_span(target_label),
                 Span::styled(
-                    target.as_str(),
+                    truncate_middle(target.as_str(), field_width(content_width, 36)),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 label_span("code"),
-                Span::styled(code.as_str(), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    truncate_middle(code.as_str(), field_width(content_width, 28)),
+                    Style::default().fg(Color::Yellow),
+                ),
             ]),
         }
     }
 
-    fn stage_line(&self) -> Line<'_> {
+    fn state_line(&self, width: u16) -> Line<'static> {
+        let stage = stage_label(&self.stage);
+        let status = if self.status == stage {
+            String::new()
+        } else {
+            format!(" | {}", self.status)
+        };
+        let prefix_width = 8 + stage.chars().count();
+        let status_width = (width as usize).saturating_sub(prefix_width).max(1);
         Line::from(vec![
-            label_span("stage"),
-            Span::styled(stage_label(&self.stage), stage_style(&self.stage)),
-            Span::raw("  "),
-            label_span("status"),
-            Span::styled(self.status.as_str(), Style::default().fg(Color::White)),
+            label_span("state"),
+            Span::styled(stage, stage_style(&self.stage)),
+            Span::styled(
+                truncate_end(&status, status_width),
+                Style::default().fg(Color::White),
+            ),
         ])
     }
 
-    fn count_line(&self) -> Line<'_> {
-        let active = self
-            .transfers
+    fn active_transfer_count(&self) -> usize {
+        self.transfers
             .iter()
             .filter(|row| {
                 !matches!(
@@ -442,34 +488,21 @@ impl Dashboard {
                     TransferStage::Complete | TransferStage::Failed(_)
                 )
             })
-            .count();
-        let done = self
-            .transfers
+            .count()
+    }
+
+    fn complete_transfer_count(&self) -> usize {
+        self.transfers
             .iter()
             .filter(|row| matches!(row.stage, TransferStage::Complete))
-            .count();
-        let failed = self
-            .transfers
+            .count()
+    }
+
+    fn failed_transfer_count(&self) -> usize {
+        self.transfers
             .iter()
             .filter(|row| matches!(row.stage, TransferStage::Failed(_)))
-            .count();
-
-        Line::from(vec![
-            label_span("active"),
-            Span::styled(active.to_string(), Style::default().fg(Color::Cyan)),
-            Span::raw("  "),
-            label_span("done"),
-            Span::styled(done.to_string(), Style::default().fg(Color::Green)),
-            Span::raw("  "),
-            label_span("failed"),
-            Span::styled(failed.to_string(), Style::default().fg(Color::Red)),
-            Span::raw("  "),
-            label_span("logs"),
-            Span::styled(
-                self.logs.len().to_string(),
-                Style::default().fg(Color::Gray),
-            ),
-        ])
+            .count()
     }
 
     fn push_log(&mut self, kind: LogKind, text: impl Into<String>, source: Option<String>) {
@@ -504,6 +537,7 @@ async fn run_dashboard(
     let _cleanup = TerminalCleanup;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
     let mut tick = time::interval(Duration::from_millis(75));
 
     loop {
@@ -533,6 +567,10 @@ async fn run_dashboard(
                                 let _ = signal.send(true);
                             }
                             return Ok(());
+                        }
+                        crossterm::event::Event::Resize(_, _) => {
+                            terminal.clear()?;
+                            terminal.draw(|frame| dashboard.draw(frame))?;
                         }
                         _ => {}
                     }
@@ -586,21 +624,34 @@ fn is_quit_key(key: crossterm::event::KeyEvent) -> bool {
     )
 }
 
-fn render_log_item(entry: LogEntry) -> ListItem<'static> {
-    let mut spans = vec![Span::styled(
-        format!("[{}] ", format_elapsed(entry.elapsed)),
-        Style::default().fg(Color::DarkGray),
-    )];
-    if let Some(source) = entry.source {
-        spans.push(Span::styled(
-            format!("[{}] ", truncate_middle(&source, 18)),
-            Style::default().fg(Color::Gray),
-        ));
+fn render_log_lines(entry: &LogEntry, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let source_width = if width >= 84 {
+        18
+    } else if width >= 56 {
+        12
+    } else {
+        0
+    };
+    let mut prefix = Vec::new();
+    let mut prefix_width = 0usize;
+    if width >= 24 {
+        let elapsed = format!("[{}] ", format_elapsed(entry.elapsed));
+        prefix_width += elapsed.chars().count();
+        prefix.push(Span::styled(elapsed, Style::default().fg(Color::DarkGray)));
     }
-    spans.push(Span::styled(
-        format!("[{}] ", log_kind_label(entry.kind)),
-        log_kind_style(entry.kind),
-    ));
+    if source_width > 0
+        && let Some(source) = &entry.source
+    {
+        let source = format!("[{}] ", truncate_middle(source, source_width));
+        prefix_width += source.chars().count();
+        prefix.push(Span::styled(source, Style::default().fg(Color::Gray)));
+    }
+    if width >= 10 {
+        let kind = format!("[{}] ", log_kind_label(entry.kind));
+        prefix_width += kind.chars().count();
+        prefix.push(Span::styled(kind, log_kind_style(entry.kind)));
+    }
     let text_style = match entry.kind {
         LogKind::Info => Style::default().fg(Color::White),
         LogKind::Success => Style::default().fg(Color::Green),
@@ -608,8 +659,34 @@ fn render_log_item(entry: LogEntry) -> ListItem<'static> {
         LogKind::Error => Style::default().fg(Color::Red),
         LogKind::Status => Style::default().fg(Color::Cyan),
     };
-    spans.push(Span::styled(entry.text, text_style));
-    ListItem::new(Line::from(spans))
+    let first_width = width.saturating_sub(prefix_width).max(1);
+    let continuation_prefix = " ".repeat(prefix_width.min(width.saturating_sub(1)));
+    let continuation_width = width
+        .saturating_sub(continuation_prefix.chars().count())
+        .max(1);
+    let wrapped = wrap_log_text(&entry.text, first_width, continuation_width);
+    let mut lines = Vec::with_capacity(wrapped.len().max(1));
+    for (index, text) in wrapped.into_iter().enumerate() {
+        if index == 0 {
+            let mut spans = prefix.clone();
+            spans.push(Span::styled(text, text_style));
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    continuation_prefix.clone(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(text, text_style),
+            ]));
+        }
+    }
+    if lines.is_empty() {
+        let mut spans = prefix;
+        spans.push(Span::styled("", text_style));
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 fn log_kind_label(kind: LogKind) -> &'static str {
@@ -639,6 +716,10 @@ fn label_span(label: &str) -> Span<'static> {
             .fg(Color::Gray)
             .add_modifier(Modifier::BOLD),
     )
+}
+
+fn field_width(content_width: usize, preferred: usize) -> usize {
+    preferred.min(content_width.saturating_div(2).max(8))
 }
 
 fn format_progress(done: u64, total: u64) -> String {
@@ -707,6 +788,46 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
     format!("{start}...{end}")
 }
 
+fn truncate_end(value: &str, max_chars: usize) -> String {
+    let chars = value.chars().count();
+    if chars <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+    let mut truncated = value.chars().take(max_chars - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn wrap_log_text(value: &str, first_width: usize, continuation_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut next_width = first_width.max(1);
+    for logical in value.replace('\r', "").split('\n') {
+        if logical.is_empty() {
+            lines.push(String::new());
+            next_width = continuation_width.max(1);
+            continue;
+        }
+        let mut current = String::new();
+        let mut width = 0usize;
+        for ch in logical.chars() {
+            if width >= next_width {
+                lines.push(current);
+                current = String::new();
+                width = 0;
+                next_width = continuation_width.max(1);
+            }
+            current.push(ch);
+            width += 1;
+        }
+        lines.push(current);
+        next_width = continuation_width.max(1);
+    }
+    lines
+}
+
 struct TerminalCleanup;
 
 impl Drop for TerminalCleanup {
@@ -773,6 +894,36 @@ mod tests {
             TransferStage::Connecting(ConnectionRoute::Libp2pDcutr)
         ));
         assert!(dashboard.logs.len() >= 4);
+    }
+
+    #[test]
+    fn activity_log_lines_wrap_to_the_available_width() {
+        let entry = LogEntry {
+            elapsed: Duration::from_millis(1250),
+            kind: LogKind::Info,
+            source: Some("peerline_cli::very_long_target_name".into()),
+            text: "abcdefghijklmnopqrstuvwxyz0123456789\nsecond-line-with-more-text".into(),
+        };
+
+        let lines = render_log_lines(&entry, 32);
+
+        assert!(lines.len() > 2);
+        assert!(lines.iter().all(|line| line.width() <= 32));
+    }
+
+    #[test]
+    fn activity_log_prefix_degrades_for_tiny_widths() {
+        let entry = LogEntry {
+            elapsed: Duration::from_millis(1250),
+            kind: LogKind::Warn,
+            source: Some("peerline_cli::very_long_target_name".into()),
+            text: "abcdefghijklmnopqrstuvwxyz".into(),
+        };
+
+        let lines = render_log_lines(&entry, 8);
+
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| line.width() <= 8));
     }
 
     #[test]
