@@ -752,13 +752,6 @@ fn max_log_start(total_rows: usize, visible_rows: usize) -> usize {
 
 fn render_log_lines(entry: &LogEntry, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
-    let source_width = if width >= 84 {
-        18
-    } else if width >= 56 {
-        12
-    } else {
-        0
-    };
     let mut prefix = Vec::new();
     let mut prefix_width = 0usize;
     if width >= 24 {
@@ -766,15 +759,22 @@ fn render_log_lines(entry: &LogEntry, width: usize) -> Vec<Line<'static>> {
         prefix_width += elapsed.chars().count();
         prefix.push(Span::styled(elapsed, Style::default().fg(Color::DarkGray)));
     }
-    if source_width > 0
+    let kind = if width >= 10 {
+        Some(format!("[{}] ", log_kind_label(entry.kind)))
+    } else {
+        None
+    };
+    if width >= 56
         && let Some(source) = &entry.source
     {
-        let source = format!("[{}] ", log_source_label(source, source_width));
-        prefix_width += source.chars().count();
-        prefix.push(Span::styled(source, Style::default().fg(Color::Gray)));
+        let source = format!("[{}] ", log_source_label(source));
+        let reserved_width = kind.as_ref().map_or(0, |label| label.chars().count()) + 12;
+        if prefix_width + source.chars().count() + reserved_width <= width {
+            prefix_width += source.chars().count();
+            prefix.push(Span::styled(source, Style::default().fg(Color::Gray)));
+        }
     }
-    if width >= 10 {
-        let kind = format!("[{}] ", log_kind_label(entry.kind));
+    if let Some(kind) = kind {
         prefix_width += kind.chars().count();
         prefix.push(Span::styled(kind, log_kind_style(entry.kind)));
     }
@@ -835,12 +835,11 @@ fn log_kind_style(kind: LogKind) -> Style {
     }
 }
 
-fn log_source_label(source: &str, max_chars: usize) -> String {
-    let compact = source
+fn log_source_label(source: &str) -> &str {
+    source
         .strip_prefix("peerline_")
         .or_else(|| source.strip_prefix("peerline::"))
-        .unwrap_or(source);
-    truncate_middle(compact, max_chars)
+        .unwrap_or(source)
 }
 
 fn label_span(label: &str) -> Span<'static> {
@@ -1093,15 +1092,40 @@ mod tests {
 
     #[test]
     fn activity_log_source_labels_omit_peerline_prefix() {
-        assert_eq!(log_source_label("peerline_cli::main", 18), "cli::main");
+        assert_eq!(log_source_label("peerline_cli::main"), "cli::main");
         assert_eq!(
-            log_source_label("peerline_net::libp2p_transfer::receiver", 18),
-            "net::li...receiver"
+            log_source_label("peerline_net::libp2p_transfer::receiver"),
+            "net::libp2p_transfer::receiver"
         );
         assert_eq!(
-            log_source_label("external_crate::module", 32),
+            log_source_label("external_crate::module"),
             "external_crate::module"
         );
+    }
+
+    #[test]
+    fn activity_log_prefix_never_invents_ellipses() {
+        let entry = LogEntry {
+            elapsed: Duration::from_millis(1250),
+            kind: LogKind::Status,
+            source: Some("peerline_net::libp2p_transfer::receiver".into()),
+            text: "DHT provider record published".into(),
+        };
+
+        let narrow = render_log_lines(&entry, 48)
+            .into_iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wide = render_log_lines(&entry, 96)
+            .into_iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!narrow.contains("..."));
+        assert!(!wide.contains("..."));
+        assert!(wide.contains("[net::libp2p_transfer::receiver]"));
     }
 
     #[test]
