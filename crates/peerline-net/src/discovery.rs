@@ -433,6 +433,12 @@ async fn run_descriptor_publisher(
         direct_bind,
         allow_loopback,
     )?;
+    let _rendezvous_registration = rendezvous::RendezvousRegistrationGuard::new(
+        name_code.name.clone(),
+        name_code.code.clone(),
+        descriptor.peer_id.clone(),
+        config.rendezvous.clone(),
+    );
     rendezvous::publish_peer_descriptor_background(
         name_code.name.clone(),
         name_code.code.clone(),
@@ -912,6 +918,32 @@ mod tests {
         };
         let ranked = rank_candidates(vec![candidate.clone(), candidate]);
         assert_eq!(ranked.len(), 1);
+    }
+
+    #[test]
+    fn dht_publish_and_discovery_keys_use_the_same_lookup_key() {
+        let name = HumanName::parse("river-mango-42").unwrap();
+        let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+        let lookup_key = NameCode::new(name.clone(), code.clone()).lookup_key();
+        let receiver_lookup_key = NameCode::new(name, code).lookup_key();
+
+        assert_eq!(lookup_key.hex(), receiver_lookup_key.hex());
+        assert_eq!(
+            descriptor_record_key(&lookup_key).to_vec(),
+            descriptor_record_key(&receiver_lookup_key).to_vec()
+        );
+        assert_eq!(
+            provider_record_key(&lookup_key).to_vec(),
+            provider_record_key(&receiver_lookup_key).to_vec()
+        );
+        assert_eq!(
+            String::from_utf8(descriptor_record_key(&lookup_key).to_vec()).unwrap(),
+            format!("/peerline/descriptor/v1/{}", lookup_key.hex())
+        );
+        assert_eq!(
+            String::from_utf8(provider_record_key(&lookup_key).to_vec()).unwrap(),
+            format!("/peerline/v1/{}", lookup_key.hex())
+        );
     }
 
     #[test]

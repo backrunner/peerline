@@ -6,13 +6,15 @@ Private HTTP rendezvous service for Peerline named transfers. It runs on Cloudfl
 
 - `GET /healthz`
 - `POST /v1/namespaces/:namespace/registrations`
+- `DELETE /v1/namespaces/:namespace/registrations?peer_id=...`
 - `GET /v1/namespaces/:namespace/registrations?after_cookie=...&limit=...`
 
 ## Observability
 
 The Worker emits structured JSON logs to Cloudflare Logs/Tail for request completion,
 edge and Durable Object rate limits, authentication failures, descriptor validation
-failures, successful registrations, and successful discovery lookups.
+failures, edge-to-Durable-Object forwarding, successful registrations, explicit
+unregistrations, and successful discovery lookups.
 
 Responses include:
 
@@ -37,6 +39,18 @@ export PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH=/path/to/peerline-client.pem
 ```
 
 You can also supply the bundle inline with `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM`.
+
+Official release builds can embed the same PEM from GitHub Actions secrets by
+setting `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM` or
+`PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM_B64` in the repository secret store.
+The workflow forwards those values to Cargo as
+`PEERLINE_BUILD_RENDEZVOUS_CLIENT_IDENTITY_PEM` and
+`PEERLINE_BUILD_RENDEZVOUS_CLIENT_IDENTITY_PEM_B64`.
+
+Embedding a client certificate private key keeps it out of source control and
+CI logs, but it is not a true secret once distributed in a public binary. Use
+short-lived certificates, fingerprint allow-lists, rate limits, and rotation for
+the private default rendezvous deployment.
 
 If you are wiring Peerline to another rendezvous service that still expects a shared secret, set `PEERLINE_RENDEZVOUS_TOKEN` in the client environment instead.
 

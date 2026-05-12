@@ -34,6 +34,11 @@ pub struct RendezvousRegisterResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendezvousUnregisterResponse {
+    pub removed: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RendezvousDiscoverRequest {
     pub after_cookie: Option<u64>,
     pub limit: Option<u32>,

@@ -13,6 +13,10 @@ command = "cargo install worker-build --version 0.8.3 --locked --force && worker
 PEERLINE_RENDEZVOUS_MAX_TTL_SECS = "180"
 PEERLINE_RENDEZVOUS_REQUIRE_MTLS = "1"
 
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 [durable_objects]
 bindings = [{ name = "RENDEZVOUS", class_name = "RendezvousShard" }]
 
@@ -23,5 +27,13 @@ new_sqlite_classes = ["RendezvousShard"]
 [env.alpha]
 routes = [{ pattern = "alpha.rendezvous.peerline.pwp.sh", custom_domain = true }]
 
+[env.alpha.observability]
+enabled = true
+head_sampling_rate = 1
+
 [env.beta]
 routes = [{ pattern = "beta.rendezvous.peerline.pwp.sh", custom_domain = true }]
+
+[env.beta.observability]
+enabled = true
+head_sampling_rate = 1

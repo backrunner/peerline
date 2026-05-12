@@ -1,7 +1,9 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use peerline_core::{HumanCode, HumanName, NameCode};
 use peerline_rendezvous_model::{
     HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_VERSION, PeerDescriptor, RendezvousDiscoverResponse,
-    RendezvousRegisterRequest, request_path_and_query, sign_peerline_request,
+    RendezvousRegisterRequest, RendezvousUnregisterResponse, request_path_and_query,
+    sign_peerline_request,
 };
 use reqwest::Url;
 use std::{
@@ -15,6 +17,10 @@ const DEFAULT_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(5);
 const PEERLINE_RENDEZVOUS_HOST_ROOT: &str = "rendezvous.peerline.pwp.sh";
 const PEERLINE_RENDEZVOUS_HOST_ALPHA: &str = "alpha.rendezvous.peerline.pwp.sh";
 const PEERLINE_RENDEZVOUS_HOST_BETA: &str = "beta.rendezvous.peerline.pwp.sh";
+const BUILD_CLIENT_IDENTITY_PEM: Option<&str> =
+    option_env!("PEERLINE_BUILD_RENDEZVOUS_CLIENT_IDENTITY_PEM");
+const BUILD_CLIENT_IDENTITY_PEM_B64: Option<&str> =
+    option_env!("PEERLINE_BUILD_RENDEZVOUS_CLIENT_IDENTITY_PEM_B64");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReleaseChannel {
@@ -69,7 +75,7 @@ impl Default for RendezvousConfig {
         let client_identity = client_identity_from_env();
         if endpoints.iter().any(is_default_private_endpoint) && client_identity.is_none() {
             tracing::warn!(
-                "default rendezvous endpoint requires PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM or PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH"
+                "default rendezvous endpoint requires a runtime or build-time rendezvous client identity"
             );
         }
 
@@ -183,6 +189,128 @@ pub fn publish_peer_descriptor_background(
             tracing::warn!(%error, "rendezvous registration failed");
         }
     }));
+}
+
+pub async fn unpublish_peer_descriptor(
+    name: &HumanName,
+    code: &HumanCode,
+    peer_id: &str,
+    config: &RendezvousConfig,
+) -> anyhow::Result<()> {
+    let usable_endpoints = usable_endpoints(config);
+    if usable_endpoints.is_empty() {
+        return Ok(());
+    }
+
+    let namespace = rendezvous_namespace(name, code);
+    let client = client(config)?;
+    let mut accepted = 0usize;
+    let mut removed = 0u32;
+
+    for endpoint in usable_endpoints {
+        let mut url = namespace_url(endpoint, &namespace)?;
+        url.query_pairs_mut().append_pair("peer_id", peer_id);
+        match signed_request(&client, config, "DELETE", url, &[])
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                accepted += 1;
+                match response.json::<RendezvousUnregisterResponse>().await {
+                    Ok(payload) => {
+                        removed = removed.saturating_add(payload.removed);
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            endpoint = %endpoint,
+                            "invalid rendezvous unregister payload"
+                        );
+                    }
+                }
+            }
+            Ok(response) => {
+                tracing::debug!(
+                    status = %response.status(),
+                    endpoint = %endpoint,
+                    "rendezvous unregister rejected"
+                );
+            }
+            Err(error) => {
+                tracing::debug!(%error, endpoint = %endpoint, "rendezvous unregister failed");
+            }
+        }
+    }
+
+    if accepted > 0 {
+        tracing::info!(
+            namespace = %namespace,
+            peer_id = %peer_id,
+            removed = removed,
+            "rendezvous registration removed"
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct RendezvousRegistrationGuard {
+    name: HumanName,
+    code: HumanCode,
+    peer_id: String,
+    config: RendezvousConfig,
+    active: bool,
+}
+
+impl RendezvousRegistrationGuard {
+    pub fn new(
+        name: HumanName,
+        code: HumanCode,
+        peer_id: impl Into<String>,
+        config: RendezvousConfig,
+    ) -> Self {
+        Self {
+            name,
+            code,
+            peer_id: peer_id.into(),
+            config,
+            active: true,
+        }
+    }
+
+    pub async fn unregister(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        if let Err(error) =
+            unpublish_peer_descriptor(&self.name, &self.code, &self.peer_id, &self.config).await
+        {
+            tracing::debug!(%error, peer_id = %self.peer_id, "rendezvous unregister failed");
+        }
+    }
+}
+
+impl Drop for RendezvousRegistrationGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let name = self.name.clone();
+        let code = self.code.clone();
+        let peer_id = self.peer_id.clone();
+        let config = self.config.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            std::mem::drop(handle.spawn(async move {
+                if let Err(error) =
+                    unpublish_peer_descriptor(&name, &code, &peer_id, &config).await
+                {
+                    tracing::debug!(%error, peer_id = %peer_id, "rendezvous drop unregister failed");
+                }
+            }));
+        }
+    }
 }
 
 pub async fn discover_peer_descriptors(
@@ -365,11 +493,10 @@ fn release_channel_from_version(version: &str) -> ReleaseChannel {
 }
 
 fn client_identity_from_env() -> Option<RendezvousClientIdentity> {
-    if let Ok(raw) = std::env::var("PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM") {
-        let pem = raw.trim();
-        if !pem.is_empty() {
-            return Some(RendezvousClientIdentity::PemBundle(pem.as_bytes().to_vec()));
-        }
+    if let Ok(raw) = std::env::var("PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM")
+        && let Some(pem) = pem_bundle_from_raw(&raw)
+    {
+        return Some(RendezvousClientIdentity::PemBundle(pem));
     }
     if let Ok(raw) = std::env::var("PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH") {
         let path = PathBuf::from(raw.trim());
@@ -377,7 +504,43 @@ fn client_identity_from_env() -> Option<RendezvousClientIdentity> {
             return Some(RendezvousClientIdentity::PemPath(path));
         }
     }
+    if let Some(raw) = BUILD_CLIENT_IDENTITY_PEM
+        && let Some(pem) = pem_bundle_from_raw(raw)
+    {
+        tracing::debug!("using build-time embedded rendezvous client identity");
+        return Some(RendezvousClientIdentity::PemBundle(pem));
+    }
+    if let Some(raw) = BUILD_CLIENT_IDENTITY_PEM_B64
+        && let Some(pem) = pem_bundle_from_base64(raw)
+    {
+        tracing::debug!("using build-time embedded base64 rendezvous client identity");
+        return Some(RendezvousClientIdentity::PemBundle(pem));
+    }
     None
+}
+
+fn pem_bundle_from_raw(raw: &str) -> Option<Vec<u8>> {
+    let pem = raw.trim();
+    if pem.is_empty() {
+        None
+    } else {
+        Some(pem.as_bytes().to_vec())
+    }
+}
+
+fn pem_bundle_from_base64(raw: &str) -> Option<Vec<u8>> {
+    let encoded = raw.split_whitespace().collect::<String>();
+    if encoded.is_empty() {
+        return None;
+    }
+    match STANDARD.decode(encoded) {
+        Ok(bytes) if !bytes.is_empty() => Some(bytes),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::warn!(%error, "ignoring invalid build-time rendezvous identity base64");
+            None
+        }
+    }
 }
 
 fn is_default_private_endpoint(url: &Url) -> bool {
@@ -483,5 +646,19 @@ mod tests {
         };
 
         assert_eq!(usable_endpoints(&config), vec![&public]);
+    }
+
+    #[test]
+    fn build_time_identity_helpers_ignore_empty_values() {
+        assert_eq!(pem_bundle_from_raw(" \n "), None);
+        assert_eq!(pem_bundle_from_base64(" \n "), None);
+    }
+
+    #[test]
+    fn build_time_identity_helper_decodes_base64_pem() {
+        let pem = b"-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----";
+        let encoded = STANDARD.encode(pem);
+
+        assert_eq!(pem_bundle_from_base64(&encoded), Some(pem.to_vec()));
     }
 }

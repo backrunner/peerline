@@ -135,12 +135,17 @@ jobs:
         shell: bash
         env:
           PEERLINE_PLATFORM_PACKAGE: ${{ matrix.package }}
+          PEERLINE_BUILD_RENDEZVOUS_CLIENT_IDENTITY_PEM: ${{ secrets.PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM }}
+          PEERLINE_BUILD_RENDEZVOUS_CLIENT_IDENTITY_PEM_B64: ${{ secrets.PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM_B64 }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           set -euo pipefail
+          if [ -z "${PEERLINE_BUILD_RENDEZVOUS_CLIENT_IDENTITY_PEM:-}" ] && [ -z "${PEERLINE_BUILD_RENDEZVOUS_CLIENT_IDENTITY_PEM_B64:-}" ]; then
+            echo "::warning::platform asset is being built without an embedded rendezvous client identity"
+          fi
           npm run build:platform-asset -- --platform-package="$PEERLINE_PLATFORM_PACKAGE"
 
       - name: Upload platform asset

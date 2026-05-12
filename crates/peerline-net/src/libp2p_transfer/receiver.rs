@@ -57,6 +57,12 @@ pub(crate) async fn recv_libp2p(
         provider_key.clone(),
         &options,
     )?;
+    let mut rendezvous_registration = rendezvous::RendezvousRegistrationGuard::new(
+        options.name.clone(),
+        options.code.clone(),
+        descriptor.peer_id.clone(),
+        options.discovery.rendezvous.clone(),
+    );
     rendezvous::publish_peer_descriptor_background(
         options.name.clone(),
         options.code.clone(),
@@ -98,6 +104,7 @@ pub(crate) async fn recv_libp2p(
                                 &options.events,
                                 PeerlineEvent::StageChanged(TransferStage::Complete),
                             );
+                            rendezvous_registration.unregister().await;
                             return Ok(done);
                         }
                     }

@@ -1,7 +1,8 @@
 use peerline_rendezvous_model::{
     HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_VERSION, PeerDescriptor, RendezvousDiscoverRequest,
     RendezvousDiscoverResponse, RendezvousRecord, RendezvousRegisterRequest,
-    RendezvousRegisterResponse, request_path_and_query, verify_peerline_request_signature,
+    RendezvousRegisterResponse, RendezvousUnregisterResponse, request_path_and_query,
+    verify_peerline_request_signature,
 };
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -27,6 +28,7 @@ const MAX_LIBP2P_ENDPOINTS: usize = 24;
 const MAX_ENDPOINT_LEN: usize = 256;
 const RATE_WINDOW_MS: i64 = 60_000;
 const REGISTER_RATE_LIMIT: u32 = 30;
+const UNREGISTER_RATE_LIMIT: u32 = 60;
 const DISCOVER_RATE_LIMIT: u32 = 120;
 const SIGNATURE_SKEW_MS: i64 = 5 * 60 * 1000;
 
@@ -62,7 +64,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             serde_json::json!({ "reason": "invalid_namespace" }),
         );
     }
-    if !matches!(req.method(), Method::Get | Method::Post) {
+    if !matches!(req.method(), Method::Get | Method::Post | Method::Delete) {
         return observed_error_response(
             "rendezvous_edge_rejected",
             &telemetry,
@@ -89,6 +91,13 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
 
     let stub = env.durable_object(DO_BINDING)?.get_by_name(namespace)?;
+    log_request_event(
+        LogLevel::Info,
+        "rendezvous_edge_forward",
+        &telemetry,
+        Some(namespace),
+        serde_json::json!({ "durable_object": DO_BINDING }),
+    );
     let response = stub.fetch_with_request(req).await?;
     log_request_complete(
         "rendezvous_request_complete",
@@ -152,6 +161,7 @@ impl DurableObject for RendezvousShard {
         match req.method() {
             Method::Post => self.register(namespace, &mut req, &telemetry).await,
             Method::Get => self.discover(namespace, &mut req, &telemetry).await,
+            Method::Delete => self.unregister(namespace, &req, &telemetry).await,
             _ => observed_error_response(
                 "rendezvous_do_rejected",
                 &telemetry,
@@ -393,6 +403,78 @@ impl RendezvousShard {
         Response::from_json(&RendezvousDiscoverResponse {
             cookie: cookie.cookie as u64,
             records,
+        })
+    }
+
+    async fn unregister(
+        &self,
+        namespace: &str,
+        req: &Request,
+        telemetry: &RequestTelemetry,
+    ) -> Result<Response> {
+        if let Err(rejection) = self.verify_request(req, &[]) {
+            return observed_rejection_response(
+                "rendezvous_auth_rejected",
+                telemetry,
+                Some(namespace),
+                rejection,
+            );
+        }
+        if !self.enforce_rate_limit(namespace, req, UNREGISTER_RATE_LIMIT)? {
+            return observed_error_response(
+                "rendezvous_do_rate_limited",
+                telemetry,
+                Some(namespace),
+                "rate limit exceeded",
+                429,
+                serde_json::json!({
+                    "operation": "unregister",
+                    "limit": UNREGISTER_RATE_LIMIT,
+                }),
+            );
+        }
+
+        let peer_id = match unregister_peer_id(req) {
+            Some(peer_id) if is_valid_peer_id(&peer_id) => peer_id,
+            _ => {
+                return observed_error_response(
+                    "rendezvous_unregister_rejected",
+                    telemetry,
+                    Some(namespace),
+                    "invalid peer id",
+                    400,
+                    serde_json::json!({ "reason": "invalid_peer_id" }),
+                );
+            }
+        };
+
+        let now = now_unix_ms();
+        self.cleanup_expired(now)?;
+        let existing: CountRow = self
+            .sql
+            .exec(
+                "SELECT COUNT(*) AS count FROM registrations WHERE peer_id = ?;",
+                vec![peer_id.clone().into()],
+            )?
+            .one()?;
+        self.sql.exec(
+            "DELETE FROM registrations WHERE peer_id = ?;",
+            vec![peer_id.clone().into()],
+        )?;
+
+        log_request_event(
+            LogLevel::Info,
+            "rendezvous_unregister_ok",
+            telemetry,
+            Some(namespace),
+            serde_json::json!({
+                "peer_id": peer_id,
+                "removed": existing.count,
+            }),
+        );
+
+        Response::from_json(&RendezvousUnregisterResponse {
+            removed: existing.count.max(0) as u32,
         })
     }
 
@@ -751,7 +833,7 @@ fn validate_descriptor(descriptor: &PeerDescriptor) -> std::result::Result<(), R
             400,
         ));
     }
-    if descriptor.peer_id.is_empty() || descriptor.peer_id.len() > 128 {
+    if !is_valid_peer_id(&descriptor.peer_id) {
         return Err(Rejection::new("invalid peer id", 400));
     }
     if descriptor.direct_endpoints.is_empty() && descriptor.libp2p_endpoints.is_empty() {
@@ -772,6 +854,20 @@ fn validate_descriptor(descriptor: &PeerDescriptor) -> std::result::Result<(), R
     }
 
     Ok(())
+}
+
+fn unregister_peer_id(req: &Request) -> Option<String> {
+    req.url()
+        .ok()?
+        .query_pairs()
+        .find(|(key, _)| key == "peer_id")
+        .map(|(_, value)| value.into_owned())
+}
+
+fn is_valid_peer_id(peer_id: &str) -> bool {
+    !peer_id.is_empty()
+        && peer_id.len() <= 128
+        && peer_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 fn namespace_from_path(path: &str) -> Option<&str> {
