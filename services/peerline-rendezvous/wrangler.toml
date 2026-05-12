@@ -7,11 +7,12 @@ routes = [{ pattern = "rendezvous.peerline.pwp.sh", custom_domain = true }]
 [build]
 # Avoid worker-build's nightly panic-unwind path; it currently generates wasm
 # that wasm-bindgen can panic on in Linux CI.
-command = "cargo install worker-build --version 0.8.3 --locked --force && worker-build --release --no-panic-recovery"
+command = "cargo install worker-build --version 0.8.3 --locked --force && \"$HOME/.cargo/bin/worker-build\" --release --no-panic-recovery"
 
 [vars]
 PEERLINE_RENDEZVOUS_MAX_TTL_SECS = "180"
 PEERLINE_RENDEZVOUS_REQUIRE_MTLS = "1"
+PEERLINE_RENDEZVOUS_ALLOWED_CLIENT_CERT_FINGERPRINTS = "8e3aca955bd80378bc087cb8215eb1d642164dbe647ecb1561887dbb51984764"
 
 [observability]
 enabled = true
@@ -27,12 +28,28 @@ new_sqlite_classes = ["RendezvousShard"]
 [env.alpha]
 routes = [{ pattern = "alpha.rendezvous.peerline.pwp.sh", custom_domain = true }]
 
+[env.alpha.vars]
+PEERLINE_RENDEZVOUS_MAX_TTL_SECS = "180"
+PEERLINE_RENDEZVOUS_REQUIRE_MTLS = "1"
+PEERLINE_RENDEZVOUS_ALLOWED_CLIENT_CERT_FINGERPRINTS = "8e3aca955bd80378bc087cb8215eb1d642164dbe647ecb1561887dbb51984764"
+
+[env.alpha.durable_objects]
+bindings = [{ name = "RENDEZVOUS", class_name = "RendezvousShard" }]
+
 [env.alpha.observability]
 enabled = true
 head_sampling_rate = 1
 
 [env.beta]
 routes = [{ pattern = "beta.rendezvous.peerline.pwp.sh", custom_domain = true }]
+
+[env.beta.vars]
+PEERLINE_RENDEZVOUS_MAX_TTL_SECS = "180"
+PEERLINE_RENDEZVOUS_REQUIRE_MTLS = "1"
+PEERLINE_RENDEZVOUS_ALLOWED_CLIENT_CERT_FINGERPRINTS = "8e3aca955bd80378bc087cb8215eb1d642164dbe647ecb1561887dbb51984764"
+
+[env.beta.durable_objects]
+bindings = [{ name = "RENDEZVOUS", class_name = "RendezvousShard" }]
 
 [env.beta.observability]
 enabled = true
