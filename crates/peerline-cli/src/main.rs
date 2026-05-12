@@ -10,11 +10,14 @@ use peerline_net::{
 use std::{
     fmt,
     future::Future,
-    io::IsTerminal,
+    io::{self, IsTerminal, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::{sync::watch, task::JoinHandle};
 use tracing::{Event, Level, Subscriber, field::Field};
@@ -138,7 +141,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
             stage: peerline_core::TransferStage::Discovering,
             progress: None,
         };
-        let task = tokio::spawn(peerline_tui::render_once_with_quit(
+        let task = spawn_terminal_ui(peerline_tui::render_once_with_quit(
             view,
             receiver,
             Some(quit_tx),
@@ -301,7 +304,7 @@ fn init_tracing(debug: bool) {
         .with(tracing_filter(debug))
         .with(
             tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
+                .with_writer(TuiAwareStderr)
                 .with_target(true),
         )
         .with(ActivityLogLayer)
@@ -321,6 +324,68 @@ fn tracing_filter(debug: bool) -> tracing_subscriber::EnvFilter {
 static ACTIVITY_LOG_SENDERS: OnceLock<
     Mutex<Vec<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>>,
 > = OnceLock::new();
+static TERMINAL_UI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct TerminalUiLogGuard;
+
+impl TerminalUiLogGuard {
+    fn activate() -> Self {
+        TERMINAL_UI_ACTIVE.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for TerminalUiLogGuard {
+    fn drop(&mut self) {
+        TERMINAL_UI_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
+fn spawn_terminal_ui<F>(future: F) -> JoinHandle<anyhow::Result<()>>
+where
+    F: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let guard = TerminalUiLogGuard::activate();
+    tokio::spawn(async move {
+        let _guard = guard;
+        future.await
+    })
+}
+
+struct TuiAwareStderr;
+
+enum TuiAwareStderrWriter {
+    Stderr(io::Stderr),
+    Sink(io::Sink),
+}
+
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TuiAwareStderr {
+    type Writer = TuiAwareStderrWriter;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        if TERMINAL_UI_ACTIVE.load(Ordering::SeqCst) && io::stderr().is_terminal() {
+            TuiAwareStderrWriter::Sink(io::sink())
+        } else {
+            TuiAwareStderrWriter::Stderr(io::stderr())
+        }
+    }
+}
+
+impl Write for TuiAwareStderrWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stderr(stderr) => stderr.write(buf),
+            Self::Sink(sink) => sink.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stderr(stderr) => stderr.flush(),
+            Self::Sink(sink) => sink.flush(),
+        }
+    }
+}
 
 fn register_activity_log_sender(sender: &tokio::sync::mpsc::UnboundedSender<PeerlineEvent>) {
     ACTIVITY_LOG_SENDERS
@@ -423,7 +488,7 @@ fn spawn_send_tui(
         stage: TransferStage::Discovering,
         progress: None,
     };
-    let task = tokio::spawn(peerline_tui::render_send_once_with_quit(
+    let task = spawn_terminal_ui(peerline_tui::render_send_once_with_quit(
         view,
         receiver,
         quit_signal,
@@ -896,5 +961,17 @@ mod tests {
         assert!(!route_allowed(&RouteKind::Libp2pRelay, false));
         assert!(route_allowed(&RouteKind::Libp2pRelay, true));
         assert!(route_allowed(&RouteKind::Libp2pDcutr, false));
+    }
+
+    #[test]
+    fn terminal_ui_log_guard_resets_formatter_suppression() {
+        TERMINAL_UI_ACTIVE.store(false, Ordering::SeqCst);
+
+        {
+            let _guard = TerminalUiLogGuard::activate();
+            assert!(TERMINAL_UI_ACTIVE.load(Ordering::SeqCst));
+        }
+
+        assert!(!TERMINAL_UI_ACTIVE.load(Ordering::SeqCst));
     }
 }

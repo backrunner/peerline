@@ -45,6 +45,7 @@ struct Dashboard {
     active_transfer: Option<TransferId>,
     transfers: Vec<TransferRow>,
     logs: VecDeque<LogEntry>,
+    log_scroll_top: Option<usize>,
     started_at: Instant,
 }
 
@@ -104,6 +105,7 @@ impl Dashboard {
             active_transfer: None,
             transfers: Vec::new(),
             logs: VecDeque::new(),
+            log_scroll_top: None,
             started_at: Instant::now(),
         }
     }
@@ -121,6 +123,7 @@ impl Dashboard {
             active_transfer: None,
             transfers: Vec::new(),
             logs: VecDeque::new(),
+            log_scroll_top: None,
             started_at: Instant::now(),
         }
     }
@@ -240,29 +243,19 @@ impl Dashboard {
 
     fn draw(&self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(5),
-                Constraint::Min(8),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        let body = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Ratio(6, 11), Constraint::Ratio(5, 11)])
-            .split(chunks[1]);
+        let layout = dashboard_layout(area);
 
-        self.draw_header(frame, chunks[0]);
-        self.draw_transfers(frame, body[0]);
-        self.draw_logs(frame, body[1]);
-        self.draw_footer(frame, chunks[2]);
+        self.draw_header(frame, layout.header);
+        self.draw_transfers(frame, layout.transfers);
+        self.draw_logs(frame, layout.logs);
+        self.draw_footer(frame, layout.footer);
     }
 
     fn draw_header(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let mut lines = vec![
-            self.title_line(area.width),
-            self.meta_line(area.width),
+            self.summary_line(area.width),
+            self.identity_line(area.width),
+            self.code_line(area.width),
             self.state_line(area.width),
         ];
         if lines.is_empty() {
@@ -338,7 +331,12 @@ impl Dashboard {
     }
 
     fn draw_logs(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let block = Block::new().title("Activity").borders(Borders::ALL);
+        let title = if self.log_scroll_top.is_some() {
+            "Activity (history)"
+        } else {
+            "Activity"
+        };
+        let block = Block::new().title(title).borders(Borders::ALL);
         if self.logs.is_empty() {
             let empty = Paragraph::new("waiting for events")
                 .style(Style::default().fg(Color::DarkGray))
@@ -347,21 +345,19 @@ impl Dashboard {
             return;
         }
 
-        let visible_rows = area.height.saturating_sub(2) as usize;
-        let content_width = area.width.saturating_sub(2) as usize;
-        let mut lines = self
-            .logs
-            .iter()
-            .flat_map(|entry| render_log_lines(entry, content_width))
-            .collect::<Vec<_>>();
-        if lines.len() > visible_rows {
-            lines = lines.split_off(lines.len() - visible_rows);
-        }
-
-        frame.render_widget(Paragraph::new(lines).block(block), area);
+        frame.render_widget(
+            Paragraph::new(self.visible_activity_lines(area)).block(block),
+            area,
+        );
     }
 
     fn draw_footer(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let controls = if self.log_scroll_top.is_some() {
+            " quit  logs Up/Down PgUp/PgDn Home/End  history  "
+        } else {
+            " quit  logs Up/Down PgUp/PgDn Home/End  "
+        };
+        let fixed_width = "q/Esc".chars().count() + controls.chars().count();
         let summary = truncate_end(
             &format!(
                 "transfers {}  active {}  done {}  failed {}  logs {}",
@@ -371,7 +367,7 @@ impl Dashboard {
                 self.failed_transfer_count(),
                 self.logs.len(),
             ),
-            area.width.saturating_sub(10) as usize,
+            (area.width as usize).saturating_sub(fixed_width),
         );
         let footer = Paragraph::new(Line::from(vec![
             Span::styled(
@@ -380,7 +376,7 @@ impl Dashboard {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" quit  ", Style::default().fg(Color::Gray)),
+            Span::styled(controls, Style::default().fg(Color::Gray)),
             Span::styled(summary, Style::default().fg(Color::DarkGray)),
         ]));
         frame.render_widget(footer, area);
@@ -393,45 +389,33 @@ impl Dashboard {
         }
     }
 
-    fn title_line(&self, width: u16) -> Line<'static> {
+    fn summary_line(&self, width: u16) -> Line<'static> {
         let summary = format!(
-            "{} transfer(s) | {} active | {} done | {} failed",
+            "transfers {} | active {} | done {} | failed {}",
             self.transfers.len(),
             self.active_transfer_count(),
             self.complete_transfer_count(),
             self.failed_transfer_count(),
         );
-        let title_width = self.title().chars().count() + 2;
-        let summary_width = (width as usize).saturating_sub(title_width).max(1);
-        Line::from(vec![
-            Span::styled(
-                self.title(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                truncate_end(&summary, summary_width),
-                Style::default().fg(Color::Gray),
-            ),
-        ])
+        let summary_width = width.saturating_sub(2) as usize;
+        Line::from(vec![Span::styled(
+            truncate_end(&summary, summary_width),
+            Style::default().fg(Color::Gray),
+        )])
     }
 
-    fn meta_line(&self, width: u16) -> Line<'static> {
+    fn identity_line(&self, width: u16) -> Line<'static> {
         let content_width = width.saturating_sub(2) as usize;
         match &self.kind {
-            DashboardKind::Recv { name, code, bind } => Line::from(vec![
+            DashboardKind::Recv {
+                name,
+                code: _,
+                bind,
+            } => Line::from(vec![
                 label_span("name"),
                 Span::styled(
-                    truncate_middle(name.as_str(), field_width(content_width, 22)),
+                    truncate_middle(name.as_str(), field_width(content_width, 28)),
                     Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                label_span("code"),
-                Span::styled(
-                    truncate_middle(code.as_str(), field_width(content_width, 24)),
-                    Style::default().fg(Color::Yellow),
                 ),
                 Span::raw("  "),
                 label_span("listen"),
@@ -443,21 +427,25 @@ impl Dashboard {
             DashboardKind::Send {
                 target_label,
                 target,
-                code,
+                code: _,
             } => Line::from(vec![
                 label_span(target_label),
                 Span::styled(
                     truncate_middle(target.as_str(), field_width(content_width, 36)),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("  "),
-                label_span("code"),
-                Span::styled(
-                    truncate_middle(code.as_str(), field_width(content_width, 28)),
-                    Style::default().fg(Color::Yellow),
-                ),
             ]),
         }
+    }
+
+    fn code_line(&self, _width: u16) -> Line<'static> {
+        let code = match &self.kind {
+            DashboardKind::Recv { code, .. } | DashboardKind::Send { code, .. } => code,
+        };
+        Line::from(vec![
+            label_span("code"),
+            Span::styled(code.clone(), Style::default().fg(Color::Yellow)),
+        ])
     }
 
     fn state_line(&self, width: u16) -> Line<'static> {
@@ -517,6 +505,45 @@ impl Dashboard {
         }
     }
 
+    fn visible_activity_lines(&self, area: Rect) -> Vec<Line<'static>> {
+        let visible_rows = activity_visible_rows(area);
+        let content_width = activity_content_width(area);
+        visible_log_lines(&self.logs, content_width, visible_rows, self.log_scroll_top)
+    }
+
+    fn handle_activity_scroll_key(&mut self, key: crossterm::event::KeyEvent, area: Rect) -> bool {
+        let Some(command) = activity_scroll_command(key) else {
+            return false;
+        };
+        let visible_rows = activity_visible_rows(area);
+        let content_width = activity_content_width(area);
+        let total_rows = rendered_log_line_count(&self.logs, content_width);
+        let max_start = max_log_start(total_rows, visible_rows);
+        if max_start == 0 {
+            self.log_scroll_top = None;
+            return true;
+        }
+
+        let current = log_view_start(total_rows, visible_rows, self.log_scroll_top);
+        let page = visible_rows.saturating_sub(1).max(1);
+        let next = match command {
+            ActivityScrollCommand::Up => Some(current.saturating_sub(1)),
+            ActivityScrollCommand::Down => {
+                let next = current.saturating_add(1).min(max_start);
+                (next < max_start).then_some(next)
+            }
+            ActivityScrollCommand::PageUp => Some(current.saturating_sub(page)),
+            ActivityScrollCommand::PageDown => {
+                let next = current.saturating_add(page).min(max_start);
+                (next < max_start).then_some(next)
+            }
+            ActivityScrollCommand::Top => Some(0),
+            ActivityScrollCommand::Bottom => None,
+        };
+        self.log_scroll_top = next;
+        true
+    }
+
     fn transfer_mut(&mut self, id: TransferId) -> Option<&mut TransferRow> {
         self.transfers.iter_mut().find(|row| row.id == id)
     }
@@ -567,6 +594,13 @@ async fn run_dashboard(
                                 let _ = signal.send(true);
                             }
                             return Ok(());
+                        }
+                        crossterm::event::Event::Key(key) => {
+                            let size = terminal.size()?;
+                            let layout = dashboard_layout(Rect::new(0, 0, size.width, size.height));
+                            if dashboard.handle_activity_scroll_key(key, layout.logs) {
+                                terminal.draw(|frame| dashboard.draw(frame))?;
+                            }
                         }
                         crossterm::event::Event::Resize(_, _) => {
                             terminal.clear()?;
@@ -624,6 +658,98 @@ fn is_quit_key(key: crossterm::event::KeyEvent) -> bool {
     )
 }
 
+#[derive(Clone, Copy)]
+struct DashboardLayout {
+    header: Rect,
+    transfers: Rect,
+    logs: Rect,
+    footer: Rect,
+}
+
+fn dashboard_layout(area: Rect) -> DashboardLayout {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Ratio(6, 11), Constraint::Ratio(5, 11)])
+        .split(chunks[1]);
+
+    DashboardLayout {
+        header: chunks[0],
+        transfers: body[0],
+        logs: body[1],
+        footer: chunks[2],
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ActivityScrollCommand {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+}
+
+fn activity_scroll_command(key: crossterm::event::KeyEvent) -> Option<ActivityScrollCommand> {
+    match key.code {
+        crossterm::event::KeyCode::Up => Some(ActivityScrollCommand::Up),
+        crossterm::event::KeyCode::Down => Some(ActivityScrollCommand::Down),
+        crossterm::event::KeyCode::PageUp => Some(ActivityScrollCommand::PageUp),
+        crossterm::event::KeyCode::PageDown => Some(ActivityScrollCommand::PageDown),
+        crossterm::event::KeyCode::Home => Some(ActivityScrollCommand::Top),
+        crossterm::event::KeyCode::End => Some(ActivityScrollCommand::Bottom),
+        _ => None,
+    }
+}
+
+fn activity_visible_rows(area: Rect) -> usize {
+    area.height.saturating_sub(2) as usize
+}
+
+fn activity_content_width(area: Rect) -> usize {
+    area.width.saturating_sub(2) as usize
+}
+
+fn visible_log_lines(
+    logs: &VecDeque<LogEntry>,
+    width: usize,
+    visible_rows: usize,
+    scroll_top: Option<usize>,
+) -> Vec<Line<'static>> {
+    let lines = rendered_log_lines(logs, width);
+    let start = log_view_start(lines.len(), visible_rows, scroll_top);
+    lines.into_iter().skip(start).take(visible_rows).collect()
+}
+
+fn rendered_log_lines(logs: &VecDeque<LogEntry>, width: usize) -> Vec<Line<'static>> {
+    logs.iter()
+        .flat_map(|entry| render_log_lines(entry, width))
+        .collect()
+}
+
+fn rendered_log_line_count(logs: &VecDeque<LogEntry>, width: usize) -> usize {
+    logs.iter()
+        .map(|entry| render_log_lines(entry, width).len())
+        .sum()
+}
+
+fn log_view_start(total_rows: usize, visible_rows: usize, scroll_top: Option<usize>) -> usize {
+    let max_start = max_log_start(total_rows, visible_rows);
+    scroll_top.unwrap_or(max_start).min(max_start)
+}
+
+fn max_log_start(total_rows: usize, visible_rows: usize) -> usize {
+    total_rows.saturating_sub(visible_rows)
+}
+
 fn render_log_lines(entry: &LogEntry, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let source_width = if width >= 84 {
@@ -643,7 +769,7 @@ fn render_log_lines(entry: &LogEntry, width: usize) -> Vec<Line<'static>> {
     if source_width > 0
         && let Some(source) = &entry.source
     {
-        let source = format!("[{}] ", truncate_middle(source, source_width));
+        let source = format!("[{}] ", log_source_label(source, source_width));
         prefix_width += source.chars().count();
         prefix.push(Span::styled(source, Style::default().fg(Color::Gray)));
     }
@@ -707,6 +833,14 @@ fn log_kind_style(kind: LogKind) -> Style {
         LogKind::Error => Style::default().fg(Color::Red),
         LogKind::Status => Style::default().fg(Color::Cyan),
     }
+}
+
+fn log_source_label(source: &str, max_chars: usize) -> String {
+    let compact = source
+        .strip_prefix("peerline_")
+        .or_else(|| source.strip_prefix("peerline::"))
+        .unwrap_or(source);
+    truncate_middle(compact, max_chars)
 }
 
 fn label_span(label: &str) -> Span<'static> {
@@ -854,6 +988,37 @@ mod tests {
         })
     }
 
+    fn line_text(line: Line<'_>) -> String {
+        line.spans
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect()
+    }
+
+    fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn header_summary_does_not_repeat_the_block_title() {
+        let dashboard = recv_dashboard();
+
+        let summary = line_text(dashboard.summary_line(80));
+
+        assert!(!summary.contains("Peerline receive"));
+        assert_eq!(summary, "transfers 0 | active 0 | done 0 | failed 0");
+    }
+
+    #[test]
+    fn pairing_code_is_rendered_without_middle_truncation() {
+        let dashboard = recv_dashboard();
+
+        let code = line_text(dashboard.code_line(20));
+
+        assert!(code.contains("rose-lime-iris-jade-1234"));
+        assert!(!code.contains("..."));
+    }
+
     #[test]
     fn tracks_multiple_transfer_rows_with_peer_labels() {
         let mut dashboard = recv_dashboard();
@@ -924,6 +1089,89 @@ mod tests {
 
         assert!(lines.len() > 1);
         assert!(lines.iter().all(|line| line.width() <= 8));
+    }
+
+    #[test]
+    fn activity_log_source_labels_omit_peerline_prefix() {
+        assert_eq!(log_source_label("peerline_cli::main", 18), "cli::main");
+        assert_eq!(
+            log_source_label("peerline_net::libp2p_transfer::receiver", 18),
+            "net::li...receiver"
+        );
+        assert_eq!(
+            log_source_label("external_crate::module", 32),
+            "external_crate::module"
+        );
+    }
+
+    #[test]
+    fn activity_log_follows_the_bottom_by_default() {
+        let mut dashboard = recv_dashboard();
+        for index in 0..8 {
+            dashboard.push_log(LogKind::Info, format!("log-{index}"), None);
+        }
+
+        let lines = dashboard
+            .visible_activity_lines(Rect::new(0, 0, 80, 6))
+            .into_iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].contains("log-4"));
+        assert!(lines[3].contains("log-7"));
+    }
+
+    #[test]
+    fn activity_log_scroll_keys_lock_and_release_history_view() {
+        let mut dashboard = recv_dashboard();
+        let area = Rect::new(0, 0, 80, 6);
+        for index in 0..8 {
+            dashboard.push_log(LogKind::Info, format!("log-{index}"), None);
+        }
+
+        assert!(dashboard.handle_activity_scroll_key(key(crossterm::event::KeyCode::Up), area));
+        assert_eq!(dashboard.log_scroll_top, Some(3));
+
+        let lines = dashboard
+            .visible_activity_lines(area)
+            .into_iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(lines[0].contains("log-3"));
+        assert!(lines[3].contains("log-6"));
+
+        assert!(dashboard.handle_activity_scroll_key(key(crossterm::event::KeyCode::End), area));
+        assert_eq!(dashboard.log_scroll_top, None);
+        let lines = dashboard
+            .visible_activity_lines(area)
+            .into_iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert!(lines[0].contains("log-4"));
+        assert!(lines[3].contains("log-7"));
+    }
+
+    #[test]
+    fn activity_log_history_view_is_not_yanked_by_new_logs() {
+        let mut dashboard = recv_dashboard();
+        let area = Rect::new(0, 0, 80, 6);
+        for index in 0..8 {
+            dashboard.push_log(LogKind::Info, format!("log-{index}"), None);
+        }
+
+        assert!(dashboard.handle_activity_scroll_key(key(crossterm::event::KeyCode::Home), area));
+        assert_eq!(dashboard.log_scroll_top, Some(0));
+
+        dashboard.push_log(LogKind::Info, "log-8", None);
+        let lines = dashboard
+            .visible_activity_lines(area)
+            .into_iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert!(lines[0].contains("log-0"));
+        assert!(lines[3].contains("log-3"));
     }
 
     #[test]
