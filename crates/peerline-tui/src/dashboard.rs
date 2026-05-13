@@ -20,6 +20,7 @@ use tokio::{
 
 const MAX_LOGS: usize = 64;
 const MAX_TRANSFERS: usize = 32;
+const LOG_COALESCE_LOOKBACK: usize = 24;
 
 pub async fn run_recv(
     view: RecvView,
@@ -74,7 +75,7 @@ struct TransferRow {
     updated_at: Instant,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum LogKind {
     Info,
     Success,
@@ -89,6 +90,7 @@ struct LogEntry {
     kind: LogKind,
     source: Option<String>,
     text: String,
+    repeat_count: usize,
 }
 
 impl Dashboard {
@@ -494,15 +496,39 @@ impl Dashboard {
     }
 
     fn push_log(&mut self, kind: LogKind, text: impl Into<String>, source: Option<String>) {
+        let text = text.into();
+        let elapsed = self.started_at.elapsed();
+        if let Some(index) = self.repeated_log_index(kind, source.as_deref(), &text)
+            && let Some(mut entry) = self.logs.remove(index)
+        {
+            entry.elapsed = elapsed;
+            entry.repeat_count = entry.repeat_count.saturating_add(1);
+            self.logs.push_back(entry);
+            return;
+        }
+
         self.logs.push_back(LogEntry {
-            elapsed: self.started_at.elapsed(),
+            elapsed,
             kind,
             source,
-            text: text.into(),
+            text,
+            repeat_count: 1,
         });
         while self.logs.len() > MAX_LOGS {
             self.logs.pop_front();
         }
+    }
+
+    fn repeated_log_index(&self, kind: LogKind, source: Option<&str>, text: &str) -> Option<usize> {
+        self.logs
+            .iter()
+            .enumerate()
+            .rev()
+            .take(LOG_COALESCE_LOOKBACK)
+            .find_map(|(index, entry)| {
+                (entry.kind == kind && entry.source.as_deref() == source && entry.text == text)
+                    .then_some(index)
+            })
     }
 
     fn visible_activity_lines(&self, area: Rect) -> Vec<Line<'static>> {
@@ -790,7 +816,8 @@ fn render_log_lines(entry: &LogEntry, width: usize) -> Vec<Line<'static>> {
     let continuation_width = width
         .saturating_sub(continuation_prefix.chars().count())
         .max(1);
-    let wrapped = wrap_log_text(&entry.text, first_width, continuation_width);
+    let text = log_entry_text(entry);
+    let wrapped = wrap_log_text(&text, first_width, continuation_width);
     let mut lines = Vec::with_capacity(wrapped.len().max(1));
     for (index, text) in wrapped.into_iter().enumerate() {
         if index == 0 {
@@ -813,6 +840,14 @@ fn render_log_lines(entry: &LogEntry, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(spans));
     }
     lines
+}
+
+fn log_entry_text(entry: &LogEntry) -> String {
+    if entry.repeat_count > 1 {
+        format!("{} (x{})", entry.text, entry.repeat_count)
+    } else {
+        entry.text.clone()
+    }
 }
 
 fn log_kind_label(kind: LogKind) -> &'static str {
@@ -1067,6 +1102,7 @@ mod tests {
             kind: LogKind::Info,
             source: Some("peerline_cli::very_long_target_name".into()),
             text: "abcdefghijklmnopqrstuvwxyz0123456789\nsecond-line-with-more-text".into(),
+            repeat_count: 1,
         };
 
         let lines = render_log_lines(&entry, 32);
@@ -1082,6 +1118,7 @@ mod tests {
             kind: LogKind::Warn,
             source: Some("peerline_cli::very_long_target_name".into()),
             text: "abcdefghijklmnopqrstuvwxyz".into(),
+            repeat_count: 1,
         };
 
         let lines = render_log_lines(&entry, 8);
@@ -1110,6 +1147,7 @@ mod tests {
             kind: LogKind::Status,
             source: Some("peerline_net::libp2p_transfer::receiver".into()),
             text: "DHT provider record published".into(),
+            repeat_count: 1,
         };
 
         let narrow = render_log_lines(&entry, 48)
@@ -1126,6 +1164,38 @@ mod tests {
         assert!(!narrow.contains("..."));
         assert!(!wide.contains("..."));
         assert!(wide.contains("[net::libp2p_transfer::receiver]"));
+    }
+
+    #[test]
+    fn activity_log_coalesces_repeated_infrastructure_messages() {
+        let mut dashboard = recv_dashboard();
+        let source = Some("peerline_net::libp2p_transfer::receiver".into());
+
+        dashboard.push_log(
+            LogKind::Info,
+            "DHT descriptor published key=/peerline/descriptor/v1/example",
+            source.clone(),
+        );
+        dashboard.push_log(
+            LogKind::Info,
+            "DHT provider record published key=/peerline/provider/v1/example",
+            source.clone(),
+        );
+        dashboard.push_log(
+            LogKind::Info,
+            "DHT descriptor published key=/peerline/descriptor/v1/example",
+            source,
+        );
+
+        assert_eq!(dashboard.logs.len(), 2);
+        assert_eq!(dashboard.logs[1].repeat_count, 2);
+        let text = dashboard
+            .visible_activity_lines(Rect::new(0, 0, 96, 6))
+            .into_iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("(x2)"));
     }
 
     #[test]

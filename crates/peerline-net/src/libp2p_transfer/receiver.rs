@@ -49,7 +49,11 @@ pub(crate) async fn recv_libp2p(
     );
 
     let mut sessions: HashMap<PeerId, ReceiverSession> = HashMap::new();
-    let mut descriptor_interval = time::interval(Duration::from_secs(10));
+    let descriptor_publish_interval = Duration::from_secs(10);
+    let mut descriptor_interval = time::interval_at(
+        time::Instant::now() + descriptor_publish_interval,
+        descriptor_publish_interval,
+    );
 
     let descriptor = publish_receiver_descriptor(
         &mut swarm,
@@ -183,7 +187,7 @@ pub(crate) async fn recv_libp2p(
 fn log_dht_publish_result(result: &kad::QueryResult) {
     match result {
         kad::QueryResult::PutRecord(Ok(ok)) => {
-            tracing::info!(key = ?ok.key, "DHT descriptor published");
+            tracing::debug!(key = ?ok.key, "DHT descriptor published");
         }
         kad::QueryResult::PutRecord(Err(kad::PutRecordError::QuorumFailed {
             success,
@@ -200,7 +204,7 @@ fn log_dht_publish_result(result: &kad::QueryResult) {
             tracing::warn!(%error, "DHT descriptor publish failed");
         }
         kad::QueryResult::StartProviding(Ok(ok)) => {
-            tracing::info!(key = ?ok.key, "DHT provider record published");
+            tracing::debug!(key = ?ok.key, "DHT provider record published");
         }
         kad::QueryResult::StartProviding(Err(error)) => {
             tracing::warn!(%error, "DHT provider record publish failed");

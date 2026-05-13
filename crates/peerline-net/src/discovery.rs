@@ -424,7 +424,8 @@ async fn run_descriptor_publisher(
     let record_key = descriptor_record_key(&name_code.lookup_key());
     let provider_key = provider_record_key(&name_code.lookup_key());
     let allow_loopback = config.allow_loopback_endpoints;
-    let mut interval = time::interval(Duration::from_secs(60));
+    let publish_interval = Duration::from_secs(60);
+    let mut interval = time::interval_at(time::Instant::now() + publish_interval, publish_interval);
 
     let descriptor = publish_descriptor(
         &mut swarm,
@@ -680,7 +681,7 @@ fn handle_discovery_event_with_snapshot(
 fn log_publish_query_result(result: &kad::QueryResult) {
     match result {
         kad::QueryResult::PutRecord(Ok(ok)) => {
-            tracing::info!(key = ?ok.key, "DHT descriptor published");
+            tracing::debug!(key = ?ok.key, "DHT descriptor published");
         }
         kad::QueryResult::PutRecord(Err(kad::PutRecordError::QuorumFailed {
             success,
@@ -697,7 +698,7 @@ fn log_publish_query_result(result: &kad::QueryResult) {
             tracing::warn!(%error, "DHT descriptor publish failed");
         }
         kad::QueryResult::StartProviding(Ok(ok)) => {
-            tracing::info!(key = ?ok.key, "DHT provider record published");
+            tracing::debug!(key = ?ok.key, "DHT provider record published");
         }
         kad::QueryResult::StartProviding(Err(error)) => {
             tracing::warn!(%error, "DHT provider record publish failed");
