@@ -10,7 +10,7 @@ use peerline_rendezvous_model::PeerDescriptor;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{task::JoinHandle, time};
@@ -114,12 +114,30 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub(crate) fn direct_endpoint_candidates(descriptor: &PeerDescriptor) -> Vec<SocketAddr> {
+fn discovered_direct_endpoint_candidates(
+    descriptor: &PeerDescriptor,
+    local_networks: Option<&LocalDirectNetworks>,
+    allow_unverified_lan: bool,
+) -> Vec<SocketAddr> {
     let mut endpoints = descriptor
         .direct_endpoints
         .iter()
         .filter_map(|endpoint| endpoint.parse().ok())
         .filter(|endpoint: &SocketAddr| is_usable_endpoint_ip(&endpoint.ip(), true))
+        .filter(|endpoint| {
+            let reachable = discovered_direct_endpoint_is_reachable(
+                endpoint,
+                local_networks,
+                allow_unverified_lan,
+            );
+            if !reachable {
+                tracing::debug!(
+                    %endpoint,
+                    "skipping discovered LAN endpoint outside local network"
+                );
+            }
+            reachable
+        })
         .collect::<Vec<_>>();
     endpoints.sort_by_key(direct_endpoint_priority);
     endpoints.dedup();
@@ -138,16 +156,21 @@ pub(crate) fn libp2p_endpoint_candidates(descriptor: &PeerDescriptor) -> Vec<Mul
     endpoints
 }
 
-pub(crate) fn descriptor_candidates(descriptor: &PeerDescriptor) -> Vec<Candidate> {
+fn descriptor_candidates_for_discovery(
+    descriptor: &PeerDescriptor,
+    local_networks: Option<&LocalDirectNetworks>,
+    allow_unverified_lan: bool,
+) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     let peer_id = descriptor.peer_id.clone();
-    let direct = direct_endpoint_candidates(descriptor)
-        .into_iter()
-        .map(|endpoint| Candidate {
-            peer_id: peer_id.clone(),
-            addresses: vec![endpoint.to_string()],
-            route: route_kind_from_direct_endpoint(&endpoint),
-        });
+    let direct =
+        discovered_direct_endpoint_candidates(descriptor, local_networks, allow_unverified_lan)
+            .into_iter()
+            .map(|endpoint| Candidate {
+                peer_id: peer_id.clone(),
+                addresses: vec![endpoint.to_string()],
+                route: route_kind_from_direct_endpoint(&endpoint),
+            });
     candidates.extend(direct);
 
     let libp2p = libp2p_endpoint_candidates(descriptor)
@@ -206,9 +229,17 @@ pub async fn discover_direct_endpoint(
     code: &HumanCode,
     config: DiscoveryConfig,
 ) -> anyhow::Result<Option<SocketAddr>> {
-    Ok(discover_peer_descriptor(name, code, config)
-        .await?
-        .and_then(|descriptor| direct_endpoint_candidates(&descriptor).into_iter().next()))
+    let local_networks = LocalDirectNetworks::current();
+    Ok(
+        discover_peer_descriptors(name, code, config, local_networks.as_ref())
+            .await?
+            .and_then(|snapshot| {
+                snapshot
+                    .best_direct_endpoints(local_networks.as_ref())
+                    .into_iter()
+                    .next()
+            }),
+    )
 }
 
 pub async fn discover_direct_endpoints(
@@ -216,10 +247,13 @@ pub async fn discover_direct_endpoints(
     code: &HumanCode,
     config: DiscoveryConfig,
 ) -> anyhow::Result<Vec<SocketAddr>> {
-    Ok(discover_peer_descriptor(name, code, config)
-        .await?
-        .map(|descriptor| direct_endpoint_candidates(&descriptor))
-        .unwrap_or_default())
+    let local_networks = LocalDirectNetworks::current();
+    Ok(
+        discover_peer_descriptors(name, code, config, local_networks.as_ref())
+            .await?
+            .map(|snapshot| snapshot.best_direct_endpoints(local_networks.as_ref()))
+            .unwrap_or_default(),
+    )
 }
 
 pub async fn discover_peer_candidates(
@@ -227,10 +261,13 @@ pub async fn discover_peer_candidates(
     code: &HumanCode,
     config: DiscoveryConfig,
 ) -> anyhow::Result<Vec<Candidate>> {
-    Ok(discover_peer_descriptors(name, code, config)
-        .await?
-        .map(|snapshot| snapshot.into_candidates())
-        .unwrap_or_default())
+    let local_networks = LocalDirectNetworks::current();
+    Ok(
+        discover_peer_descriptors(name, code, config, local_networks.as_ref())
+            .await?
+            .map(|snapshot| snapshot.into_candidates(local_networks.as_ref()))
+            .unwrap_or_default(),
+    )
 }
 
 pub async fn discover_peer_descriptor(
@@ -238,9 +275,12 @@ pub async fn discover_peer_descriptor(
     code: &HumanCode,
     config: DiscoveryConfig,
 ) -> anyhow::Result<Option<PeerDescriptor>> {
-    Ok(discover_peer_descriptors(name, code, config)
-        .await?
-        .and_then(|snapshot| snapshot.best_descriptor()))
+    let local_networks = LocalDirectNetworks::current();
+    Ok(
+        discover_peer_descriptors(name, code, config, local_networks.as_ref())
+            .await?
+            .and_then(|snapshot| snapshot.best_descriptor(local_networks.as_ref())),
+    )
 }
 
 struct DiscoverySnapshot {
@@ -292,28 +332,67 @@ impl DiscoverySnapshot {
         }
     }
 
-    fn best_descriptor(&self) -> Option<PeerDescriptor> {
-        self.descriptors.values().cloned().max_by_key(|descriptor| {
-            (
-                descriptor.published_unix_ms,
-                descriptor_candidates(descriptor).len(),
-                descriptor.peer_id.clone(),
-            )
+    fn best_descriptor(
+        &self,
+        local_networks: Option<&LocalDirectNetworks>,
+    ) -> Option<PeerDescriptor> {
+        self.descriptors
+            .values()
+            .filter(|descriptor| {
+                let allow_unverified_lan = self.local_peer_ids.contains(&descriptor.peer_id);
+                !descriptor_candidates_for_discovery(
+                    descriptor,
+                    local_networks,
+                    allow_unverified_lan,
+                )
+                .is_empty()
+            })
+            .cloned()
+            .max_by_key(|descriptor| {
+                let allow_unverified_lan = self.local_peer_ids.contains(&descriptor.peer_id);
+                (
+                    descriptor.published_unix_ms,
+                    descriptor_candidates_for_discovery(
+                        descriptor,
+                        local_networks,
+                        allow_unverified_lan,
+                    )
+                    .len(),
+                    descriptor.peer_id.clone(),
+                )
+            })
+    }
+
+    fn best_direct_endpoints(
+        &self,
+        local_networks: Option<&LocalDirectNetworks>,
+    ) -> Vec<SocketAddr> {
+        self.best_descriptor(local_networks)
+            .map(|descriptor| {
+                let allow_unverified_lan = self.local_peer_ids.contains(&descriptor.peer_id);
+                discovered_direct_endpoint_candidates(
+                    &descriptor,
+                    local_networks,
+                    allow_unverified_lan,
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn has_usable_candidates(&self, local_networks: Option<&LocalDirectNetworks>) -> bool {
+        self.descriptors.values().any(|descriptor| {
+            let allow_unverified_lan = self.local_peer_ids.contains(&descriptor.peer_id);
+            !descriptor_candidates_for_discovery(descriptor, local_networks, allow_unverified_lan)
+                .is_empty()
         })
     }
 
-    fn has_usable_candidates(&self) -> bool {
-        self.descriptors
-            .values()
-            .any(|descriptor| !descriptor_candidates(descriptor).is_empty())
-    }
-
-    fn into_candidates(self) -> Vec<Candidate> {
-        rank_candidates(
-            self.descriptors
-                .into_values()
-                .flat_map(|descriptor| descriptor_candidates(&descriptor)),
-        )
+    fn into_candidates(self, local_networks: Option<&LocalDirectNetworks>) -> Vec<Candidate> {
+        let local_peer_ids = self.local_peer_ids;
+        rank_candidates(self.descriptors.into_values().flat_map(|descriptor| {
+            let allow_unverified_lan = local_peer_ids.contains(&descriptor.peer_id);
+            descriptor_candidates_for_discovery(&descriptor, local_networks, allow_unverified_lan)
+        }))
     }
 }
 
@@ -321,6 +400,7 @@ async fn discover_peer_descriptors(
     name: &HumanName,
     code: &HumanCode,
     config: DiscoveryConfig,
+    local_networks: Option<&LocalDirectNetworks>,
 ) -> anyhow::Result<Option<DiscoverySnapshot>> {
     let name_code = NameCode::new(name.clone(), code.clone());
     let lookup_key = name_code.lookup_key();
@@ -368,7 +448,7 @@ async fn discover_peer_descriptors(
                             snapshot.insert_descriptor(descriptor);
                         }
                         if snapshot.is_diverse_enough(config.min_candidate_diversity)
-                            && snapshot.has_usable_candidates()
+                            && snapshot.has_usable_candidates(local_networks)
                         {
                             break;
                         }
@@ -386,13 +466,17 @@ async fn discover_peer_descriptors(
                 match event {
                     SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
                         handle_discovery_query_result(&mut snapshot, result);
-                        if snapshot.is_diverse_enough(config.min_candidate_diversity) {
+                        if snapshot.is_diverse_enough(config.min_candidate_diversity)
+                            && snapshot.has_usable_candidates(local_networks)
+                        {
                             break;
                         }
                     }
                     SwarmEvent::Behaviour(event) => {
                         let _ = handle_discovery_event_with_snapshot(&mut swarm, event, Some(&mut snapshot));
-                        if snapshot.is_diverse_enough(config.min_candidate_diversity) {
+                        if snapshot.is_diverse_enough(config.min_candidate_diversity)
+                            && snapshot.has_usable_candidates(local_networks)
+                        {
                             break;
                         }
                     }
@@ -402,7 +486,9 @@ async fn discover_peer_descriptors(
         }
     }
 
-    if snapshot.is_diverse_enough(config.min_candidate_diversity) {
+    if snapshot.is_diverse_enough(config.min_candidate_diversity)
+        && snapshot.has_usable_candidates(local_networks)
+    {
         Ok(Some(snapshot))
     } else {
         Ok(None)
@@ -794,6 +880,151 @@ pub(crate) fn direct_endpoint_priority(endpoint: &SocketAddr) -> u8 {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalDirectNetworks {
+    ipv4: Vec<Ipv4Network>,
+    ipv6: Vec<Ipv6Network>,
+}
+
+impl LocalDirectNetworks {
+    fn current() -> Option<Self> {
+        let mut networks = Self {
+            ipv4: Vec::new(),
+            ipv6: Vec::new(),
+        };
+
+        for interface in if_addrs::get_if_addrs().ok()? {
+            if !interface.is_oper_up() {
+                continue;
+            }
+            match interface.addr {
+                if_addrs::IfAddr::V4(addr) => {
+                    let ip = IpAddr::V4(addr.ip);
+                    if is_private_lan_ip(&ip) && is_usable_endpoint_ip(&ip, false) {
+                        networks
+                            .ipv4
+                            .push(Ipv4Network::new(addr.ip, addr.prefixlen));
+                    }
+                }
+                if_addrs::IfAddr::V6(addr) => {
+                    let ip = IpAddr::V6(addr.ip);
+                    if is_private_lan_ip(&ip) && is_usable_endpoint_ip(&ip, false) {
+                        networks
+                            .ipv6
+                            .push(Ipv6Network::new(addr.ip, addr.prefixlen));
+                    }
+                }
+            }
+        }
+
+        networks.ipv4.sort();
+        networks.ipv4.dedup();
+        networks.ipv6.sort();
+        networks.ipv6.dedup();
+
+        Some(networks)
+    }
+
+    fn contains(&self, ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(ip) => self.ipv4.iter().any(|network| network.contains(ip)),
+            IpAddr::V6(ip) => self.ipv6.iter().any(|network| network.contains(ip)),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_prefixes(
+        ipv4: impl IntoIterator<Item = (Ipv4Addr, u8)>,
+        ipv6: impl IntoIterator<Item = (Ipv6Addr, u8)>,
+    ) -> Self {
+        Self {
+            ipv4: ipv4
+                .into_iter()
+                .map(|(ip, prefix_len)| Ipv4Network::new(ip, prefix_len))
+                .collect(),
+            ipv6: ipv6
+                .into_iter()
+                .map(|(ip, prefix_len)| Ipv6Network::new(ip, prefix_len))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Ipv4Network {
+    network: u32,
+    mask: u32,
+}
+
+impl Ipv4Network {
+    fn new(ip: Ipv4Addr, prefix_len: u8) -> Self {
+        let prefix_len = prefix_len.min(32);
+        let mask = if prefix_len == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix_len)
+        };
+        Self {
+            network: u32::from(ip) & mask,
+            mask,
+        }
+    }
+
+    fn contains(&self, ip: &Ipv4Addr) -> bool {
+        u32::from(*ip) & self.mask == self.network
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Ipv6Network {
+    network: u128,
+    mask: u128,
+}
+
+impl Ipv6Network {
+    fn new(ip: Ipv6Addr, prefix_len: u8) -> Self {
+        let prefix_len = prefix_len.min(128);
+        let mask = if prefix_len == 0 {
+            0
+        } else {
+            u128::MAX << (128 - prefix_len)
+        };
+        Self {
+            network: u128::from(ip) & mask,
+            mask,
+        }
+    }
+
+    fn contains(&self, ip: &Ipv6Addr) -> bool {
+        u128::from(*ip) & self.mask == self.network
+    }
+}
+
+fn discovered_direct_endpoint_is_reachable(
+    endpoint: &SocketAddr,
+    local_networks: Option<&LocalDirectNetworks>,
+    allow_unverified_lan: bool,
+) -> bool {
+    if allow_unverified_lan || !is_private_lan_ip(&endpoint.ip()) {
+        return true;
+    }
+
+    if endpoint.ip().is_loopback() {
+        return false;
+    }
+
+    local_networks
+        .map(|networks| networks.contains(&endpoint.ip()))
+        .unwrap_or(true)
+}
+
+fn is_private_lan_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_loopback(),
+    }
+}
+
 fn libp2p_endpoint_priority(endpoint: &Multiaddr) -> u8 {
     if is_relayed(endpoint) {
         4
@@ -961,7 +1192,7 @@ mod tests {
             published_unix_ms: 0,
         };
 
-        let endpoints = direct_endpoint_candidates(&descriptor);
+        let endpoints = discovered_direct_endpoint_candidates(&descriptor, None, true);
         assert_eq!(endpoints[0], "192.168.1.20:43117".parse().unwrap());
         assert_eq!(endpoints[1], "203.0.113.7:43117".parse().unwrap());
         assert_eq!(endpoints[2], "127.0.0.1:43117".parse().unwrap());
@@ -1049,6 +1280,78 @@ mod tests {
     }
 
     #[test]
+    fn discovered_lan_candidates_require_matching_local_network() {
+        let descriptor = PeerDescriptor {
+            protocol_version: 1,
+            peer_id: "peer".into(),
+            direct_endpoints: vec![
+                "192.168.1.20:43117".into(),
+                "192.168.2.20:43117".into(),
+                "203.0.113.7:43117".into(),
+            ],
+            libp2p_endpoints: vec![],
+            published_unix_ms: 1,
+        };
+        let networks = LocalDirectNetworks::from_prefixes(
+            [(Ipv4Addr::new(192, 168, 1, 9), 24)],
+            std::iter::empty(),
+        );
+
+        let candidates = descriptor_candidates_for_discovery(&descriptor, Some(&networks), false);
+        let addresses = candidates
+            .iter()
+            .map(|candidate| candidate.addresses[0].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(addresses.contains(&"192.168.1.20:43117"));
+        assert!(addresses.contains(&"203.0.113.7:43117"));
+        assert!(!addresses.contains(&"192.168.2.20:43117"));
+    }
+
+    #[test]
+    fn remote_loopback_direct_candidates_are_not_discovered() {
+        let descriptor = PeerDescriptor {
+            protocol_version: 1,
+            peer_id: "peer".into(),
+            direct_endpoints: vec!["127.0.0.1:43117".into(), "10.10.0.8:43117".into()],
+            libp2p_endpoints: vec![],
+            published_unix_ms: 1,
+        };
+        let networks = LocalDirectNetworks::from_prefixes(
+            [(Ipv4Addr::new(10, 10, 0, 4), 24)],
+            std::iter::empty(),
+        );
+
+        let candidates = descriptor_candidates_for_discovery(&descriptor, Some(&networks), false);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].addresses, vec!["10.10.0.8:43117"]);
+    }
+
+    #[test]
+    fn mdns_observed_peers_keep_unverified_lan_candidates() {
+        let mut snapshot = DiscoverySnapshot::new();
+        let peer = PeerId::random();
+        snapshot.observe_local_peer(peer);
+        snapshot.insert_descriptor(PeerDescriptor {
+            protocol_version: 1,
+            peer_id: peer.to_string(),
+            direct_endpoints: vec!["192.168.50.20:43117".into()],
+            libp2p_endpoints: vec![],
+            published_unix_ms: 1,
+        });
+        let networks = LocalDirectNetworks::from_prefixes(
+            [(Ipv4Addr::new(10, 10, 0, 4), 24)],
+            std::iter::empty(),
+        );
+
+        let candidates = snapshot.into_candidates(Some(&networks));
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].addresses, vec!["192.168.50.20:43117"]);
+    }
+
+    #[test]
     fn empty_descriptors_do_not_count_as_usable_candidates() {
         let mut snapshot = DiscoverySnapshot::new();
         let peer = PeerId::random();
@@ -1062,7 +1365,7 @@ mod tests {
         });
 
         assert!(snapshot.is_diverse_enough(1));
-        assert!(!snapshot.has_usable_candidates());
+        assert!(!snapshot.has_usable_candidates(None));
     }
 
     #[test]

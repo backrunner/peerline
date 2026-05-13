@@ -11,6 +11,7 @@ async-trait.workspace = true
 base64.workspace = true
 blake3.workspace = true
 futures.workspace = true
+if-addrs.workspace = true
 libp2p.workspace = true
 libp2p-webrtc.workspace = true
 local-ip-address.workspace = true

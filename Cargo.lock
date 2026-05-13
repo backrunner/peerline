@@ -3225,6 +3225,7 @@ dependencies = [
  "base64",
  "blake3",
  "futures",
+ "if-addrs",
  "libp2p",
  "libp2p-webrtc",
  "local-ip-address",
