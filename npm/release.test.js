@@ -118,6 +118,11 @@ test("parseArgs rejects mutually exclusive version selectors", () => {
   assert.throws(() => parseArgs(["--current", "--version", "0.1.0-alpha.2"]));
 });
 
+test("parseArgs rejects mutually exclusive publish targets", () => {
+  assert.throws(() => parseArgs(["--main-only", "--platform-only"]));
+  assert.throws(() => parseArgs(["--platform-only", "--main-only"]));
+});
+
 test("platform package names do not require a private npm scope", () => {
   assert.ok(platformPackageNames.includes("peerline-linux-x64-gnu"));
   assert.ok(platformPackageNames.includes("peerline-linux-arm64-gnu"));

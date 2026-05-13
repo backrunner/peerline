@@ -107,6 +107,7 @@ function parseArgs(argv) {
     tag: "",
     version: "",
   };
+  let publishTargetFlag = "";
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -138,8 +139,16 @@ function parseArgs(argv) {
     } else if (arg === "--platform-package" || arg.startsWith("--platform-package=")) {
       options.platformPackage = readValue("--platform-package");
     } else if (arg === "--main-only") {
+      if (publishTargetFlag && publishTargetFlag !== "--main-only") {
+        throw new Error("--main-only cannot be combined with --platform-only");
+      }
+      publishTargetFlag = "--main-only";
       options.publishTarget = "main";
     } else if (arg === "--platform-only") {
+      if (publishTargetFlag && publishTargetFlag !== "--platform-only") {
+        throw new Error("--platform-only cannot be combined with --main-only");
+      }
+      publishTargetFlag = "--platform-only";
       options.publishTarget = "platform";
     } else if (arg === "--ignore-existing") {
       options.ignoreExisting = true;

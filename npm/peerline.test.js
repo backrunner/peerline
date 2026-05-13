@@ -12,6 +12,7 @@ const {
   detectLibc,
   ensureExecutable,
   executeBinary,
+  exitCodeForResult,
   packageName,
   releaseAssetName,
   releaseAssetUrl,
@@ -133,3 +134,10 @@ test(
     assert.equal(fs.existsSync(fallbackRoot), false);
   }
 );
+
+test("exitCodeForResult preserves child process signal semantics", () => {
+  assert.equal(exitCodeForResult({ status: 7 }), 7);
+  assert.equal(exitCodeForResult({ status: null, signal: "SIGINT" }), 130);
+  assert.equal(exitCodeForResult({ status: null, signal: "SIGTERM" }), 143);
+  assert.equal(exitCodeForResult({ status: null, signal: "SIGHUP" }), 1);
+});

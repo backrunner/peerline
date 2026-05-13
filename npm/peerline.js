@@ -292,7 +292,20 @@ function executeBinary(binaryPath, argv = process.argv.slice(2), deps = {}) {
 
 async function main(argv = process.argv.slice(2), deps = {}) {
   const result = executeBinary(await resolveBinary(deps), argv, deps);
-  process.exit(result.status ?? 1);
+  process.exit(exitCodeForResult(result));
+}
+
+function exitCodeForResult(result) {
+  if (Number.isInteger(result?.status)) {
+    return result.status;
+  }
+  if (result?.signal === "SIGINT") {
+    return 130;
+  }
+  if (result?.signal === "SIGTERM") {
+    return 143;
+  }
+  return 1;
 }
 
 if (require.main === module) {
@@ -310,6 +323,7 @@ module.exports = {
   downloadReleaseBinary,
   ensureExecutable,
   executeBinary,
+  exitCodeForResult,
   copyBinaryToTemporaryLocation,
   formatExecutionFallbackError,
   isRetryableExecutionError,

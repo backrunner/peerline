@@ -388,11 +388,13 @@ impl Write for TuiAwareStderrWriter {
 }
 
 fn register_activity_log_sender(sender: &tokio::sync::mpsc::UnboundedSender<PeerlineEvent>) {
-    ACTIVITY_LOG_SENDERS
+    let Ok(mut senders) = ACTIVITY_LOG_SENDERS
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
-        .expect("activity log sender registry lock should not be poisoned")
-        .push(sender.clone());
+    else {
+        return;
+    };
+    senders.push(sender.clone());
 }
 
 struct ActivityLogLayer;
@@ -421,9 +423,9 @@ where
             message,
         };
 
-        let mut senders = senders
-            .lock()
-            .expect("activity log sender registry lock should not be poisoned");
+        let Ok(mut senders) = senders.lock() else {
+            return;
+        };
         senders.retain(|sender| sender.send(log_event.clone()).is_ok());
     }
 }
