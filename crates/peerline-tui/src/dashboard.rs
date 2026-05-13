@@ -27,15 +27,22 @@ pub async fn run_recv(
     events: UnboundedReceiver<PeerlineEvent>,
     quit_signal: Option<watch::Sender<bool>>,
 ) -> anyhow::Result<()> {
-    run_dashboard(Dashboard::new_recv(view), events, quit_signal).await
+    run_dashboard(Dashboard::new_recv(view), events, quit_signal, None).await
 }
 
 pub async fn run_send(
     view: SendView,
     events: UnboundedReceiver<PeerlineEvent>,
     quit_signal: Option<watch::Sender<bool>>,
+    retry_signal: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 ) -> anyhow::Result<()> {
-    run_dashboard(Dashboard::new_send(view), events, quit_signal).await
+    run_dashboard(
+        Dashboard::new_send(view, retry_signal.is_some()),
+        events,
+        quit_signal,
+        retry_signal,
+    )
+    .await
 }
 
 struct Dashboard {
@@ -48,6 +55,7 @@ struct Dashboard {
     logs: VecDeque<LogEntry>,
     log_scroll_top: Option<usize>,
     started_at: Instant,
+    retry_enabled: bool,
 }
 
 enum DashboardKind {
@@ -109,10 +117,11 @@ impl Dashboard {
             logs: VecDeque::new(),
             log_scroll_top: None,
             started_at: Instant::now(),
+            retry_enabled: false,
         }
     }
 
-    fn new_send(view: SendView) -> Self {
+    fn new_send(view: SendView, retry_enabled: bool) -> Self {
         Self {
             kind: DashboardKind::Send {
                 target_label: view.target_label,
@@ -127,13 +136,16 @@ impl Dashboard {
             logs: VecDeque::new(),
             log_scroll_top: None,
             started_at: Instant::now(),
+            retry_enabled,
         }
     }
 
     fn apply_event(&mut self, event: PeerlineEvent) -> bool {
         let now = Instant::now();
         match event {
+            PeerlineEvent::Shutdown => true,
             PeerlineEvent::StageChanged(next) => {
+                let should_exit = self.should_exit_after_stage(&next);
                 self.stage = next.clone();
                 self.status = stage_label(&next);
                 if let Some(id) = self.active_transfer {
@@ -151,7 +163,7 @@ impl Dashboard {
                 }
                 if matches!(next, TransferStage::Complete | TransferStage::Failed(_)) {
                     self.active_transfer = None;
-                    return true;
+                    return should_exit;
                 }
                 false
             }
@@ -354,10 +366,15 @@ impl Dashboard {
     }
 
     fn draw_footer(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let controls = if self.log_scroll_top.is_some() {
-            " quit  logs Up/Down PgUp/PgDn Home/End  history  "
+        let retry = if self.retry_available() {
+            "r retry  "
         } else {
-            " quit  logs Up/Down PgUp/PgDn Home/End  "
+            ""
+        };
+        let controls = if self.log_scroll_top.is_some() {
+            format!("{retry}quit  logs Up/Down PgUp/PgDn Home/End  history  ")
+        } else {
+            format!("{retry}quit  logs Up/Down PgUp/PgDn Home/End  ")
         };
         let fixed_width = "q/Esc".chars().count() + controls.chars().count();
         let summary = truncate_end(
@@ -495,6 +512,19 @@ impl Dashboard {
             .count()
     }
 
+    fn retry_available(&self) -> bool {
+        self.retry_enabled
+            && matches!(self.kind, DashboardKind::Send { .. })
+            && matches!(self.stage, TransferStage::Failed(_))
+    }
+
+    fn should_exit_after_stage(&self, stage: &TransferStage) -> bool {
+        match self.kind {
+            DashboardKind::Recv { .. } => matches!(stage, TransferStage::Failed(_)),
+            DashboardKind::Send { .. } => matches!(stage, TransferStage::Complete),
+        }
+    }
+
     fn push_log(&mut self, kind: LogKind, text: impl Into<String>, source: Option<String>) {
         let text = text.into();
         let elapsed = self.started_at.elapsed();
@@ -583,6 +613,7 @@ async fn run_dashboard(
     mut dashboard: Dashboard,
     mut events: UnboundedReceiver<PeerlineEvent>,
     quit_signal: Option<watch::Sender<bool>>,
+    retry_signal: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 ) -> anyhow::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -620,6 +651,16 @@ async fn run_dashboard(
                                 let _ = signal.send(true);
                             }
                             return Ok(());
+                        }
+                        crossterm::event::Event::Key(key)
+                            if is_retry_key(key) && dashboard.retry_available() =>
+                        {
+                            if let Some(signal) = retry_signal.as_ref() {
+                                let _ = signal.send(());
+                            }
+                            dashboard.push_log(LogKind::Status, "retry requested", None);
+                            dashboard.status = "retry requested".into();
+                            terminal.draw(|frame| dashboard.draw(frame))?;
                         }
                         crossterm::event::Event::Key(key) => {
                             let size = terminal.size()?;
@@ -682,6 +723,13 @@ fn is_quit_key(key: crossterm::event::KeyEvent) -> bool {
                 .modifiers
                 .contains(crossterm::event::KeyModifiers::CONTROL)
     )
+}
+
+fn is_retry_key(key: crossterm::event::KeyEvent) -> bool {
+    matches!(
+        key.code,
+        crossterm::event::KeyCode::Char('r') | crossterm::event::KeyCode::Char('R')
+    ) && key.modifiers.is_empty()
 }
 
 #[derive(Clone, Copy)]
@@ -1022,6 +1070,20 @@ mod tests {
         })
     }
 
+    fn send_dashboard() -> Dashboard {
+        Dashboard::new_send(
+            SendView {
+                target_label: "peer".into(),
+                target: "river-mango-42".into(),
+                code: HumanCode::parse("rose-lime-iris-jade-1234").unwrap(),
+                route_status: "ready".into(),
+                stage: TransferStage::Discovering,
+                progress: None,
+            },
+            true,
+        )
+    }
+
     fn line_text(line: Line<'_>) -> String {
         line.spans
             .into_iter()
@@ -1093,6 +1155,36 @@ mod tests {
             TransferStage::Connecting(ConnectionRoute::Libp2pDcutr)
         ));
         assert!(dashboard.logs.len() >= 4);
+    }
+
+    #[test]
+    fn receive_dashboard_stays_open_after_completed_transfer() {
+        let mut dashboard = recv_dashboard();
+
+        let should_exit =
+            dashboard.apply_event(PeerlineEvent::StageChanged(TransferStage::Complete));
+
+        assert!(!should_exit);
+    }
+
+    #[test]
+    fn send_dashboard_exits_on_success_but_waits_for_retry_on_failure() {
+        let mut dashboard = send_dashboard();
+
+        assert!(
+            !dashboard.apply_event(PeerlineEvent::StageChanged(TransferStage::Failed(
+                "dial failed".into()
+            ),))
+        );
+        assert!(dashboard.retry_available());
+        assert!(dashboard.apply_event(PeerlineEvent::StageChanged(TransferStage::Complete,)));
+    }
+
+    #[test]
+    fn shutdown_event_closes_the_dashboard() {
+        let mut dashboard = recv_dashboard();
+
+        assert!(dashboard.apply_event(PeerlineEvent::Shutdown));
     }
 
     #[test]

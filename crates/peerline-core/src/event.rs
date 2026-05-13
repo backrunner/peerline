@@ -33,6 +33,7 @@ pub enum PeerlineLogLevel {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerlineEvent {
+    Shutdown,
     StageChanged(TransferStage),
     TransferStarted {
         id: TransferId,

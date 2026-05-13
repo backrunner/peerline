@@ -4,7 +4,7 @@ Peerline is a terminal-first peer-to-peer file transfer tool.
 
 It is built for the moments when you want to move files, folders, logs, build artifacts, or project snapshots directly between two machines without first uploading them to a cloud drive. One side opens a receive session, shares a human-friendly name and code, and the other side sends one or more paths. Peerline then tries to find the best route between the two peers and transfers the data with application-layer end-to-end encryption.
 
-Peerline is not a sync service and it does not keep a permanent hosted copy of your files. It is closer to a one-shot terminal copy workflow: start a receiver, send the paths, verify the transfer, and exit.
+Peerline is not a sync service and it does not keep a permanent hosted copy of your files. It is closer to a terminal copy workflow: start a receiver, send one or more batches of paths, verify the transfer, and exit when you are done.
 
 ## Why Peerline Exists
 
@@ -18,7 +18,7 @@ Peerline is not a sync service and it does not keep a permanent hosted copy of y
 
 Peerline has two roles:
 
-- Receiver: runs `peerline recv`, listens for one incoming transfer, and prints a `name`, `code`, and direct endpoint.
+- Receiver: runs `peerline recv`, keeps listening for incoming transfers until you quit or the idle timeout expires, and prints a `name`, `code`, and direct endpoint.
 - Sender: runs `peerline send`, points at the receiver by name/code or IP/code, and provides the files or folders to send.
 
 For named transfers, the receiver publishes a short-lived descriptor keyed by the shared name and code. The sender derives the same lookup key, discovers candidate routes, and tries them in order. Peerline prefers direct LAN or public TCP endpoints first, then libp2p routes such as DCUtR and WebRTC TURN. Relay data fallback is available only when explicitly enabled.
@@ -76,7 +76,8 @@ peerline recv
 name: frost-827
 code: fig-mint-1234-5678
 direct: 0.0.0.0:43117
-waiting for one transfer over direct TCP or libp2p...
+waiting for transfers over direct TCP or libp2p...
+idle timeout: 10 min (change with --idle-timeout-minutes)
 ```
 
 Send a file, multiple files, or a folder by name and code:
@@ -117,9 +118,11 @@ peerline recv [NAME_OR_CODE] [CODE] --port 43117
 peerline recv [NAME_OR_CODE] [CODE] --overwrite
 peerline recv [NAME_OR_CODE] [CODE] --no-tui
 peerline recv [NAME_OR_CODE] [CODE] --allow-relay-fallback
+peerline recv [NAME_OR_CODE] [CODE] --idle-timeout-minutes 30
 ```
 
 `--port` starts the 5-port direct window; Peerline will try that port and the next four.
+`--idle-timeout-minutes` defaults to `10`; set it to `0` to wait until you quit manually.
 
 Sender options:
 
@@ -133,12 +136,14 @@ peerline send --name <name> --code <code> <path...>
 ```
 
 Relay fallback must be enabled on both sides when you want Peerline to use relay data paths. Direct and hole-punched routes are attempted before relay fallback.
+In the send TUI, a failed attempt stays on screen and offers `r` to retry the same send or `q`/Esc to quit.
 
 ## Current Status
 
 - Direct IP send and receive works.
 - Named discovery now uses HTTP rendezvous first, then Kademlia provider records, mDNS, DCUtR, relay fallback, and libp2p-webrtc's built-in ICE servers.
 - Files, multiple files, and folders are archived with safe relative paths, BLAKE3 integrity checks, and streaming zstd/lzma compression support.
+- Receivers stay open across multiple incoming transfers, with a configurable idle auto-exit.
 - Conflicts default to non-overwrite behavior, with TUI-driven handling in the receiver flow.
 - The receive side includes a modern terminal UI for identity, route state, and transfer progress.
 - The workspace test suite and E2E coverage are in place.

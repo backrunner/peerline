@@ -128,7 +128,16 @@ pub async fn render_send_once_with_quit(
     events: UnboundedReceiver<PeerlineEvent>,
     quit_signal: Option<tokio::sync::watch::Sender<bool>>,
 ) -> anyhow::Result<()> {
-    dashboard::run_send(view, events, quit_signal).await
+    render_send_once_with_controls(view, events, quit_signal, None).await
+}
+
+pub async fn render_send_once_with_controls(
+    view: SendView,
+    events: UnboundedReceiver<PeerlineEvent>,
+    quit_signal: Option<tokio::sync::watch::Sender<bool>>,
+    retry_signal: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+) -> anyhow::Result<()> {
+    dashboard::run_send(view, events, quit_signal, retry_signal).await
 }
 
 fn fold_events<T: TransferView>(view: &mut T, events: &[PeerlineEvent]) {
@@ -139,6 +148,7 @@ fn fold_events<T: TransferView>(view: &mut T, events: &[PeerlineEvent]) {
 
 fn apply_event<T: TransferView>(view: &mut T, event: PeerlineEvent) -> bool {
     match event {
+        PeerlineEvent::Shutdown => true,
         PeerlineEvent::StageChanged(next) => {
             let done = matches!(next, TransferStage::Complete | TransferStage::Failed(_));
             *view.stage_mut() = next;

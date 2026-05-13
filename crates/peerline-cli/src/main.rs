@@ -18,8 +18,13 @@ use std::{
         Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+    time,
+};
 use tracing::{Event, Level, Subscriber, field::Field};
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
@@ -35,6 +40,8 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+
+const DEFAULT_RECV_IDLE_TIMEOUT_MINUTES: f64 = 10.0;
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -57,6 +64,12 @@ struct RecvArgs {
     no_tui: bool,
     #[arg(long)]
     allow_relay_fallback: bool,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_RECV_IDLE_TIMEOUT_MINUTES,
+        value_parser = parse_idle_timeout_minutes
+    )]
+    idle_timeout_minutes: f64,
 }
 
 #[derive(Debug, Args)]
@@ -118,6 +131,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     let store = ConfigStore::user_default()?;
     let config = store.load()?;
     let (name, code) = resolve_recv_identity(config.name, args.first, args.second)?;
+    let idle_timeout = recv_idle_timeout(args.idle_timeout_minutes);
 
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), args.port);
     let (listener, actual_bind) = bind_direct_listener(bind).await?;
@@ -127,10 +141,19 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     println!("name: {name}");
     println!("code: {code}");
     println!("direct: {actual_bind}");
-    println!("waiting for one transfer over direct TCP or libp2p...");
+    println!("waiting for transfers over direct TCP or libp2p...");
+    match idle_timeout {
+        Some(timeout) => println!(
+            "idle timeout: {} (change with --idle-timeout-minutes)",
+            format_duration(timeout)
+        ),
+        None => println!("idle timeout: disabled"),
+    }
 
-    let (events, tui_task, mut quit_rx) = if !args.no_tui && std::io::stdout().is_terminal() {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (network_events, network_event_rx) = mpsc::unbounded_channel();
+    let (activity_tx, mut activity_rx) = mpsc::unbounded_channel();
+    let (tui_sender, tui_task, mut quit_rx) = if !args.no_tui && std::io::stdout().is_terminal() {
+        let (sender, receiver) = mpsc::unbounded_channel();
         register_activity_log_sender(&sender);
         let (quit_tx, quit_rx) = watch::channel(false);
         let view = peerline_tui::RecvView {
@@ -150,6 +173,8 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     } else {
         (None, None, None)
     };
+    let event_fanout = spawn_event_fanout(network_event_rx, tui_sender, activity_tx);
+    let events = Some(network_events.clone());
     if code.is_low_entropy() {
         tracing::warn!("code entropy looks low; generated codes are safer on public networks");
     }
@@ -158,60 +183,221 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let direct_fut = Box::pin(peerline_net::recv_once_bound(
-        listener,
-        RecvOptions {
+    let mut transfers = 0usize;
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+
+    loop {
+        let _ = network_events.send(PeerlineEvent::Message(
+            "ready for the next transfer".to_string(),
+        ));
+        let direct_fut = Box::pin(peerline_net::recv_once_bound(
+            &listener,
+            RecvOptions {
+                name: name.clone(),
+                code: code.clone(),
+                bind: actual_bind,
+                destination: destination.clone(),
+                overwrite: args.overwrite,
+                events: events.clone(),
+            },
+        ));
+        let libp2p_fut = Box::pin(peerline_net::recv_libp2p(Libp2pRecvOptions {
             name: name.clone(),
             code: code.clone(),
-            bind: actual_bind,
+            direct_bind: actual_bind,
             destination: destination.clone(),
             overwrite: args.overwrite,
+            discovery: discovery.clone(),
             events: events.clone(),
-        },
-    ));
-    let libp2p_fut = Box::pin(peerline_net::recv_libp2p(Libp2pRecvOptions {
-        name,
-        code,
-        direct_bind: actual_bind,
-        destination,
-        overwrite: args.overwrite,
-        discovery,
-        events: events.clone(),
-    }));
+        }));
 
-    let received =
-        match wait_with_quit(wait_for_receiver(direct_fut, libp2p_fut), &mut quit_rx).await {
-            Ok(TaskOutcome::Completed(received)) => received,
-            Ok(TaskOutcome::Quit) => {
-                if let Some(task) = tui_task {
-                    let _ = task.await;
+        match wait_for_recv_activity(
+            wait_for_receiver(direct_fut, libp2p_fut),
+            &mut quit_rx,
+            &mut activity_rx,
+            idle_timeout,
+        )
+        .await
+        {
+            Ok(RecvOutcome::Completed(received)) => {
+                transfers += 1;
+                files += received.files;
+                bytes += received.bytes;
+                if tui_task.is_none() {
+                    println!(
+                        "received {} file(s), {} bytes from {}",
+                        received.files, received.bytes, received.peer
+                    );
                 }
-                return Ok(());
+                let _ =
+                    network_events.send(PeerlineEvent::StageChanged(TransferStage::Discovering));
+            }
+            Ok(RecvOutcome::Quit) => break,
+            Ok(RecvOutcome::IdleTimeout) => {
+                let message = idle_timeout
+                    .map(|timeout| format!("idle for {}; exiting", format_duration(timeout)))
+                    .unwrap_or_else(|| "receiver idle timeout reached; exiting".into());
+                let _ = network_events.send(PeerlineEvent::Message(message));
+                let _ = network_events.send(PeerlineEvent::Shutdown);
+                break;
             }
             Err(error) => {
-                if let Some(sender) = events.as_ref() {
-                    let _ = sender.send(peerline_core::PeerlineEvent::StageChanged(
-                        peerline_core::TransferStage::Failed(error.to_string()),
-                    ));
-                }
+                let _ = network_events.send(PeerlineEvent::StageChanged(TransferStage::Failed(
+                    error.to_string(),
+                )));
+                drop(events);
+                drop(network_events);
+                let _ = event_fanout.await;
                 if let Some(task) = tui_task {
                     let _ = task.await;
                 }
                 return Err(error);
             }
-        };
+        }
+    }
+
+    let _ = network_events.send(PeerlineEvent::Shutdown);
+    drop(events);
+    drop(network_events);
+    let _ = event_fanout.await;
     if let Some(task) = tui_task {
         let _ = task.await;
     }
     println!(
-        "received {} file(s), {} bytes from {}",
-        received.files, received.bytes, received.peer
+        "receiver stopped after {} transfer(s), {} file(s), {} bytes",
+        transfers, files, bytes
     );
     Ok(())
 }
 
+enum RecvOutcome<T> {
+    Completed(T),
+    Quit,
+    IdleTimeout,
+}
+
+fn parse_idle_timeout_minutes(value: &str) -> Result<f64, String> {
+    let minutes = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid minute value: {error}"))?;
+    if !minutes.is_finite() || minutes < 0.0 {
+        return Err("idle timeout must be a non-negative number of minutes".into());
+    }
+    Ok(minutes)
+}
+
+fn recv_idle_timeout(minutes: f64) -> Option<Duration> {
+    if minutes == 0.0 {
+        None
+    } else {
+        Some(Duration::from_secs_f64(minutes * 60.0))
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 60 && seconds % 60 == 0 {
+        format!("{} min", seconds / 60)
+    } else if seconds > 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
+}
+
+fn spawn_event_fanout(
+    mut receiver: mpsc::UnboundedReceiver<PeerlineEvent>,
+    tui_sender: Option<mpsc::UnboundedSender<PeerlineEvent>>,
+    activity_sender: mpsc::UnboundedSender<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = receiver.recv().await {
+            if is_recv_activity_event(&event) {
+                let _ = activity_sender.send(());
+            }
+            if let Some(sender) = tui_sender.as_ref() {
+                let _ = sender.send(event);
+            }
+        }
+    })
+}
+
+fn is_recv_activity_event(event: &PeerlineEvent) -> bool {
+    matches!(
+        event,
+        PeerlineEvent::TransferStarted { .. }
+            | PeerlineEvent::Progress { .. }
+            | PeerlineEvent::StageChanged(
+                TransferStage::ReceivingManifest
+                    | TransferStage::Transferring
+                    | TransferStage::Verifying
+                    | TransferStage::Complete
+                    | TransferStage::Failed(_)
+            )
+    )
+}
+
+async fn wait_for_recv_activity<F, T>(
+    future: F,
+    quit_rx: &mut Option<watch::Receiver<bool>>,
+    activity_rx: &mut mpsc::UnboundedReceiver<()>,
+    idle_timeout: Option<Duration>,
+) -> anyhow::Result<RecvOutcome<T>>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    tokio::pin!(future);
+    let mut idle_deadline = idle_timeout.map(|timeout| time::Instant::now() + timeout);
+    let mut activity_open = true;
+
+    loop {
+        let quit_future = async {
+            if let Some(rx) = quit_rx.as_mut() {
+                wait_for_quit(rx).await
+            } else {
+                std::future::pending::<bool>().await
+            }
+        };
+        let idle_future = async {
+            if let Some(deadline) = idle_deadline {
+                time::sleep_until(deadline).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+
+        tokio::select! {
+            result = &mut future => {
+                return result.map(RecvOutcome::Completed);
+            }
+            quit = quit_future => {
+                if quit {
+                    return Ok(RecvOutcome::Quit);
+                }
+                *quit_rx = None;
+            }
+            activity = activity_rx.recv(), if activity_open => {
+                if activity.is_some() {
+                    idle_deadline = idle_timeout.map(|timeout| time::Instant::now() + timeout);
+                } else {
+                    activity_open = false;
+                }
+            }
+            _ = idle_future, if idle_timeout.is_some() => {
+                return Ok(RecvOutcome::IdleTimeout);
+            }
+        }
+    }
+}
+
 enum TaskOutcome<T> {
     Completed(T),
+    Quit,
+}
+
+enum RetryDecision {
+    Retry,
     Quit,
 }
 
@@ -247,6 +433,52 @@ async fn wait_for_quit(rx: &mut watch::Receiver<bool>) -> bool {
     match rx.changed().await {
         Ok(()) => *rx.borrow(),
         Err(_) => false,
+    }
+}
+
+async fn wait_for_retry_or_quit(
+    quit_rx: &mut Option<watch::Receiver<bool>>,
+    retry_rx: &mut Option<mpsc::UnboundedReceiver<()>>,
+) -> RetryDecision {
+    loop {
+        let quit_future = async {
+            if let Some(rx) = quit_rx.as_mut() {
+                wait_for_quit(rx).await
+            } else {
+                std::future::pending::<bool>().await
+            }
+        };
+        let retry_future = async {
+            if let Some(rx) = retry_rx.as_mut() {
+                rx.recv().await.is_some()
+            } else {
+                std::future::pending::<bool>().await
+            }
+        };
+
+        tokio::select! {
+            quit = quit_future => {
+                if quit {
+                    return RetryDecision::Quit;
+                }
+                *quit_rx = None;
+            }
+            retry = retry_future => {
+                if retry {
+                    return RetryDecision::Retry;
+                }
+                *retry_rx = None;
+                if quit_rx.is_none() {
+                    return RetryDecision::Quit;
+                }
+            }
+        }
+    }
+}
+
+fn drain_retry_signals(retry_rx: &mut Option<mpsc::UnboundedReceiver<()>>) {
+    if let Some(rx) = retry_rx.as_mut() {
+        while rx.try_recv().is_ok() {}
     }
 }
 
@@ -466,22 +698,38 @@ fn peerline_log_level(level: &Level) -> PeerlineLogLevel {
     }
 }
 
+struct SendUi {
+    events: Option<mpsc::UnboundedSender<PeerlineEvent>>,
+    task: Option<JoinHandle<anyhow::Result<()>>>,
+    quit_rx: Option<watch::Receiver<bool>>,
+    retry_rx: Option<mpsc::UnboundedReceiver<()>>,
+}
+
 fn spawn_send_tui(
     target_label: &str,
     target: String,
     code: HumanCode,
     route_status: String,
-    quit_signal: Option<watch::Sender<bool>>,
-) -> (
-    Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
-    Option<JoinHandle<anyhow::Result<()>>>,
-) {
+    retry_enabled: bool,
+) -> SendUi {
     if !std::io::stdout().is_terminal() {
-        return (None, None);
+        return SendUi {
+            events: None,
+            task: None,
+            quit_rx: None,
+            retry_rx: None,
+        };
     }
 
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, receiver) = mpsc::unbounded_channel();
     register_activity_log_sender(&sender);
+    let (quit_tx, quit_rx) = watch::channel(false);
+    let (retry_tx, retry_rx) = if retry_enabled {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let view = peerline_tui::SendView {
         target_label: target_label.to_string(),
         target,
@@ -490,12 +738,18 @@ fn spawn_send_tui(
         stage: TransferStage::Discovering,
         progress: None,
     };
-    let task = spawn_terminal_ui(peerline_tui::render_send_once_with_quit(
+    let task = spawn_terminal_ui(peerline_tui::render_send_once_with_controls(
         view,
         receiver,
-        quit_signal,
+        Some(quit_tx),
+        retry_tx,
     ));
-    (Some(sender), Some(task))
+    SendUi {
+        events: Some(sender),
+        task: Some(task),
+        quit_rx: Some(quit_rx),
+        retry_rx,
+    }
 }
 
 async fn send(args: SendArgs) -> anyhow::Result<()> {
@@ -527,13 +781,7 @@ async fn send_direct_mode(args: SendArgs, target: DirectTarget) -> anyhow::Resul
         DirectTarget::Exact(endpoint) => ("endpoint", endpoint.to_string()),
         DirectTarget::Ip(ip) => ("ip", ip.to_string()),
     };
-    let (quit_signal, mut quit_rx) = if std::io::stdout().is_terminal() {
-        let (tx, rx) = watch::channel(false);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-    let (events, tui_task) = spawn_send_tui(
+    let mut ui = spawn_send_tui(
         target_label,
         target_value,
         code.clone(),
@@ -545,64 +793,90 @@ async fn send_direct_mode(args: SendArgs, target: DirectTarget) -> anyhow::Resul
                 DEFAULT_DIRECT_PORT.saturating_add(DEFAULT_DIRECT_PORT_WINDOW.saturating_sub(1))
             ),
         },
-        quit_signal,
+        true,
     );
     let compression = args.compression.into();
-    let send_events = events.clone();
-    let send_future = async move {
-        match target {
-            DirectTarget::Exact(endpoint) => {
-                peerline_net::send_direct(SendOptions {
-                    endpoint,
-                    name: None,
-                    code,
-                    paths,
-                    compression,
-                    events: send_events,
-                })
-                .await
-            }
-            DirectTarget::Ip(ip) => {
-                peerline_net::send_direct_probe(SendOptions {
-                    endpoint: SocketAddr::new(ip, DEFAULT_DIRECT_PORT),
-                    name: None,
-                    code,
-                    paths,
-                    compression,
-                    events: send_events,
-                })
-                .await
-            }
-        }
-    };
+    let mut attempt = 1usize;
 
-    match wait_with_quit(send_future, &mut quit_rx).await {
-        Ok(TaskOutcome::Completed(sent)) => {
-            if let Some(task) = tui_task {
-                let _ = task.await;
-            }
-            println!(
-                "sent {} file(s), {} bytes to {}",
-                sent.files, sent.bytes, sent.endpoint
-            );
-            Ok(())
+    loop {
+        drain_retry_signals(&mut ui.retry_rx);
+        if attempt > 1
+            && let Some(sender) = ui.events.as_ref()
+        {
+            let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Discovering));
+            let _ = sender.send(PeerlineEvent::Message(format!(
+                "retrying send attempt {attempt}"
+            )));
         }
-        Ok(TaskOutcome::Quit) => {
-            if let Some(task) = tui_task {
-                let _ = task.await;
+        let send_events = ui.events.clone();
+        let code = code.clone();
+        let paths = paths.clone();
+        let send_future = async move {
+            match target {
+                DirectTarget::Exact(endpoint) => {
+                    peerline_net::send_direct(SendOptions {
+                        endpoint,
+                        name: None,
+                        code,
+                        paths,
+                        compression,
+                        events: send_events,
+                    })
+                    .await
+                }
+                DirectTarget::Ip(ip) => {
+                    peerline_net::send_direct_probe(SendOptions {
+                        endpoint: SocketAddr::new(ip, DEFAULT_DIRECT_PORT),
+                        name: None,
+                        code,
+                        paths,
+                        compression,
+                        events: send_events,
+                    })
+                    .await
+                }
             }
-            Ok(())
-        }
-        Err(error) => {
-            if let Some(sender) = events.as_ref() {
-                let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
-                    error.to_string(),
-                )));
+        };
+
+        match wait_with_quit(send_future, &mut ui.quit_rx).await {
+            Ok(TaskOutcome::Completed(sent)) => {
+                if let Some(task) = ui.task {
+                    let _ = task.await;
+                }
+                println!(
+                    "sent {} file(s), {} bytes to {}",
+                    sent.files, sent.bytes, sent.endpoint
+                );
+                return Ok(());
             }
-            if let Some(task) = tui_task {
-                let _ = task.await;
+            Ok(TaskOutcome::Quit) => {
+                if let Some(task) = ui.task {
+                    let _ = task.await;
+                }
+                return Ok(());
             }
-            Err(error)
+            Err(error) => {
+                if let Some(sender) = ui.events.as_ref() {
+                    let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
+                        format!("{error}; press r to retry or q to quit"),
+                    )));
+                } else {
+                    return Err(error);
+                }
+
+                match wait_for_retry_or_quit(&mut ui.quit_rx, &mut ui.retry_rx).await {
+                    RetryDecision::Retry => {
+                        attempt += 1;
+                        continue;
+                    }
+                    RetryDecision::Quit => {
+                        if let Some(task) = ui.task {
+                            let _ = task.await;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
         }
     }
 }
@@ -611,20 +885,14 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
     let compression = args.compression.into();
     let allow_relay_fallback = args.allow_relay_fallback;
     let (name, code, paths) = resolve_named_send(args)?;
-    let (quit_signal, mut quit_rx) = if std::io::stdout().is_terminal() {
-        let (tx, rx) = watch::channel(false);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-    let (events, tui_task) = spawn_send_tui(
+    let mut ui = spawn_send_tui(
         "peer",
         name.to_string(),
         code.clone(),
         "discovering routes through rendezvous, DHT, and mDNS...".into(),
-        quit_signal,
+        true,
     );
-    if events.is_none() {
+    if ui.events.is_none() {
         println!("discovering {name} through rendezvous, DHT, and mDNS...");
     }
     if code.is_low_entropy() {
@@ -634,11 +902,86 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
         allow_relay_data_fallback: allow_relay_fallback,
         ..Default::default()
     };
+    let mut attempt = 1usize;
+
+    loop {
+        drain_retry_signals(&mut ui.retry_rx);
+        if attempt > 1
+            && let Some(sender) = ui.events.as_ref()
+        {
+            let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Discovering));
+            let _ = sender.send(PeerlineEvent::Message(format!(
+                "retrying send attempt {attempt}"
+            )));
+        }
+
+        match named_send_attempt(
+            &name,
+            &code,
+            &paths,
+            compression,
+            discovery.clone(),
+            ui.events.clone(),
+            &mut ui.quit_rx,
+        )
+        .await
+        {
+            Ok(TaskOutcome::Completed(sent)) => {
+                if let Some(task) = ui.task {
+                    let _ = task.await;
+                }
+                println!(
+                    "sent {} file(s), {} bytes to {}",
+                    sent.files, sent.bytes, sent.endpoint
+                );
+                return Ok(());
+            }
+            Ok(TaskOutcome::Quit) => {
+                if let Some(task) = ui.task {
+                    let _ = task.await;
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                if let Some(sender) = ui.events.as_ref() {
+                    let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
+                        format!("{error}; press r to retry or q to quit"),
+                    )));
+                } else {
+                    return Err(error);
+                }
+
+                match wait_for_retry_or_quit(&mut ui.quit_rx, &mut ui.retry_rx).await {
+                    RetryDecision::Retry => {
+                        attempt += 1;
+                        continue;
+                    }
+                    RetryDecision::Quit => {
+                        if let Some(task) = ui.task {
+                            let _ = task.await;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn named_send_attempt(
+    name: &HumanName,
+    code: &HumanCode,
+    paths: &[PathBuf],
+    compression: Compression,
+    discovery: peerline_net::DiscoveryConfig,
+    events: Option<mpsc::UnboundedSender<PeerlineEvent>>,
+    quit_rx: &mut Option<watch::Receiver<bool>>,
+) -> anyhow::Result<TaskOutcome<peerline_net::SentTransfer>> {
     let candidates = loop {
         tracing::info!(peer = %name, "discovering routes through rendezvous, DHT, and mDNS");
         let discovery_future =
-            peerline_net::discovery::discover_peer_candidates(&name, &code, discovery.clone());
-        match wait_with_quit(discovery_future, &mut quit_rx).await {
+            peerline_net::discovery::discover_peer_candidates(name, code, discovery.clone());
+        match wait_with_quit(discovery_future, quit_rx).await {
             Ok(TaskOutcome::Completed(candidates)) if !candidates.is_empty() => break candidates,
             Ok(TaskOutcome::Completed(_)) => {
                 tracing::error!(
@@ -647,20 +990,9 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
                 );
             }
             Ok(TaskOutcome::Quit) => {
-                if let Some(task) = tui_task {
-                    let _ = task.await;
-                }
-                return Ok(());
+                return Ok(TaskOutcome::Quit);
             }
             Err(error) => {
-                if let Some(sender) = events.as_ref() {
-                    let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
-                        error.to_string(),
-                    )));
-                }
-                if let Some(task) = tui_task {
-                    let _ = task.await;
-                }
                 return Err(error);
             }
         }
@@ -680,31 +1012,14 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
             )));
         }
 
-        let attempt = send_candidate(
-            &candidate,
-            &name,
-            &code,
-            &paths,
-            compression,
-            events.clone(),
-        );
+        let attempt = send_candidate(&candidate, name, code, paths, compression, events.clone());
 
-        match wait_with_quit(attempt, &mut quit_rx).await {
+        match wait_with_quit(attempt, quit_rx).await {
             Ok(TaskOutcome::Completed(sent)) => {
-                if let Some(task) = tui_task {
-                    let _ = task.await;
-                }
-                println!(
-                    "sent {} file(s), {} bytes to {}",
-                    sent.files, sent.bytes, sent.endpoint
-                );
-                return Ok(());
+                return Ok(TaskOutcome::Completed(sent));
             }
             Ok(TaskOutcome::Quit) => {
-                if let Some(task) = tui_task {
-                    let _ = task.await;
-                }
-                return Ok(());
+                return Ok(TaskOutcome::Quit);
             }
             Err(error) => {
                 if let Some(sender) = events.as_ref() {
@@ -718,16 +1033,9 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
     let error = last_error
         .map(|error| error.to_string())
         .unwrap_or_else(|| "no usable endpoint".into());
-    let final_error = anyhow::anyhow!("discovered {name}, but all routes failed: {error}");
-    if let Some(sender) = events.as_ref() {
-        let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
-            final_error.to_string(),
-        )));
-    }
-    if let Some(task) = tui_task {
-        let _ = task.await;
-    }
-    Err(final_error)
+    Err(anyhow::anyhow!(
+        "discovered {name}, but all routes failed: {error}"
+    ))
 }
 
 async fn send_candidate(
@@ -963,6 +1271,17 @@ mod tests {
         assert!(!route_allowed(&RouteKind::Libp2pRelay, false));
         assert!(route_allowed(&RouteKind::Libp2pRelay, true));
         assert!(route_allowed(&RouteKind::Libp2pDcutr, false));
+    }
+
+    #[test]
+    fn idle_timeout_minutes_accepts_decimal_and_zero_disables() {
+        assert_eq!(parse_idle_timeout_minutes("0").unwrap(), 0.0);
+        assert!(recv_idle_timeout(0.0).is_none());
+        assert_eq!(
+            recv_idle_timeout(parse_idle_timeout_minutes("0.5").unwrap()),
+            Some(Duration::from_secs(30))
+        );
+        assert!(parse_idle_timeout_minutes("-1").is_err());
     }
 
     #[test]

@@ -29,7 +29,9 @@ fn spawn_recv(cwd: &Path, port: u16, overwrite: bool, extra_env: &[(&str, &str)]
         .arg("rose-lime-iris-jade-1234")
         .arg("--no-tui")
         .arg("--port")
-        .arg(port.to_string());
+        .arg(port.to_string())
+        .arg("--idle-timeout-minutes")
+        .arg("0.02");
     if overwrite {
         cmd.arg("--overwrite");
     }
@@ -106,6 +108,54 @@ fn direct_tcp_roundtrip_uses_destination_cwd() {
     assert_eq!(
         std::fs::read_to_string(dst.join("hello.txt")).unwrap(),
         "hello direct cli"
+    );
+}
+
+#[test]
+fn direct_tcp_roundtrip_multiple_files_in_one_send() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::create_dir(&dst).unwrap();
+    std::fs::write(src.join("one.txt"), "first").unwrap();
+    std::fs::write(src.join("two.txt"), "second").unwrap();
+
+    let port = free_port();
+    let mut recv = spawn_recv(
+        &dst,
+        port,
+        false,
+        &[("PEERLINE_BOOTSTRAP", ""), ("PEERLINE_DISABLE_MDNS", "1")],
+    );
+    wait_for_port(port, Duration::from_secs(5));
+
+    let send = spawn_send(
+        temp.path(),
+        &[
+            "send",
+            &format!("127.0.0.1:{port}"),
+            src.join("one.txt").to_str().unwrap(),
+            src.join("two.txt").to_str().unwrap(),
+            "--code",
+            "rose-lime-iris-jade-1234",
+        ],
+        &[],
+    );
+
+    assert!(
+        send.status.success(),
+        "send stderr: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+    assert!(recv.wait().unwrap().success());
+    assert_eq!(
+        std::fs::read_to_string(dst.join("one.txt")).unwrap(),
+        "first"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dst.join("two.txt")).unwrap(),
+        "second"
     );
 }
 
@@ -197,6 +247,55 @@ fn direct_tcp_roundtrip_directory() {
 }
 
 #[test]
+fn direct_tcp_receiver_accepts_multiple_sends_before_idle_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::create_dir(&dst).unwrap();
+    std::fs::write(src.join("one.txt"), "first").unwrap();
+    std::fs::write(src.join("two.txt"), "second").unwrap();
+
+    let port = free_port();
+    let mut recv = spawn_recv(
+        &dst,
+        port,
+        false,
+        &[("PEERLINE_BOOTSTRAP", ""), ("PEERLINE_DISABLE_MDNS", "1")],
+    );
+    wait_for_port(port, Duration::from_secs(5));
+
+    for file in ["one.txt", "two.txt"] {
+        let send = spawn_send(
+            temp.path(),
+            &[
+                "send",
+                &format!("127.0.0.1:{port}"),
+                src.join(file).to_str().unwrap(),
+                "--code",
+                "rose-lime-iris-jade-1234",
+            ],
+            &[],
+        );
+        assert!(
+            send.status.success(),
+            "send stderr: {}",
+            String::from_utf8_lossy(&send.stderr)
+        );
+    }
+
+    assert!(recv.wait().unwrap().success());
+    assert_eq!(
+        std::fs::read_to_string(dst.join("one.txt")).unwrap(),
+        "first"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dst.join("two.txt")).unwrap(),
+        "second"
+    );
+}
+
+#[test]
 fn named_send_uses_saved_name_and_can_route_locally() {
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("src");
@@ -226,7 +325,9 @@ fn named_send_uses_saved_name_and_can_route_locally() {
         .arg("rose-lime-iris-jade-1234")
         .arg("--no-tui")
         .arg("--port")
-        .arg(port.to_string());
+        .arg(port.to_string())
+        .arg("--idle-timeout-minutes")
+        .arg("0.05");
     let mut recv = recv.spawn().unwrap();
     wait_for_port(port, Duration::from_secs(5));
 

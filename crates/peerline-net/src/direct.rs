@@ -316,11 +316,11 @@ pub async fn recv_once(options: RecvOptions) -> anyhow::Result<ReceivedTransfer>
     );
     let (listener, _) =
         bind_direct_listener_with_window(options.bind, DEFAULT_DIRECT_PORT_WINDOW).await?;
-    recv_once_bound(listener, options).await
+    recv_once_bound(&listener, options).await
 }
 
 pub async fn recv_once_bound(
-    listener: TcpListener,
+    listener: &TcpListener,
     options: RecvOptions,
 ) -> anyhow::Result<ReceivedTransfer> {
     loop {
