@@ -31,6 +31,7 @@ const REGISTER_RATE_LIMIT: u32 = 30;
 const UNREGISTER_RATE_LIMIT: u32 = 60;
 const DISCOVER_RATE_LIMIT: u32 = 120;
 const SIGNATURE_SKEW_MS: i64 = 5 * 60 * 1000;
+const MAX_REQUEST_ID_LEN: usize = 128;
 
 #[event(fetch, respond_with_errors)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -110,6 +111,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 #[durable_object(fetch)]
 pub struct RendezvousShard {
     sql: SqlStorage,
+    schema_error: Option<String>,
     auth_token: Option<String>,
     require_mtls: bool,
     allowed_client_cert_fingerprints: Option<HashSet<String>>,
@@ -119,7 +121,10 @@ pub struct RendezvousShard {
 impl DurableObject for RendezvousShard {
     fn new(state: State, env: Env) -> Self {
         let sql = state.storage().sql();
-        install_schema(&sql);
+        let schema_error = install_schema(&sql).err().map(|error| error.to_string());
+        if let Some(error) = &schema_error {
+            worker::console_error!("failed to install rendezvous schema: {error}");
+        }
         let allowed_client_cert_fingerprints =
             env_fingerprint_set(&env, CLIENT_CERT_FINGERPRINTS_BINDING);
         let require_mtls = env_bool(&env, REQUIRE_MTLS_BINDING)
@@ -127,11 +132,15 @@ impl DurableObject for RendezvousShard {
 
         Self {
             sql,
+            schema_error,
             auth_token: env_string(&env, AUTH_TOKEN_BINDING),
             require_mtls,
             allowed_client_cert_fingerprints,
-            max_ttl_secs: env_u32(&env, "PEERLINE_RENDEZVOUS_MAX_TTL_SECS")
-                .unwrap_or(DEFAULT_MAX_TTL_SECS),
+            max_ttl_secs: env_positive_u32(
+                &env,
+                "PEERLINE_RENDEZVOUS_MAX_TTL_SECS",
+                DEFAULT_MAX_TTL_SECS,
+            ),
         }
     }
 
@@ -155,6 +164,19 @@ impl DurableObject for RendezvousShard {
                 "invalid namespace",
                 400,
                 serde_json::json!({ "reason": "invalid_namespace" }),
+            );
+        }
+        if let Some(error) = &self.schema_error {
+            return observed_error_response(
+                "rendezvous_do_rejected",
+                &telemetry,
+                Some(namespace),
+                "storage schema unavailable",
+                500,
+                serde_json::json!({
+                    "reason": "schema_install_failed",
+                    "error": error,
+                }),
             );
         }
 
@@ -335,13 +357,30 @@ impl RendezvousShard {
             );
         }
 
-        let query = req
-            .query::<RendezvousDiscoverRequest>()
-            .unwrap_or(RendezvousDiscoverRequest {
-                after_cookie: None,
-                limit: None,
-            });
+        let query = match req.query::<RendezvousDiscoverRequest>() {
+            Ok(query) => query,
+            Err(_) => {
+                return observed_error_response(
+                    "rendezvous_discover_rejected",
+                    telemetry,
+                    Some(namespace),
+                    "invalid discover query",
+                    400,
+                    serde_json::json!({ "reason": "invalid_query" }),
+                );
+            }
+        };
         let after_cookie = query.after_cookie.unwrap_or_default();
+        let Some(after_cookie_i64) = sqlite_cookie(after_cookie) else {
+            return observed_error_response(
+                "rendezvous_discover_rejected",
+                telemetry,
+                Some(namespace),
+                "invalid discover cursor",
+                400,
+                serde_json::json!({ "reason": "invalid_after_cookie" }),
+            );
+        };
         let limit = query
             .limit
             .unwrap_or(DEFAULT_DISCOVER_LIMIT)
@@ -360,7 +399,7 @@ impl RendezvousShard {
                  LIMIT ?;",
                 vec![
                     now.into(),
-                    (after_cookie as i64).into(),
+                    after_cookie_i64.into(),
                     i64::from(limit).into(),
                 ],
             )?
@@ -480,7 +519,11 @@ impl RendezvousShard {
 
     fn verify_request(&self, req: &Request, body: &[u8]) -> std::result::Result<(), Rejection> {
         self.verify_peerline_version(req)?;
-        if let Some(auth) = req.cf().and_then(|cf| cf.tls_client_auth()) {
+        if let Some(auth) = req
+            .cf()
+            .and_then(|cf| cf.tls_client_auth())
+            .filter(|auth| auth.cert_presented() == "1")
+        {
             return self.verify_tls_client_auth(&auth);
         }
         if self.require_mtls {
@@ -675,28 +718,26 @@ impl Rejection {
 
 fn request_id(req: &Request) -> Result<String> {
     for header in ["x-request-id", "cf-ray", "traceparent"] {
-        if let Some(value) = req.headers().get(header)? {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Ok(value.to_string());
-            }
+        if let Some(value) = req
+            .headers()
+            .get(header)?
+            .and_then(|value| sanitized_header_value(&value))
+        {
+            return Ok(value);
         }
     }
     Ok(format!("peerline-{}", now_unix_ms()))
 }
 
 fn with_observability_headers(
-    mut response: Response,
+    response: Response,
     telemetry: &RequestTelemetry,
 ) -> Result<Response> {
     let duration = telemetry.elapsed_ms();
-    response
-        .headers_mut()
-        .set("x-peerline-request-id", &telemetry.request_id)?;
-    response
-        .headers_mut()
-        .set("server-timing", &format!("peerline;dur={duration}"))?;
-    Ok(response)
+    let headers = response.headers().clone();
+    headers.set("x-peerline-request-id", &telemetry.request_id)?;
+    headers.set("server-timing", &format!("peerline;dur={duration}"))?;
+    Ok(response.with_headers(headers))
 }
 
 fn observed_error_response(
@@ -792,7 +833,7 @@ fn level_for_status(status: u16) -> LogLevel {
     }
 }
 
-fn install_schema(sql: &SqlStorage) {
+fn install_schema(sql: &SqlStorage) -> Result<()> {
     sql.exec(
         "CREATE TABLE IF NOT EXISTS registrations(
             cookie INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -801,20 +842,17 @@ fn install_schema(sql: &SqlStorage) {
             descriptor_json TEXT NOT NULL
         );",
         Vec::<SqlStorageValue>::new(),
-    )
-    .expect("install rendezvous registrations table");
+    )?;
     sql.exec(
         "CREATE INDEX IF NOT EXISTS registrations_expires_idx
             ON registrations(expires_unix_ms);",
         Vec::<SqlStorageValue>::new(),
-    )
-    .expect("install rendezvous registrations expiry index");
+    )?;
     sql.exec(
         "CREATE INDEX IF NOT EXISTS registrations_peer_id_idx
             ON registrations(peer_id);",
         Vec::<SqlStorageValue>::new(),
-    )
-    .expect("install rendezvous registrations peer index");
+    )?;
     sql.exec(
         "CREATE TABLE IF NOT EXISTS rate_limits(
             key TEXT PRIMARY KEY,
@@ -822,8 +860,8 @@ fn install_schema(sql: &SqlStorage) {
             count INTEGER NOT NULL
         );",
         Vec::<SqlStorageValue>::new(),
-    )
-    .expect("install rendezvous rate limit table");
+    )?;
+    Ok(())
 }
 
 fn validate_descriptor(descriptor: &PeerDescriptor) -> std::result::Result<(), Rejection> {
@@ -848,7 +886,7 @@ fn validate_descriptor(descriptor: &PeerDescriptor) -> std::result::Result<(), R
         .direct_endpoints
         .iter()
         .chain(descriptor.libp2p_endpoints.iter())
-        .any(|endpoint| endpoint.is_empty() || endpoint.len() > MAX_ENDPOINT_LEN)
+        .any(|endpoint| !is_valid_endpoint(endpoint))
     {
         return Err(Rejection::new("invalid advertised endpoint", 400));
     }
@@ -868,6 +906,16 @@ fn is_valid_peer_id(peer_id: &str) -> bool {
     !peer_id.is_empty()
         && peer_id.len() <= 128
         && peer_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn sqlite_cookie(cookie: u64) -> Option<i64> {
+    i64::try_from(cookie).ok()
+}
+
+fn is_valid_endpoint(endpoint: &str) -> bool {
+    !endpoint.is_empty()
+        && endpoint.len() <= MAX_ENDPOINT_LEN
+        && endpoint.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 fn namespace_from_path(path: &str) -> Option<&str> {
@@ -897,12 +945,17 @@ fn is_json_request(req: &Request) -> Result<bool> {
     Ok(req
         .headers()
         .get("content-type")?
-        .map(|content_type| {
-            content_type
-                .to_ascii_lowercase()
-                .contains("application/json")
-        })
+        .as_deref()
+        .map(is_json_content_type)
         .unwrap_or(false))
+}
+
+fn is_json_content_type(content_type: &str) -> bool {
+    content_type
+        .split_once(';')
+        .map_or(content_type, |(mime, _)| mime)
+        .trim()
+        .eq_ignore_ascii_case("application/json")
 }
 
 fn client_ip(req: &Request) -> Result<String> {
@@ -921,8 +974,17 @@ fn env_string(env: &Env, name: &str) -> Option<String> {
         .ok()
 }
 
-fn env_u32(env: &Env, name: &str) -> Option<u32> {
-    env_string(env, name)?.parse().ok()
+fn env_positive_u32(env: &Env, name: &str, default: u32) -> u32 {
+    match env_string(env, name) {
+        Some(raw) => match raw.trim().parse::<u32>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                worker::console_warn!("{name} must be a positive integer; using default {default}");
+                default
+            }
+        },
+        None => default,
+    }
 }
 
 fn env_bool(env: &Env, name: &str) -> Option<bool> {
@@ -935,7 +997,23 @@ fn env_bool(env: &Env, name: &str) -> Option<bool> {
 
 fn env_fingerprint_set(env: &Env, name: &str) -> Option<HashSet<String>> {
     let raw = env_string(env, name)?;
-    Some(fingerprints_from_raw(&raw))
+    let fingerprints = fingerprints_from_raw(&raw);
+    if fingerprints.is_empty() {
+        worker::console_warn!(
+            "{name} is configured but contains no valid SHA-256 fingerprints; all client certificates will be rejected"
+        );
+    }
+    Some(fingerprints)
+}
+
+fn sanitized_header_value(raw: &str) -> Option<String> {
+    let value = raw
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_graphic())
+        .take(MAX_REQUEST_ID_LEN)
+        .collect::<String>();
+    (!value.is_empty()).then_some(value)
 }
 
 fn normalize_cert_fingerprint(raw: &str) -> String {
@@ -972,5 +1050,47 @@ mod tests {
         assert_eq!(fingerprints.len(), 1);
         assert!(fingerprints.contains(&valid));
         assert!(fingerprints_from_raw("short").is_empty());
+    }
+
+    #[test]
+    fn validates_json_content_type_exactly() {
+        assert!(is_json_content_type("application/json"));
+        assert!(is_json_content_type("Application/JSON; charset=utf-8"));
+        assert!(!is_json_content_type("text/plain; note=application/json"));
+        assert!(!is_json_content_type("application/json-patch+json"));
+        assert!(!is_json_content_type(""));
+    }
+
+    #[test]
+    fn rejects_control_or_space_in_advertised_endpoints() {
+        assert!(is_valid_endpoint("/ip4/127.0.0.1/tcp/43117"));
+        assert!(is_valid_endpoint("127.0.0.1:43117"));
+        assert!(!is_valid_endpoint(""));
+        assert!(!is_valid_endpoint("/ip4/127.0.0.1/tcp/43117\n"));
+        assert!(!is_valid_endpoint("/dns/example.com/tcp/43117 with-space"));
+        assert!(!is_valid_endpoint(&"a".repeat(MAX_ENDPOINT_LEN + 1)));
+    }
+
+    #[test]
+    fn rejects_discover_cursors_outside_sqlite_integer_range() {
+        assert_eq!(sqlite_cookie(0), Some(0));
+        assert_eq!(sqlite_cookie(i64::MAX as u64), Some(i64::MAX));
+        assert_eq!(sqlite_cookie(i64::MAX as u64 + 1), None);
+    }
+
+    #[test]
+    fn sanitizes_request_id_header_values() {
+        assert_eq!(
+            sanitized_header_value("  abc-123  "),
+            Some("abc-123".into())
+        );
+        assert_eq!(sanitized_header_value("abc def\né"), Some("abcdef".into()));
+        assert_eq!(sanitized_header_value("\n\té"), None);
+        assert_eq!(
+            sanitized_header_value(&"a".repeat(MAX_REQUEST_ID_LEN + 1))
+                .expect("non-empty value")
+                .len(),
+            MAX_REQUEST_ID_LEN
+        );
     }
 }

@@ -7,7 +7,7 @@ routes = [{ pattern = "rendezvous.peerline.pwp.sh", custom_domain = true }]
 [build]
 # Avoid worker-build's nightly panic-unwind path; it currently generates wasm
 # that wasm-bindgen can panic on in Linux CI.
-command = "cargo install worker-build --version 0.8.3 --locked --force && \"$HOME/.cargo/bin/worker-build\" --release --no-panic-recovery"
+command = "sh scripts/build-worker.sh"
 
 [vars]
 PEERLINE_RENDEZVOUS_MAX_TTL_SECS = "180"
