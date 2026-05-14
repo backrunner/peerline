@@ -33,7 +33,7 @@ pub(super) fn recv_idle_timeout(minutes: f64) -> Option<Duration> {
 
 pub(super) fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
-    if seconds >= 60 && seconds % 60 == 0 {
+    if seconds >= 60 && seconds.is_multiple_of(60) {
         format!("{} min", seconds / 60)
     } else if seconds > 0 {
         format!("{seconds}s")
