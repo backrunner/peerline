@@ -170,16 +170,17 @@ impl Dashboard {
                 peer,
                 files,
                 bytes,
+                resume_offset,
             } => {
                 self.active_transfer = Some(id);
                 self.status = format!("{files} file(s) from {peer}");
-                self.progress = Some((0, bytes));
+                self.progress = Some((resume_offset, bytes));
                 self.transfers.push(TransferRow {
                     id,
                     peer: peer.clone(),
                     files,
                     bytes,
-                    progress: Some((0, bytes)),
+                    progress: Some((resume_offset, bytes)),
                     stage: self.stage.clone(),
                     status: stage_label(&self.stage),
                     updated_at: now,
@@ -187,14 +188,19 @@ impl Dashboard {
                 if self.transfers.len() > MAX_TRANSFERS {
                     self.transfers.remove(0);
                 }
-                self.push_log(
-                    LogKind::Info,
+                let message = if resume_offset > 0 {
+                    format!(
+                        "resuming {files} file(s) from {peer} at {} of {}",
+                        format_bytes(resume_offset),
+                        format_bytes(bytes)
+                    )
+                } else {
                     format!(
                         "started {files} file(s) from {peer} ({})",
                         format_bytes(bytes)
-                    ),
-                    Some(peer),
-                );
+                    )
+                };
+                self.push_log(LogKind::Info, message, Some(peer));
                 false
             }
             PeerlineEvent::Progress {
@@ -518,7 +524,7 @@ impl Dashboard {
 
     fn should_exit_after_stage(&self, stage: &TransferStage) -> bool {
         match self.kind {
-            DashboardKind::Recv { .. } => matches!(stage, TransferStage::Failed(_)),
+            DashboardKind::Recv { .. } => false,
             DashboardKind::Send { .. } => matches!(stage, TransferStage::Complete),
         }
     }

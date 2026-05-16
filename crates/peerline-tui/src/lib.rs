@@ -154,9 +154,14 @@ fn apply_event<T: TransferView>(view: &mut T, event: PeerlineEvent) -> bool {
             *view.stage_mut() = next;
             done
         }
-        PeerlineEvent::TransferStarted { files, bytes, .. } => {
+        PeerlineEvent::TransferStarted {
+            files,
+            bytes,
+            resume_offset,
+            ..
+        } => {
             *view.route_status_mut() = format!("{files} file(s), {bytes} bytes");
-            *view.progress_mut() = Some((0, bytes));
+            *view.progress_mut() = Some((resume_offset, bytes));
             false
         }
         PeerlineEvent::Progress {
@@ -261,6 +266,7 @@ mod tests {
                 peer: "203.0.113.7:43117".into(),
                 files: 2,
                 bytes: 300,
+                resume_offset: 0,
             },
             PeerlineEvent::StageChanged(TransferStage::Connecting(ConnectionRoute::PublicDirect)),
             PeerlineEvent::Progress {

@@ -10,7 +10,7 @@ use super::{
 use crate::{
     discovery::{descriptor_record_key, provider_record_key},
     protocol::{PROTOCOL_VERSION, SecureFrame, WireFrame, decrypt_secure, libp2p_transcript},
-    rendezvous,
+    rendezvous, resume,
 };
 use futures::StreamExt;
 use libp2p::{
@@ -21,8 +21,7 @@ use libp2p::{
 use peerline_core::{ConnectionRoute, LookupKey, PeerlineEvent, TransferId, TransferStage};
 use peerline_crypto::{ChunkAead, ServerHandshake, create_server_record, start_server_login};
 use peerline_transfer::unpack_archive_from_reader;
-use std::{collections::HashMap, io::Write, time::Duration};
-use tempfile::NamedTempFile;
+use std::{collections::HashMap, time::Duration};
 use tokio::time;
 
 pub(crate) async fn recv_libp2p(
@@ -270,7 +269,7 @@ fn handle_transfer_event(
         RequestResponseEvent::ResponseSent {
             peer, request_id, ..
         } => {
-            let completed = if let Some(session) = sessions.get_mut(&peer) {
+            let result = if let Some(session) = sessions.get_mut(&peer) {
                 if let Some((pending_request_id, result)) = session.pending_result.take() {
                     if pending_request_id == request_id {
                         Some(result)
@@ -284,15 +283,29 @@ fn handle_transfer_event(
             } else {
                 None
             };
-            if let Some(result) = completed {
+            let should_remove_session = result.is_some()
+                || sessions
+                    .get(&peer)
+                    .is_some_and(|session| session.pending_error == Some(request_id));
+            if should_remove_session {
                 sessions.remove(&peer);
+            }
+            if let Some(result) = result {
                 Ok(Some(result))
             } else {
                 Ok(None)
             }
         }
         RequestResponseEvent::OutboundFailure { .. }
-        | RequestResponseEvent::InboundFailure { .. } => Ok(None),
+        | RequestResponseEvent::InboundFailure { .. } => {
+            emit_event(
+                &options.events,
+                PeerlineEvent::StageChanged(TransferStage::Failed(
+                    "libp2p transfer request failed".into(),
+                )),
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -313,8 +326,7 @@ fn handle_inbound_request(
         WireFrame::ClientIntro {
             version,
             name,
-            files,
-            bytes,
+            descriptor,
             opaque_request,
             client_hello,
         } if version == PROTOCOL_VERSION => {
@@ -328,13 +340,16 @@ fn handle_inbound_request(
 
             let negotiated_name = name.clone().unwrap_or_else(|| options.name.clone());
             let transfer_id = TransferId::random();
+            let resume_state = resume::resume_state(&options.destination, &descriptor)?;
+            let resume_offset = resume_state.offset;
             emit_event(
                 &options.events,
                 PeerlineEvent::TransferStarted {
                     id: transfer_id,
                     peer: peer.to_string(),
-                    files,
-                    bytes,
+                    files: descriptor.files,
+                    bytes: descriptor.archive_bytes,
+                    resume_offset,
                 },
             );
             emit_event(
@@ -364,16 +379,23 @@ fn handle_inbound_request(
                     opaque_server,
                     server_handshake,
                     transfer_id,
-                    bytes,
+                    descriptor,
+                    resume_state,
                 ),
             );
 
             Ok(InboundResponse::Frame(WireFrame::ServerIntro {
                 version: PROTOCOL_VERSION,
+                resume_offset,
                 opaque_response: response,
                 server_hello: hello,
             }))
         }
+        WireFrame::ClientIntro { version, .. } => Ok(InboundResponse::Frame(WireFrame::Error {
+            message: format!(
+                "incompatible peerline protocol version {version}; expected {PROTOCOL_VERSION}"
+            ),
+        })),
         WireFrame::ClientFinish {
             opaque_finalization,
             client_kem,
@@ -415,13 +437,16 @@ fn handle_inbound_request(
                             message: "duplicate secure header".into(),
                         }));
                     }
+                    if compression != session.descriptor.compression {
+                        return Ok(InboundResponse::Frame(WireFrame::Error {
+                            message: "secure header compression mismatch".into(),
+                        }));
+                    }
                     session.compression = Some(compression);
                     emit_event(
                         &options.events,
                         PeerlineEvent::StageChanged(TransferStage::ReceivingManifest),
                     );
-                    std::fs::create_dir_all(&options.destination)?;
-                    session.archive = Some(NamedTempFile::new_in(&options.destination)?);
                     Ok(InboundResponse::Frame(WireFrame::Ack))
                 }
                 SecureFrame::ArchiveChunk { bytes } => {
@@ -430,17 +455,17 @@ fn handle_inbound_request(
                             message: "secure stream must start with header".into(),
                         }));
                     }
-                    let archive = session
-                        .archive
-                        .as_mut()
-                        .ok_or_else(|| anyhow::anyhow!("secure archive sink not ready"))?;
-                    archive.as_file_mut().write_all(&bytes)?;
+                    let bytes_done = resume::append_chunk(
+                        &mut session.resume_state,
+                        &session.descriptor,
+                        &bytes,
+                    )?;
                     emit_event(
                         &options.events,
                         PeerlineEvent::Progress {
                             id: session.transfer_id,
-                            bytes_done: archive.as_file().metadata()?.len(),
-                            bytes_total: session.total_bytes,
+                            bytes_done,
+                            bytes_total: session.descriptor.archive_bytes,
                         },
                     );
                     Ok(InboundResponse::Frame(WireFrame::Ack))
@@ -449,26 +474,19 @@ fn handle_inbound_request(
                     let compression = session
                         .compression
                         .ok_or_else(|| anyhow::anyhow!("secure stream must start with header"))?;
-                    let mut archive = session
-                        .archive
-                        .take()
-                        .ok_or_else(|| anyhow::anyhow!("secure archive sink not ready"))?;
-                    archive.as_file_mut().flush()?;
                     emit_event(
                         &options.events,
                         PeerlineEvent::StageChanged(TransferStage::Verifying),
                     );
-                    let manifest = unpack_archive_from_reader(
+                    let archive =
+                        resume::complete_partial(&session.resume_state, &session.descriptor)?;
+                    let result = unpack_archive_from_reader(
                         &options.destination,
                         compression,
-                        archive.reopen()?,
+                        archive,
                         options.overwrite,
-                    )?;
-                    emit_event(
-                        &options.events,
-                        PeerlineEvent::StageChanged(TransferStage::Complete),
-                    );
-                    let result = crate::direct::ReceivedTransfer {
+                    )
+                    .map(|manifest| crate::direct::ReceivedTransfer {
                         peer: peer.to_string(),
                         files: manifest
                             .entries
@@ -476,9 +494,29 @@ fn handle_inbound_request(
                             .filter(|entry| entry.blake3.is_some())
                             .count(),
                         bytes: manifest.total_bytes,
-                    };
-                    session.pending_result = Some((request_id, result));
-                    Ok(InboundResponse::Frame(WireFrame::Ack))
+                    });
+
+                    match result {
+                        Ok(result) => {
+                            resume::remove_partial(&session.resume_state)?;
+                            emit_event(
+                                &options.events,
+                                PeerlineEvent::StageChanged(TransferStage::Complete),
+                            );
+                            session.pending_result = Some((request_id, result));
+                            Ok(InboundResponse::Frame(WireFrame::Ack))
+                        }
+                        Err(error) => {
+                            let _ = resume::remove_partial(&session.resume_state);
+                            let message = error.to_string();
+                            emit_event(
+                                &options.events,
+                                PeerlineEvent::StageChanged(TransferStage::Failed(message.clone())),
+                            );
+                            session.pending_error = Some(request_id);
+                            Ok(InboundResponse::Frame(WireFrame::Error { message }))
+                        }
+                    }
                 }
             }
         }

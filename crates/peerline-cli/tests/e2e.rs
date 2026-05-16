@@ -2,9 +2,19 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Mutex, MutexGuard, OnceLock},
     thread,
     time::{Duration, Instant},
 };
+
+static NETWORK_E2E_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn network_e2e_guard() -> MutexGuard<'static, ()> {
+    NETWORK_E2E_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn bin() -> PathBuf {
     assert_cmd::cargo::cargo_bin!("peerline").into()
@@ -71,6 +81,7 @@ fn wait_for_port(port: u16, timeout: Duration) {
 
 #[test]
 fn direct_tcp_roundtrip_uses_destination_cwd() {
+    let _guard = network_e2e_guard();
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("src");
     let dst = temp.path().join("dst");
@@ -113,6 +124,7 @@ fn direct_tcp_roundtrip_uses_destination_cwd() {
 
 #[test]
 fn direct_tcp_roundtrip_multiple_files_in_one_send() {
+    let _guard = network_e2e_guard();
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("src");
     let dst = temp.path().join("dst");
@@ -161,6 +173,7 @@ fn direct_tcp_roundtrip_multiple_files_in_one_send() {
 
 #[test]
 fn direct_tcp_respects_overwrite_flag() {
+    let _guard = network_e2e_guard();
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("src");
     let dst = temp.path().join("dst");
@@ -205,6 +218,7 @@ fn direct_tcp_respects_overwrite_flag() {
 
 #[test]
 fn direct_tcp_roundtrip_directory() {
+    let _guard = network_e2e_guard();
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("src");
     let dst = temp.path().join("dst");
@@ -248,6 +262,7 @@ fn direct_tcp_roundtrip_directory() {
 
 #[test]
 fn direct_tcp_receiver_accepts_multiple_sends_before_idle_exit() {
+    let _guard = network_e2e_guard();
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("src");
     let dst = temp.path().join("dst");
@@ -297,6 +312,7 @@ fn direct_tcp_receiver_accepts_multiple_sends_before_idle_exit() {
 
 #[test]
 fn named_send_uses_saved_name_and_can_route_locally() {
+    let _guard = network_e2e_guard();
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("src");
     let dst = temp.path().join("dst");

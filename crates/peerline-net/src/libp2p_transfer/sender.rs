@@ -2,6 +2,7 @@ use super::{
     LIBP2P_ROUTE_LABEL, Libp2pSendOptions,
     behaviour::{TransferBehaviour, TransferBehaviourEvent, build_sender_swarm},
 };
+use crate::direct::descriptor_for_archive;
 use crate::protocol::{
     PROTOCOL_VERSION, SecureFrame, WireFrame, encrypt_secure, libp2p_transcript,
 };
@@ -13,8 +14,8 @@ use libp2p::{
 };
 use peerline_core::{ConnectionRoute, PeerlineEvent, TransferId, TransferStage};
 use peerline_crypto::{ChunkAead, ClientHandshake, start_client_login};
-use peerline_transfer::create_archive;
-use tokio::io::AsyncReadExt;
+use peerline_transfer::{Archive, create_archive};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 fn emit_event(
     events: &Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
@@ -45,6 +46,7 @@ fn emit_transfer_started(
     peer: impl Into<String>,
     files: usize,
     bytes: u64,
+    resume_offset: u64,
 ) {
     emit_event(
         events,
@@ -53,6 +55,7 @@ fn emit_transfer_started(
             peer: peer.into(),
             files,
             bytes,
+            resume_offset,
         },
     );
 }
@@ -89,13 +92,26 @@ pub(crate) async fn send_libp2p(
     emit_message(&options.events, "building archive from selected paths");
     let archive = create_archive(&options.paths, options.compression)?;
     let transfer_id = TransferId::random();
-    let files = archive
-        .manifest
-        .entries
-        .iter()
-        .filter(|entry| entry.blake3.is_some())
-        .count();
-    let wire_bytes = archive.len();
+    send_prebuilt_libp2p(options, archive, transfer_id).await
+}
+
+pub(crate) async fn send_prebuilt_libp2p(
+    options: Libp2pSendOptions,
+    archive: Archive,
+    transfer_id: TransferId,
+) -> anyhow::Result<crate::direct::SentTransfer> {
+    let descriptor = descriptor_for_archive(
+        &crate::direct::SendOptions {
+            endpoint: "127.0.0.1:0".parse().expect("static endpoint"),
+            name: Some(options.name.clone()),
+            code: options.code.clone(),
+            source_id: options.source_id,
+            paths: Vec::new(),
+            compression: options.compression,
+            events: options.events.clone(),
+        },
+        &archive,
+    );
     emit_stage(
         &options.events,
         TransferStage::Connecting(options.route.clone()),
@@ -131,8 +147,7 @@ pub(crate) async fn send_libp2p(
         WireFrame::ClientIntro {
             version: PROTOCOL_VERSION,
             name: Some(options.name.clone()),
-            files,
-            bytes: archive.len(),
+            descriptor: descriptor.clone(),
             opaque_request: opaque_client.request.clone(),
             client_hello: client_handshake.hello.clone(),
         },
@@ -141,15 +156,24 @@ pub(crate) async fn send_libp2p(
     {
         WireFrame::ServerIntro {
             version,
+            resume_offset,
             opaque_response,
             server_hello,
-        } if version == PROTOCOL_VERSION => (opaque_response, server_hello),
+        } if version == PROTOCOL_VERSION => (resume_offset, opaque_response, server_hello),
+        WireFrame::ServerIntro { version, .. } => {
+            anyhow::bail!(
+                "incompatible peerline protocol version {version}; expected {PROTOCOL_VERSION}"
+            )
+        }
         WireFrame::Error { message } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected libp2p handshake response: {other:?}"),
     };
-    let opaque_finish = opaque_client.finish(options.code.as_str().as_bytes(), &server_intro.0)?;
+    if server_intro.0 > descriptor.archive_bytes {
+        anyhow::bail!("receiver requested resume offset beyond archive size");
+    }
+    let opaque_finish = opaque_client.finish(options.code.as_str().as_bytes(), &server_intro.1)?;
     let (client_kem, session_keys) =
-        client_handshake.finish(&server_intro.1, &opaque_finish.session_key, &transcript)?;
+        client_handshake.finish(&server_intro.2, &opaque_finish.session_key, &transcript)?;
 
     match request_round_trip(
         &mut swarm,
@@ -171,13 +195,23 @@ pub(crate) async fn send_libp2p(
         &options.events,
         transfer_id,
         options.peer_id.to_string(),
-        files,
-        wire_bytes,
+        descriptor.files,
+        descriptor.archive_bytes,
+        server_intro.0,
     );
+    if server_intro.0 > 0 {
+        emit_message(
+            &options.events,
+            format!("resuming at {} bytes", server_intro.0),
+        );
+    }
     emit_stage(&options.events, TransferStage::Transferring);
     let mut sequence = 0u64;
     let mut archive_reader = tokio::fs::File::from_std(archive.reader()?);
-    let mut bytes_sent = 0u64;
+    archive_reader
+        .seek(std::io::SeekFrom::Start(server_intro.0))
+        .await?;
+    let mut bytes_sent = server_intro.0;
     send_secure_request(
         &mut swarm,
         &options,
@@ -206,7 +240,12 @@ pub(crate) async fn send_libp2p(
             },
         )
         .await?;
-        emit_progress(&options.events, transfer_id, bytes_sent, wire_bytes);
+        emit_progress(
+            &options.events,
+            transfer_id,
+            bytes_sent,
+            descriptor.archive_bytes,
+        );
     }
 
     send_secure_request(
@@ -221,7 +260,7 @@ pub(crate) async fn send_libp2p(
 
     Ok(crate::direct::SentTransfer {
         endpoint: format!("{} via {}", options.peer_id, route_name),
-        files,
+        files: descriptor.files,
         bytes: archive.manifest.total_bytes,
     })
 }

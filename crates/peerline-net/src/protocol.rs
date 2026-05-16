@@ -1,9 +1,9 @@
-use peerline_core::{Compression, HumanName, LookupKey};
+use peerline_core::{Compression, HumanName, LookupKey, TransferDescriptor};
 use peerline_crypto::{ChunkAead, ClientHello, ClientKem, EncryptedChunk, ServerHello, Transcript};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 1;
+pub(crate) const PROTOCOL_VERSION: u16 = 2;
 pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
 pub(crate) const SECURE_AAD: &[u8] = b"peerline:secure-frame:v1";
 pub(crate) const LIBP2P_TRANSFER_PROTOCOL: &str = "/peerline/transfer/1";
@@ -13,13 +13,13 @@ pub(crate) enum WireFrame {
     ClientIntro {
         version: u16,
         name: Option<HumanName>,
-        files: usize,
-        bytes: u64,
+        descriptor: TransferDescriptor,
         opaque_request: Vec<u8>,
         client_hello: ClientHello,
     },
     ServerIntro {
         version: u16,
+        resume_offset: u64,
         opaque_response: Vec<u8>,
         server_hello: ServerHello,
     },

@@ -40,6 +40,7 @@ pub enum PeerlineEvent {
         peer: String,
         files: usize,
         bytes: u64,
+        resume_offset: u64,
     },
     Progress {
         id: TransferId,

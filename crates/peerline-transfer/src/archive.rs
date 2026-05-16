@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::Context;
 use peerline_core::{
-    Compression, Manifest, ManifestEntry,
+    Compression, Manifest, ManifestEntry, ResourceId, TransferId,
     manifest::EntryKind,
     path::{non_overwriting_path, safe_join_relative},
 };
@@ -42,6 +42,7 @@ pub enum ArchiveFrame {
 pub struct Archive {
     pub manifest: Manifest,
     pub compression: Compression,
+    pub resource_id: ResourceId,
     file: NamedTempFile,
     len: u64,
 }
@@ -58,6 +59,25 @@ impl Archive {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    pub fn from_existing(
+        manifest: Manifest,
+        compression: Compression,
+        resource_id: ResourceId,
+        mut reader: fs::File,
+        len: u64,
+    ) -> anyhow::Result<Self> {
+        let mut file = NamedTempFile::new()?;
+        io::copy(&mut reader, file.as_file_mut())?;
+        file.as_file_mut().flush()?;
+        Ok(Self {
+            manifest,
+            compression,
+            resource_id,
+            file,
+            len,
+        })
+    }
 }
 
 pub fn create_archive(paths: &[PathBuf], compression: Compression) -> anyhow::Result<Archive> {
@@ -72,17 +92,76 @@ pub fn create_archive(paths: &[PathBuf], compression: Compression) -> anyhow::Re
         + body.as_file().metadata()?.len() as usize;
     let actual_compression = resolved_compression_for_size(compression, raw_len as u64);
     manifest.compression = actual_compression;
+    manifest.id = deterministic_manifest_id(actual_compression, &manifest.entries);
 
     let raw = create_raw_archive(&manifest, &body)?;
     let file = compress_raw_archive(actual_compression, raw)?;
     let len = file.as_file().metadata()?.len();
+    let resource_id = resource_id_for_file(&file)?;
 
     Ok(Archive {
         manifest,
         compression: actual_compression,
+        resource_id,
         file,
         len,
     })
+}
+
+pub fn resource_id_for_reader(mut reader: impl Read) -> anyhow::Result<ResourceId> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(ResourceId::from_bytes(*hasher.finalize().as_bytes()))
+}
+
+fn resource_id_for_file(file: &NamedTempFile) -> anyhow::Result<ResourceId> {
+    resource_id_for_reader(file.reopen()?)
+}
+
+fn deterministic_manifest_id(compression: Compression, entries: &[ManifestEntry]) -> TransferId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"peerline:manifest-id:v1");
+    hasher.update(&[compression_tag(compression)]);
+    for entry in entries {
+        hasher.update(&[entry_kind_tag(entry.kind)]);
+        let path = entry.path.to_string_lossy();
+        hasher.update(&(path.len() as u64).to_be_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(&entry.size.to_be_bytes());
+        if let Some(hash) = entry.blake3 {
+            hasher.update(&[1]);
+            hasher.update(&hash);
+        } else {
+            hasher.update(&[0]);
+        }
+    }
+    let hash = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash.as_bytes()[..16]);
+    TransferId::from_bytes(id)
+}
+
+fn compression_tag(compression: Compression) -> u8 {
+    match compression {
+        Compression::Auto => 0,
+        Compression::None => 1,
+        Compression::Zstd => 2,
+        Compression::Lzma => 3,
+    }
+}
+
+fn entry_kind_tag(kind: EntryKind) -> u8 {
+    match kind {
+        EntryKind::File => 1,
+        EntryKind::Directory => 2,
+    }
 }
 
 fn create_archive_body(sources: &[SourceEntry]) -> anyhow::Result<NamedTempFile> {
@@ -525,6 +604,80 @@ mod tests {
             chunk_sizes,
             vec![ARCHIVE_FILE_CHUNK_SIZE, ARCHIVE_FILE_CHUNK_SIZE, 11]
         );
+    }
+
+    #[test]
+    fn archive_resource_id_is_stable_for_same_inputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("stable.txt");
+        fs::write(&src, "same content").unwrap();
+
+        let first = create_archive(std::slice::from_ref(&src), Compression::None).unwrap();
+        let second = create_archive(std::slice::from_ref(&src), Compression::None).unwrap();
+
+        assert_eq!(first.manifest.id, second.manifest.id);
+        assert_eq!(first.resource_id, second.resource_id);
+    }
+
+    #[test]
+    fn archive_resource_id_changes_when_content_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("stable.txt");
+        fs::write(&src, "first").unwrap();
+        let first = create_archive(std::slice::from_ref(&src), Compression::None).unwrap();
+
+        fs::write(&src, "second").unwrap();
+        let second = create_archive(std::slice::from_ref(&src), Compression::None).unwrap();
+
+        assert_ne!(first.resource_id, second.resource_id);
+    }
+
+    #[test]
+    fn archive_resource_id_changes_when_path_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left.txt");
+        let right = temp.path().join("right.txt");
+        fs::write(&left, "same content").unwrap();
+        fs::write(&right, "same content").unwrap();
+
+        let first = create_archive(std::slice::from_ref(&left), Compression::None).unwrap();
+        let second = create_archive(std::slice::from_ref(&right), Compression::None).unwrap();
+
+        assert_ne!(first.resource_id, second.resource_id);
+    }
+
+    #[test]
+    fn archive_resource_id_changes_when_compression_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("stable.txt");
+        fs::write(&src, vec![5u8; ARCHIVE_FILE_CHUNK_SIZE + 32]).unwrap();
+
+        let uncompressed = create_archive(std::slice::from_ref(&src), Compression::None).unwrap();
+        let compressed = create_archive(std::slice::from_ref(&src), Compression::Zstd).unwrap();
+
+        assert_ne!(uncompressed.resource_id, compressed.resource_id);
+    }
+
+    #[test]
+    fn archive_reader_can_resume_from_offset() {
+        use std::io::{Read, Seek};
+
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("large.bin");
+        fs::write(&src, vec![3u8; ARCHIVE_FILE_CHUNK_SIZE + 17]).unwrap();
+        let archive = create_archive(std::slice::from_ref(&src), Compression::None).unwrap();
+        let mut full = Vec::new();
+        archive.reader().unwrap().read_to_end(&mut full).unwrap();
+
+        let offset = 13usize;
+        let mut reader = archive.reader().unwrap();
+        reader
+            .seek(std::io::SeekFrom::Start(offset as u64))
+            .unwrap();
+        let mut suffix = Vec::new();
+        reader.read_to_end(&mut suffix).unwrap();
+
+        assert_eq!(suffix, full[offset..]);
     }
 
     #[test]

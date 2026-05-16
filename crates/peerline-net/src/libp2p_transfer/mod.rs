@@ -9,7 +9,7 @@ mod session;
 mod tests;
 
 use crate::discovery::DiscoveryConfig;
-use peerline_core::{Compression, ConnectionRoute, HumanCode, HumanName, PeerlineEvent};
+use peerline_core::{Compression, ConnectionRoute, HumanCode, HumanName, NodeId, PeerlineEvent};
 use std::{net::SocketAddr, path::PathBuf};
 
 pub(crate) const LIBP2P_ROUTE_LABEL: &str = "libp2p-request-response";
@@ -20,6 +20,7 @@ pub struct Libp2pSendOptions {
     pub addresses: Vec<libp2p::Multiaddr>,
     pub name: HumanName,
     pub code: HumanCode,
+    pub source_id: NodeId,
     pub paths: Vec<PathBuf>,
     pub compression: Compression,
     pub route: ConnectionRoute,
@@ -41,6 +42,14 @@ pub async fn send_libp2p(
     options: Libp2pSendOptions,
 ) -> anyhow::Result<crate::direct::SentTransfer> {
     sender::send_libp2p(options).await
+}
+
+pub async fn send_prebuilt_libp2p(
+    options: Libp2pSendOptions,
+    archive: peerline_transfer::Archive,
+    transfer_id: peerline_core::TransferId,
+) -> anyhow::Result<crate::direct::SentTransfer> {
+    sender::send_prebuilt_libp2p(options, archive, transfer_id).await
 }
 
 pub async fn recv_libp2p(

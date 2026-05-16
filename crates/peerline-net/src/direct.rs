@@ -1,10 +1,14 @@
-use crate::protocol::{
-    PROTOCOL_VERSION, SecureFrame, WireFrame, direct_transcript, read_secure, read_wire,
-    write_secure, write_wire,
+use crate::{
+    protocol::{
+        PROTOCOL_VERSION, SecureFrame, WireFrame, direct_transcript, read_secure, read_wire,
+        write_secure, write_wire,
+    },
+    resume,
 };
 use peerline_core::{
     Compression, ConnectionRoute, DEFAULT_DIRECT_PORT, DEFAULT_DIRECT_PORT_WINDOW, HumanCode,
-    HumanName, PeerlineEvent, TransferId, TransferStage, direct_port_candidates,
+    HumanName, NodeId, PeerlineEvent, TransferDescriptor, TransferId, TransferStage,
+    direct_port_candidates,
 };
 use peerline_crypto::{
     ChunkAead, ClientHandshake, OpaqueClientStart, ServerHello, Transcript, create_server_record,
@@ -12,14 +16,12 @@ use peerline_crypto::{
 };
 use peerline_transfer::{archive::Archive, create_archive, unpack_archive_from_reader};
 use std::{
-    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     time::Duration,
 };
-use tempfile::NamedTempFile;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time,
 };
@@ -41,6 +43,7 @@ pub struct SendOptions {
     pub endpoint: SocketAddr,
     pub name: Option<HumanName>,
     pub code: HumanCode,
+    pub source_id: NodeId,
     pub paths: Vec<PathBuf>,
     pub compression: Compression,
     pub events: Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
@@ -102,6 +105,7 @@ fn emit_transfer_started(
     peer: impl Into<String>,
     files: usize,
     bytes: u64,
+    resume_offset: u64,
 ) {
     emit_event(
         events,
@@ -110,6 +114,7 @@ fn emit_transfer_started(
             peer: peer.into(),
             files,
             bytes,
+            resume_offset,
         },
     );
 }
@@ -146,7 +151,52 @@ struct DirectSession {
     client_handshake: ClientHandshake,
     server_hello: ServerHello,
     transcript: Transcript,
+    resume_offset: u64,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferErrorKind {
+    Transient,
+    Fatal,
+}
+
+#[derive(Debug)]
+pub struct TransferError {
+    kind: TransferErrorKind,
+    source: anyhow::Error,
+}
+
+impl TransferError {
+    pub fn transient(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: TransferErrorKind::Transient,
+            source: error.into(),
+        }
+    }
+
+    pub fn fatal(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind: TransferErrorKind::Fatal,
+            source: error.into(),
+        }
+    }
+
+    pub fn kind(&self) -> TransferErrorKind {
+        self.kind
+    }
+
+    pub fn into_inner(self) -> anyhow::Error {
+        self.source
+    }
+}
+
+impl std::fmt::Display for TransferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for TransferError {}
 
 pub async fn bind_direct_listener(bind: SocketAddr) -> anyhow::Result<(TcpListener, SocketAddr)> {
     bind_direct_listener_with_window(bind, DEFAULT_DIRECT_PORT_WINDOW).await
@@ -187,8 +237,7 @@ async fn open_direct_session(
     endpoint: SocketAddr,
     name: Option<&HumanName>,
     code: &HumanCode,
-    files: usize,
-    bytes: u64,
+    descriptor: TransferDescriptor,
 ) -> anyhow::Result<DirectSession> {
     let mut stream = TcpStream::connect(endpoint).await?;
     let transcript = direct_transcript(name);
@@ -199,8 +248,7 @@ async fn open_direct_session(
         &WireFrame::ClientIntro {
             version: PROTOCOL_VERSION,
             name: name.cloned(),
-            files,
-            bytes,
+            descriptor,
             opaque_request: opaque_client.request.clone(),
             client_hello: client_handshake.hello.clone(),
         },
@@ -210,9 +258,19 @@ async fn open_direct_session(
     let server_intro = match read_wire(&mut stream).await? {
         WireFrame::ServerIntro {
             version,
+            resume_offset,
             opaque_response,
             server_hello,
-        } if version == PROTOCOL_VERSION => (opaque_response, server_hello),
+        } if version == PROTOCOL_VERSION => (resume_offset, opaque_response, server_hello),
+        WireFrame::ServerIntro { version, .. } => {
+            return Err(TransferError::fatal(anyhow::anyhow!(
+                "incompatible peerline protocol version {version}; expected {PROTOCOL_VERSION}"
+            ))
+            .into());
+        }
+        WireFrame::Error { message } => {
+            return Err(TransferError::fatal(anyhow::anyhow!(message)).into());
+        }
         _ => anyhow::bail!("unexpected server handshake frame"),
     };
 
@@ -220,9 +278,10 @@ async fn open_direct_session(
         endpoint,
         stream,
         opaque_client,
-        server_response: server_intro.0,
+        resume_offset: server_intro.0,
+        server_response: server_intro.1,
         client_handshake,
-        server_hello: server_intro.1,
+        server_hello: server_intro.2,
         transcript,
     })
 }
@@ -232,9 +291,14 @@ async fn complete_direct_transfer(
     archive: &Archive,
     options: &SendOptions,
     transfer_id: TransferId,
-    files: usize,
-    wire_bytes: u64,
+    descriptor: TransferDescriptor,
 ) -> anyhow::Result<SentTransfer> {
+    if session.resume_offset > descriptor.archive_bytes {
+        return Err(TransferError::fatal(anyhow::anyhow!(
+            "receiver requested resume offset beyond archive size"
+        ))
+        .into());
+    }
     emit_stage(&options.events, TransferStage::Authenticating);
     let opaque_finish = session
         .opaque_client
@@ -258,13 +322,23 @@ async fn complete_direct_transfer(
         &options.events,
         transfer_id,
         session.endpoint.to_string(),
-        files,
-        wire_bytes,
+        descriptor.files,
+        descriptor.archive_bytes,
+        session.resume_offset,
     );
+    if session.resume_offset > 0 {
+        emit_message(
+            &options.events,
+            format!("resuming at {} bytes", session.resume_offset),
+        );
+    }
     emit_stage(&options.events, TransferStage::Transferring);
     let mut sequence = 0u64;
-    let mut bytes_sent = 0u64;
+    let mut bytes_sent = session.resume_offset;
     let mut archive_reader = tokio::fs::File::from_std(archive.reader()?);
+    archive_reader
+        .seek(std::io::SeekFrom::Start(session.resume_offset))
+        .await?;
     write_secure(
         &mut session.stream,
         &aead,
@@ -290,7 +364,12 @@ async fn complete_direct_transfer(
             },
         )
         .await?;
-        emit_progress(&options.events, transfer_id, bytes_sent, wire_bytes);
+        emit_progress(
+            &options.events,
+            transfer_id,
+            bytes_sent,
+            descriptor.archive_bytes,
+        );
     }
     write_secure(
         &mut session.stream,
@@ -299,12 +378,24 @@ async fn complete_direct_transfer(
         &SecureFrame::Done,
     )
     .await?;
+    match read_wire(&mut session.stream).await? {
+        WireFrame::Ack => {}
+        WireFrame::Error { message } => {
+            return Err(TransferError::fatal(anyhow::anyhow!(message)).into());
+        }
+        other => {
+            return Err(TransferError::fatal(anyhow::anyhow!(
+                "unexpected completion response: {other:?}"
+            ))
+            .into());
+        }
+    }
     session.stream.shutdown().await?;
     emit_stage(&options.events, TransferStage::Complete);
 
     Ok(SentTransfer {
         endpoint: session.endpoint.to_string(),
-        files,
+        files: descriptor.files,
         bytes: archive.manifest.total_bytes,
     })
 }
@@ -335,6 +426,10 @@ pub async fn recv_once_bound(
                 tracing::warn!(%error, %peer, "direct transfer failed; waiting for another connection");
                 emit_event(
                     &options.events,
+                    PeerlineEvent::StageChanged(TransferStage::Failed(error.to_string())),
+                );
+                emit_event(
+                    &options.events,
                     PeerlineEvent::Message(format!("{peer}: {}", error)),
                 );
             }
@@ -349,13 +444,15 @@ pub async fn send_direct(options: SendOptions) -> anyhow::Result<SentTransfer> {
     );
     let archive = create_archive(&options.paths, options.compression)?;
     let transfer_id = TransferId::random();
-    let files = archive
-        .manifest
-        .entries
-        .iter()
-        .filter(|entry| entry.blake3.is_some())
-        .count();
-    let wire_bytes = archive.len();
+    send_prebuilt_direct(options, archive, transfer_id).await
+}
+
+pub async fn send_prebuilt_direct(
+    options: SendOptions,
+    archive: Archive,
+    transfer_id: TransferId,
+) -> anyhow::Result<SentTransfer> {
+    let descriptor = descriptor_for_archive(&options, &archive);
     emit_stage(
         &options.events,
         TransferStage::Connecting(connection_route_from_endpoint(&options.endpoint)),
@@ -365,11 +462,10 @@ pub async fn send_direct(options: SendOptions) -> anyhow::Result<SentTransfer> {
         options.endpoint,
         options.name.as_ref(),
         &options.code,
-        files,
-        wire_bytes,
+        descriptor.clone(),
     )
     .await?;
-    complete_direct_transfer(session, &archive, &options, transfer_id, files, wire_bytes).await
+    complete_direct_transfer(session, &archive, &options, transfer_id, descriptor).await
 }
 
 pub async fn send_direct_probe(options: SendOptions) -> anyhow::Result<SentTransfer> {
@@ -379,13 +475,15 @@ pub async fn send_direct_probe(options: SendOptions) -> anyhow::Result<SentTrans
     );
     let archive = create_archive(&options.paths, options.compression)?;
     let transfer_id = TransferId::random();
-    let files = archive
-        .manifest
-        .entries
-        .iter()
-        .filter(|entry| entry.blake3.is_some())
-        .count();
-    let wire_bytes = archive.len();
+    send_prebuilt_direct_probe(options, archive, transfer_id).await
+}
+
+pub async fn send_prebuilt_direct_probe(
+    options: SendOptions,
+    archive: Archive,
+    transfer_id: TransferId,
+) -> anyhow::Result<SentTransfer> {
+    let descriptor = descriptor_for_archive(&options, &archive);
     let endpoint_ip = options.endpoint.ip();
     let start_port = options.endpoint.port();
     let end_port = direct_port_candidates(start_port, DEFAULT_DIRECT_PORT_WINDOW)
@@ -415,8 +513,7 @@ pub async fn send_direct_probe(options: SendOptions) -> anyhow::Result<SentTrans
                 endpoint,
                 options.name.as_ref(),
                 &options.code,
-                files,
-                wire_bytes,
+                descriptor.clone(),
             ),
         )
         .await
@@ -428,8 +525,7 @@ pub async fn send_direct_probe(options: SendOptions) -> anyhow::Result<SentTrans
                     &archive,
                     &options,
                     transfer_id,
-                    files,
-                    wire_bytes,
+                    descriptor,
                 )
                 .await;
             }
@@ -454,6 +550,23 @@ pub async fn send_direct_probe(options: SendOptions) -> anyhow::Result<SentTrans
     }))
 }
 
+pub fn descriptor_for_archive(options: &SendOptions, archive: &Archive) -> TransferDescriptor {
+    let files = archive
+        .manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.blake3.is_some())
+        .count();
+    TransferDescriptor {
+        source_id: options.source_id,
+        resource_id: archive.resource_id,
+        archive_bytes: archive.len(),
+        logical_bytes: archive.manifest.total_bytes,
+        files,
+        compression: archive.compression,
+    }
+}
+
 async fn receive_stream(
     mut stream: TcpStream,
     peer: SocketAddr,
@@ -463,28 +576,42 @@ async fn receive_stream(
         WireFrame::ClientIntro {
             version,
             name,
-            files,
-            bytes,
+            descriptor,
             opaque_request,
             client_hello,
-        } if version == PROTOCOL_VERSION => (name, files, bytes, opaque_request, client_hello),
+        } if version == PROTOCOL_VERSION => (name, descriptor, opaque_request, client_hello),
+        WireFrame::ClientIntro { version, .. } => {
+            let message = format!(
+                "incompatible peerline protocol version {version}; expected {PROTOCOL_VERSION}"
+            );
+            let _ = write_wire(
+                &mut stream,
+                &WireFrame::Error {
+                    message: message.clone(),
+                },
+            )
+            .await;
+            anyhow::bail!(message)
+        }
         _ => anyhow::bail!("unexpected client handshake frame"),
     };
     let transfer_id = TransferId::random();
-    emit_event(
-        &options.events,
-        PeerlineEvent::TransferStarted {
-            id: transfer_id,
-            peer: peer.to_string(),
-            files: intro.1,
-            bytes: intro.2,
-        },
-    );
     if let Some(name) = intro.0.as_ref()
         && name != &options.name
     {
         anyhow::bail!("receiver name mismatch");
     }
+    let mut resume_state = resume::resume_state(&options.destination, &intro.1)?;
+    emit_event(
+        &options.events,
+        PeerlineEvent::TransferStarted {
+            id: transfer_id,
+            peer: peer.to_string(),
+            files: intro.1.files,
+            bytes: intro.1.archive_bytes,
+            resume_offset: resume_state.offset,
+        },
+    );
     emit_event(
         &options.events,
         PeerlineEvent::StageChanged(TransferStage::Authenticating),
@@ -495,12 +622,13 @@ async fn receive_stream(
         options.code.as_str().as_bytes(),
         options.name.as_str().as_bytes(),
     )?;
-    let opaque_server = start_server_login(&record, &intro.3)?;
-    let server_handshake = peerline_crypto::handshake::ServerHandshake::start(&intro.4)?;
+    let opaque_server = start_server_login(&record, &intro.2)?;
+    let server_handshake = peerline_crypto::handshake::ServerHandshake::start(&intro.3)?;
     write_wire(
         &mut stream,
         &WireFrame::ServerIntro {
             version: PROTOCOL_VERSION,
+            resume_offset: resume_state.offset,
             opaque_response: opaque_server.response.clone(),
             server_hello: server_handshake.hello.clone(),
         },
@@ -515,7 +643,7 @@ async fn receive_stream(
         _ => anyhow::bail!("unexpected client finish frame"),
     };
     let opaque_key = opaque_server.finish(&finish.0)?;
-    let keys = server_handshake.finish(&intro.4, &finish.1, &opaque_key, &transcript)?;
+    let keys = server_handshake.finish(&intro.3, &finish.1, &opaque_key, &transcript)?;
     let aead = ChunkAead::new(keys.recv_key, *b"pl01");
 
     let mut expected_sequence = 0u64;
@@ -524,25 +652,25 @@ async fn receive_stream(
         SecureFrame::Header { compression } => compression,
         _ => anyhow::bail!("secure stream must start with header"),
     };
+    if compression != intro.1.compression {
+        anyhow::bail!("secure header compression mismatch");
+    }
     emit_event(
         &options.events,
         PeerlineEvent::StageChanged(TransferStage::ReceivingManifest),
     );
 
     std::fs::create_dir_all(&options.destination)?;
-    let mut archive = NamedTempFile::new_in(&options.destination)?;
-    let mut bytes_received = 0u64;
     loop {
         match read_secure(&mut stream, &aead, &mut expected_sequence).await? {
             SecureFrame::ArchiveChunk { bytes } => {
-                bytes_received += bytes.len() as u64;
-                archive.as_file_mut().write_all(&bytes)?;
+                let bytes_received = resume::append_chunk(&mut resume_state, &intro.1, &bytes)?;
                 emit_event(
                     &options.events,
                     PeerlineEvent::Progress {
                         id: transfer_id,
                         bytes_done: bytes_received,
-                        bytes_total: intro.2,
+                        bytes_total: intro.1.archive_bytes,
                     },
                 );
             }
@@ -550,23 +678,19 @@ async fn receive_stream(
             SecureFrame::Header { .. } => anyhow::bail!("duplicate secure header"),
         }
     }
-    archive.as_file_mut().flush()?;
     emit_event(
         &options.events,
         PeerlineEvent::StageChanged(TransferStage::Verifying),
     );
 
-    let manifest = unpack_archive_from_reader(
+    let archive = resume::complete_partial(&resume_state, &intro.1)?;
+    let result = unpack_archive_from_reader(
         &options.destination,
         compression,
-        archive.reopen()?,
+        archive,
         options.overwrite,
-    )?;
-    emit_event(
-        &options.events,
-        PeerlineEvent::StageChanged(TransferStage::Complete),
-    );
-    Ok(ReceivedTransfer {
+    )
+    .map(|manifest| ReceivedTransfer {
         peer: peer.to_string(),
         files: manifest
             .entries
@@ -574,13 +698,34 @@ async fn receive_stream(
             .filter(|entry| entry.blake3.is_some())
             .count(),
         bytes: manifest.total_bytes,
-    })
+    });
+
+    match result {
+        Ok(received) => {
+            resume::remove_partial(&resume_state)?;
+            write_wire(&mut stream, &WireFrame::Ack).await?;
+            emit_event(
+                &options.events,
+                PeerlineEvent::StageChanged(TransferStage::Complete),
+            );
+            Ok(received)
+        }
+        Err(error) => {
+            let _ = resume::remove_partial(&resume_state);
+            let message = error.to_string();
+            let _ = write_wire(&mut stream, &WireFrame::Error { message }).await;
+            Err(TransferError::fatal(error).into())
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{SecureFrame, WireFrame, direct_transcript, write_secure, write_wire};
     use peerline_core::{ConnectionRoute, PeerlineEvent, TransferStage};
+    use peerline_crypto::{ChunkAead, ClientHandshake, start_client_login};
+    use std::io::Read;
     use std::sync::{Arc, OnceLock};
 
     static DIRECT_TEST_PORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -644,6 +789,7 @@ mod tests {
 
         let name = HumanName::parse("river-mango-42").unwrap();
         let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+        let source_id = NodeId::random();
         let recv_task = tokio::spawn(recv_once(RecvOptions {
             name,
             code: code.clone(),
@@ -656,6 +802,7 @@ mod tests {
             endpoint: addr,
             name: None,
             code,
+            source_id,
             paths: vec![src_dir.join("hello.txt")],
             compression: Compression::Zstd,
             events: None,
@@ -687,6 +834,7 @@ mod tests {
         let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let name = HumanName::parse("river-mango-42").unwrap();
         let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+        let source_id = NodeId::random();
         let recv_task = tokio::spawn(recv_once(RecvOptions {
             name,
             code: code.clone(),
@@ -699,6 +847,7 @@ mod tests {
             endpoint: addr,
             name: None,
             code,
+            source_id,
             paths: vec![src_dir.join("hello.txt")],
             compression: Compression::Zstd,
             events: None,
@@ -780,6 +929,7 @@ mod tests {
 
         let name = HumanName::parse("river-mango-42").unwrap();
         let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+        let source_id = NodeId::random();
         let recv_task = tokio::spawn(recv_once(RecvOptions {
             name,
             code: code.clone(),
@@ -795,6 +945,7 @@ mod tests {
             endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base_port),
             name: None,
             code,
+            source_id,
             paths: vec![src_dir.join("hello.txt")],
             compression: Compression::Zstd,
             events: None,
@@ -806,6 +957,172 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dst_dir.join("hello.txt")).unwrap(),
             "hello peerline"
+        );
+    }
+
+    async fn send_direct_prefix_then_disconnect(
+        endpoint: SocketAddr,
+        code: HumanCode,
+        source_id: NodeId,
+        archive: &Archive,
+        max_bytes: u64,
+    ) -> anyhow::Result<()> {
+        let descriptor = TransferDescriptor {
+            source_id,
+            resource_id: archive.resource_id,
+            archive_bytes: archive.len(),
+            logical_bytes: archive.manifest.total_bytes,
+            files: archive
+                .manifest
+                .entries
+                .iter()
+                .filter(|entry| entry.blake3.is_some())
+                .count(),
+            compression: archive.compression,
+        };
+        let mut stream = TcpStream::connect(endpoint).await?;
+        let opaque_client = start_client_login(code.as_str().as_bytes())?;
+        let client_handshake = ClientHandshake::start();
+        write_wire(
+            &mut stream,
+            &WireFrame::ClientIntro {
+                version: PROTOCOL_VERSION,
+                name: None,
+                descriptor,
+                opaque_request: opaque_client.request.clone(),
+                client_hello: client_handshake.hello.clone(),
+            },
+        )
+        .await?;
+        let (opaque_response, server_hello) = match read_wire(&mut stream).await? {
+            WireFrame::ServerIntro {
+                version,
+                opaque_response,
+                server_hello,
+                ..
+            } if version == PROTOCOL_VERSION => (opaque_response, server_hello),
+            other => anyhow::bail!("unexpected server intro: {other:?}"),
+        };
+        let opaque_finish = opaque_client.finish(code.as_str().as_bytes(), &opaque_response)?;
+        let (client_kem, keys) = client_handshake.finish(
+            &server_hello,
+            &opaque_finish.session_key,
+            &direct_transcript(None),
+        )?;
+        write_wire(
+            &mut stream,
+            &WireFrame::ClientFinish {
+                opaque_finalization: opaque_finish.finalization,
+                client_kem,
+            },
+        )
+        .await?;
+        let aead = ChunkAead::new(keys.send_key, *b"pl01");
+        let mut sequence = 0u64;
+        write_secure(
+            &mut stream,
+            &aead,
+            &mut sequence,
+            &SecureFrame::Header {
+                compression: archive.compression,
+            },
+        )
+        .await?;
+        let mut reader = archive.reader()?;
+        let mut remaining = max_bytes as usize;
+        let mut buffer = vec![0u8; 64 * 1024];
+        while remaining > 0 {
+            let read = reader.read(&mut buffer[..remaining.min(64 * 1024)])?;
+            if read == 0 {
+                break;
+            }
+            remaining -= read;
+            write_secure(
+                &mut stream,
+                &aead,
+                &mut sequence,
+                &SecureFrame::ArchiveChunk {
+                    bytes: buffer[..read].to_vec(),
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_transfer_resumes_after_disconnect() {
+        let _guard = direct_test_guard().await;
+        let temp = tempfile::tempdir().unwrap();
+        let src_dir = temp.path().join("src");
+        let dst_dir = temp.path().join("dst");
+        std::fs::create_dir(&src_dir).unwrap();
+        std::fs::create_dir(&dst_dir).unwrap();
+        let payload = vec![7u8; 192 * 1024];
+        std::fs::write(src_dir.join("large.bin"), &payload).unwrap();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+        let source_id = NodeId::random();
+        let archive = create_archive(&[src_dir.join("large.bin")], Compression::None).unwrap();
+        let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let recv_task = tokio::spawn(recv_once(RecvOptions {
+            name: HumanName::parse("river-mango-42").unwrap(),
+            code: code.clone(),
+            bind: addr,
+            destination: dst_dir.clone(),
+            overwrite: false,
+            events: Some(events),
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        send_direct_prefix_then_disconnect(addr, code.clone(), source_id, &archive, 65_536)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(dst_dir.join(".peerline-resume").exists());
+
+        let sent = send_direct(SendOptions {
+            endpoint: addr,
+            name: None,
+            code,
+            source_id,
+            paths: vec![src_dir.join("large.bin")],
+            compression: Compression::None,
+            events: None,
+        })
+        .await
+        .unwrap();
+        let received = recv_task.await.unwrap().unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+
+        assert_eq!(sent.files, 1);
+        assert_eq!(received.files, 1);
+        assert_eq!(std::fs::read(dst_dir.join("large.bin")).unwrap(), payload);
+        assert!(
+            !dst_dir
+                .join(".peerline-resume")
+                .join(source_id.hex())
+                .exists()
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PeerlineEvent::TransferStarted {
+                resume_offset,
+                ..
+            } if *resume_offset > 0
+        )));
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PeerlineEvent::StageChanged(TransferStage::Failed(_))
+            ))
         );
     }
 
@@ -824,6 +1141,7 @@ mod tests {
         drop(listener);
 
         let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+        let source_id = NodeId::random();
         let recv_task = tokio::spawn(recv_once(RecvOptions {
             name: HumanName::parse("river-mango-42").unwrap(),
             code: code.clone(),
@@ -836,6 +1154,7 @@ mod tests {
             endpoint: addr,
             name: Some(HumanName::parse("wrong-name-42").unwrap()),
             code,
+            source_id,
             paths: vec![src_dir.join("secret.txt")],
             compression: Compression::None,
             events: None,

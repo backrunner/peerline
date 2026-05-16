@@ -76,6 +76,7 @@ fn tracks_multiple_transfer_rows_with_peer_labels() {
         peer: "127.0.0.1:50001".into(),
         files: 2,
         bytes: 200,
+        resume_offset: 0,
     });
     dashboard.apply_event(PeerlineEvent::Progress {
         id: first,
@@ -88,6 +89,7 @@ fn tracks_multiple_transfer_rows_with_peer_labels() {
         peer: "12D3KooWExamplePeer".into(),
         files: 1,
         bytes: 50,
+        resume_offset: 0,
     });
     dashboard.apply_event(PeerlineEvent::StageChanged(TransferStage::Connecting(
         ConnectionRoute::Libp2pDcutr,
@@ -112,6 +114,17 @@ fn receive_dashboard_stays_open_after_completed_transfer() {
     let mut dashboard = recv_dashboard();
 
     let should_exit = dashboard.apply_event(PeerlineEvent::StageChanged(TransferStage::Complete));
+
+    assert!(!should_exit);
+}
+
+#[test]
+fn receive_dashboard_stays_open_after_failed_transfer() {
+    let mut dashboard = recv_dashboard();
+
+    let should_exit = dashboard.apply_event(PeerlineEvent::StageChanged(TransferStage::Failed(
+        "connection reset".into(),
+    )));
 
     assert!(!should_exit);
 }

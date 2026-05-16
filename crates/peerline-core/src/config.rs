@@ -1,4 +1,4 @@
-use crate::identity::HumanName;
+use crate::{identity::HumanName, manifest::NodeId};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -9,6 +9,7 @@ use std::{
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub name: Option<HumanName>,
+    pub node_id: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +57,17 @@ impl ConfigStore {
         config.name = Some(name);
         self.save(&config)
     }
+
+    pub fn node_id(&self) -> anyhow::Result<NodeId> {
+        let mut config = self.load()?;
+        if let Some(node_id) = config.node_id {
+            return Ok(node_id);
+        }
+        let node_id = NodeId::random();
+        config.node_id = Some(node_id);
+        self.save(&config)?;
+        Ok(node_id)
+    }
 }
 
 #[cfg(test)]
@@ -71,5 +83,17 @@ mod tests {
             .unwrap();
         let config = store.load().unwrap();
         assert_eq!(config.name.unwrap().as_str(), "river-mango-42");
+    }
+
+    #[test]
+    fn generates_and_persists_node_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.toml"));
+
+        let first = store.node_id().unwrap();
+        let second = store.node_id().unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(store.load().unwrap().node_id, Some(first));
     }
 }

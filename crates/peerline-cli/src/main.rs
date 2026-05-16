@@ -6,16 +6,18 @@ mod wait;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use peerline_core::{
     Compression, ConfigStore, DEFAULT_DIRECT_PORT, DEFAULT_DIRECT_PORT_WINDOW, HumanCode,
-    HumanName, PeerlineEvent, TransferStage, parse_ip_endpoint,
+    HumanName, NodeId, PeerlineEvent, TransferId, TransferStage, parse_ip_endpoint,
 };
 use peerline_net::{
     Candidate, Libp2pRecvOptions, Libp2pSendOptions, RecvOptions, RouteKind, SendOptions,
     bind_direct_listener,
 };
+use rand::Rng;
 use std::{
     io::IsTerminal,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
+    time::Duration,
 };
 use terminal::{init_tracing, register_activity_log_sender, spawn_send_tui, spawn_terminal_ui};
 use tokio::sync::{mpsc, watch};
@@ -39,6 +41,7 @@ struct Cli {
 }
 
 const DEFAULT_RECV_IDLE_TIMEOUT_MINUTES: f64 = 10.0;
+const DEFAULT_RETRY_ATTEMPTS: usize = 5;
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -81,6 +84,8 @@ struct SendArgs {
     compression: CompressionArg,
     #[arg(long)]
     allow_relay_fallback: bool,
+    #[arg(long, default_value_t = DEFAULT_RETRY_ATTEMPTS, value_parser = parse_retry_attempts)]
+    retry_attempts: usize,
 }
 
 #[derive(Debug, Args)]
@@ -113,6 +118,16 @@ impl From<CompressionArg> for Compression {
     }
 }
 
+fn parse_retry_attempts(value: &str) -> Result<usize, String> {
+    let attempts = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid retry attempt count: {error}"))?;
+    if attempts == 0 {
+        return Err("retry attempts must be at least 1".into());
+    }
+    Ok(attempts)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -128,6 +143,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     let store = ConfigStore::user_default()?;
     let config = store.load()?;
     let (name, code) = resolve_recv_identity(config.name, args.first, args.second)?;
+    let _node_id = store.node_id()?;
     let idle_timeout = recv_idle_timeout(args.idle_timeout_minutes);
 
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), args.port);
@@ -277,6 +293,8 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
 }
 
 async fn send_direct_mode(args: SendArgs, target: DirectTarget) -> anyhow::Result<()> {
+    let retry_attempts = args.retry_attempts;
+    let source_id = ConfigStore::user_default()?.node_id()?;
     let code = match args.code {
         Some(code) => HumanCode::parse(code)?,
         None => {
@@ -312,47 +330,27 @@ async fn send_direct_mode(args: SendArgs, target: DirectTarget) -> anyhow::Resul
         true,
     );
     let compression = args.compression.into();
-    let mut attempt = 1usize;
+    let mut round = 1usize;
 
     loop {
         drain_retry_signals(&mut ui.retry_rx);
-        if attempt > 1
+        if round > 1
             && let Some(sender) = ui.events.as_ref()
         {
             let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Discovering));
             let _ = sender.send(PeerlineEvent::Message(format!(
-                "retrying send attempt {attempt}"
+                "retrying send round {round}"
             )));
         }
-        let send_events = ui.events.clone();
-        let code = code.clone();
-        let paths = paths.clone();
-        let send_future = async move {
-            match target {
-                DirectTarget::Exact(endpoint) => {
-                    peerline_net::send_direct(SendOptions {
-                        endpoint,
-                        name: None,
-                        code,
-                        paths,
-                        compression,
-                        events: send_events,
-                    })
-                    .await
-                }
-                DirectTarget::Ip(ip) => {
-                    peerline_net::send_direct_probe(SendOptions {
-                        endpoint: SocketAddr::new(ip, DEFAULT_DIRECT_PORT),
-                        name: None,
-                        code,
-                        paths,
-                        compression,
-                        events: send_events,
-                    })
-                    .await
-                }
-            }
-        };
+        let send_future = direct_send_with_retries(
+            target,
+            code.clone(),
+            source_id,
+            paths.clone(),
+            compression,
+            retry_attempts,
+            ui.events.clone(),
+        );
 
         match wait_with_quit(send_future, &mut ui.quit_rx).await {
             Ok(TaskOutcome::Completed(sent)) => {
@@ -374,7 +372,9 @@ async fn send_direct_mode(args: SendArgs, target: DirectTarget) -> anyhow::Resul
             Err(error) => {
                 if let Some(sender) = ui.events.as_ref() {
                     let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
-                        format!("{error}; press r to retry or q to quit"),
+                        format!(
+                            "failed after {retry_attempts} attempt(s): {error}; press r to retry or q to quit"
+                        ),
                     )));
                 } else {
                     return Err(error);
@@ -382,7 +382,7 @@ async fn send_direct_mode(args: SendArgs, target: DirectTarget) -> anyhow::Resul
 
                 match wait_for_retry_or_quit(&mut ui.quit_rx, &mut ui.retry_rx).await {
                     RetryDecision::Retry => {
-                        attempt += 1;
+                        round += 1;
                         continue;
                     }
                     RetryDecision::Quit => {
@@ -398,6 +398,8 @@ async fn send_direct_mode(args: SendArgs, target: DirectTarget) -> anyhow::Resul
 }
 
 async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
+    let retry_attempts = args.retry_attempts;
+    let source_id = ConfigStore::user_default()?.node_id()?;
     let compression = args.compression.into();
     let allow_relay_fallback = args.allow_relay_fallback;
     let (name, code, paths) = resolve_named_send(args)?;
@@ -418,26 +420,30 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
         allow_relay_data_fallback: allow_relay_fallback,
         ..Default::default()
     };
-    let mut attempt = 1usize;
+    let mut round = 1usize;
 
     loop {
         drain_retry_signals(&mut ui.retry_rx);
-        if attempt > 1
+        if round > 1
             && let Some(sender) = ui.events.as_ref()
         {
             let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Discovering));
             let _ = sender.send(PeerlineEvent::Message(format!(
-                "retrying send attempt {attempt}"
+                "retrying send round {round}"
             )));
         }
 
-        match named_send_attempt(
-            &name,
-            &code,
-            &paths,
-            compression,
-            discovery.clone(),
-            ui.events.clone(),
+        match named_send_with_retries(
+            NamedSendPlan {
+                name: name.clone(),
+                code: code.clone(),
+                source_id,
+                paths: paths.clone(),
+                compression,
+                discovery: discovery.clone(),
+                events: ui.events.clone(),
+                retry_attempts,
+            },
             &mut ui.quit_rx,
         )
         .await
@@ -461,7 +467,9 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
             Err(error) => {
                 if let Some(sender) = ui.events.as_ref() {
                     let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
-                        format!("{error}; press r to retry or q to quit"),
+                        format!(
+                            "failed after {retry_attempts} attempt(s): {error}; press r to retry or q to quit"
+                        ),
                     )));
                 } else {
                     return Err(error);
@@ -469,7 +477,7 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
 
                 match wait_for_retry_or_quit(&mut ui.quit_rx, &mut ui.retry_rx).await {
                     RetryDecision::Retry => {
-                        attempt += 1;
+                        round += 1;
                         continue;
                     }
                     RetryDecision::Quit => {
@@ -484,24 +492,141 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
     }
 }
 
-async fn named_send_attempt(
-    name: &HumanName,
-    code: &HumanCode,
-    paths: &[PathBuf],
+async fn direct_send_with_retries(
+    target: DirectTarget,
+    code: HumanCode,
+    source_id: NodeId,
+    paths: Vec<PathBuf>,
+    compression: Compression,
+    retry_attempts: usize,
+    events: Option<mpsc::UnboundedSender<PeerlineEvent>>,
+) -> anyhow::Result<peerline_net::SentTransfer> {
+    emit_send_message(&events, "building archive from selected paths");
+    let archive = peerline_transfer::create_archive(&paths, compression)?;
+    let transfer_id = TransferId::random();
+    let mut last_error = None;
+
+    for attempt in 1..=retry_attempts {
+        if attempt > 1 {
+            let delay = retry_delay(attempt);
+            emit_send_message(
+                &events,
+                format!(
+                    "retrying attempt {attempt}/{retry_attempts} in {}",
+                    format_duration(delay)
+                ),
+            );
+            tokio::time::sleep(delay).await;
+        }
+
+        let result = match target {
+            DirectTarget::Exact(endpoint) => {
+                peerline_net::send_prebuilt_direct(
+                    SendOptions {
+                        endpoint,
+                        name: None,
+                        code: code.clone(),
+                        source_id,
+                        paths: paths.clone(),
+                        compression,
+                        events: events.clone(),
+                    },
+                    clone_archive(&archive)?,
+                    transfer_id,
+                )
+                .await
+            }
+            DirectTarget::Ip(ip) => {
+                peerline_net::send_prebuilt_direct_probe(
+                    SendOptions {
+                        endpoint: SocketAddr::new(ip, DEFAULT_DIRECT_PORT),
+                        name: None,
+                        code: code.clone(),
+                        source_id,
+                        paths: paths.clone(),
+                        compression,
+                        events: events.clone(),
+                    },
+                    clone_archive(&archive)?,
+                    transfer_id,
+                )
+                .await
+            }
+        };
+
+        match result {
+            Ok(sent) => return Ok(sent),
+            Err(error) if is_fatal_error(&error) => return Err(error),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("send failed without an error")))
+}
+
+struct NamedSendPlan {
+    name: HumanName,
+    code: HumanCode,
+    source_id: NodeId,
+    paths: Vec<PathBuf>,
     compression: Compression,
     discovery: peerline_net::DiscoveryConfig,
     events: Option<mpsc::UnboundedSender<PeerlineEvent>>,
+    retry_attempts: usize,
+}
+
+async fn named_send_with_retries(
+    plan: NamedSendPlan,
+    quit_rx: &mut Option<watch::Receiver<bool>>,
+) -> anyhow::Result<TaskOutcome<peerline_net::SentTransfer>> {
+    emit_send_message(&plan.events, "building archive from selected paths");
+    let archive = peerline_transfer::create_archive(&plan.paths, plan.compression)?;
+    let transfer_id = TransferId::random();
+    let mut last_error = None;
+
+    for attempt in 1..=plan.retry_attempts {
+        if attempt > 1 {
+            let delay = retry_delay(attempt);
+            emit_send_message(
+                &plan.events,
+                format!(
+                    "retrying attempt {attempt}/{} in {}",
+                    plan.retry_attempts,
+                    format_duration(delay)
+                ),
+            );
+            tokio::time::sleep(delay).await;
+        }
+
+        match named_send_attempt(&plan, clone_archive(&archive)?, transfer_id, quit_rx).await {
+            Ok(TaskOutcome::Completed(sent)) => return Ok(TaskOutcome::Completed(sent)),
+            Ok(TaskOutcome::Quit) => return Ok(TaskOutcome::Quit),
+            Err(error) if is_fatal_error(&error) => return Err(error),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("send failed without an error")))
+}
+
+async fn named_send_attempt(
+    plan: &NamedSendPlan,
+    archive: peerline_transfer::Archive,
+    transfer_id: TransferId,
     quit_rx: &mut Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<TaskOutcome<peerline_net::SentTransfer>> {
     let candidates = loop {
-        tracing::info!(peer = %name, "discovering routes through rendezvous, DHT, and mDNS");
-        let discovery_future =
-            peerline_net::discovery::discover_peer_candidates(name, code, discovery.clone());
+        tracing::info!(peer = %plan.name, "discovering routes through rendezvous, DHT, and mDNS");
+        let discovery_future = peerline_net::discovery::discover_peer_candidates(
+            &plan.name,
+            &plan.code,
+            plan.discovery.clone(),
+        );
         match wait_with_quit(discovery_future, quit_rx).await {
             Ok(TaskOutcome::Completed(candidates)) if !candidates.is_empty() => break candidates,
             Ok(TaskOutcome::Completed(_)) => {
                 tracing::error!(
-                    peer = %name,
+                    peer = %plan.name,
                     "could not discover a route yet; still searching"
                 );
             }
@@ -516,11 +641,11 @@ async fn named_send_attempt(
 
     let mut last_error = None;
     for candidate in candidates {
-        if !route_allowed(&candidate.route, discovery.allow_relay_data_fallback) {
+        if !route_allowed(&candidate.route, plan.discovery.allow_relay_data_fallback) {
             continue;
         }
 
-        if let Some(sender) = events.as_ref() {
+        if let Some(sender) = plan.events.as_ref() {
             let _ = sender.send(PeerlineEvent::Message(format!(
                 "trying {} via {}",
                 candidate.peer_id,
@@ -528,7 +653,7 @@ async fn named_send_attempt(
             )));
         }
 
-        let attempt = send_candidate(&candidate, name, code, paths, compression, events.clone());
+        let attempt = send_candidate(&candidate, plan, clone_archive(&archive)?, transfer_id);
 
         match wait_with_quit(attempt, quit_rx).await {
             Ok(TaskOutcome::Completed(sent)) => {
@@ -538,7 +663,7 @@ async fn named_send_attempt(
                 return Ok(TaskOutcome::Quit);
             }
             Err(error) => {
-                if let Some(sender) = events.as_ref() {
+                if let Some(sender) = plan.events.as_ref() {
                     let _ = sender.send(PeerlineEvent::Message(error.to_string()));
                 }
                 last_error = Some(error);
@@ -550,17 +675,16 @@ async fn named_send_attempt(
         .map(|error| error.to_string())
         .unwrap_or_else(|| "no usable endpoint".into());
     Err(anyhow::anyhow!(
-        "discovered {name}, but all routes failed: {error}"
+        "discovered {}, but all routes failed: {error}",
+        plan.name
     ))
 }
 
 async fn send_candidate(
     candidate: &Candidate,
-    name: &HumanName,
-    code: &HumanCode,
-    paths: &[PathBuf],
-    compression: Compression,
-    events: Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
+    plan: &NamedSendPlan,
+    archive: peerline_transfer::Archive,
+    transfer_id: TransferId,
 ) -> anyhow::Result<peerline_net::SentTransfer> {
     match candidate.route {
         RouteKind::LanDirect | RouteKind::PublicDirect => {
@@ -569,14 +693,19 @@ async fn send_candidate(
                 .first()
                 .and_then(|address| parse_ip_endpoint(address))
                 .ok_or_else(|| anyhow::anyhow!("direct candidate missing socket endpoint"))?;
-            peerline_net::send_direct(SendOptions {
-                endpoint,
-                name: Some(name.clone()),
-                code: code.clone(),
-                paths: paths.to_vec(),
-                compression,
-                events,
-            })
+            peerline_net::send_prebuilt_direct(
+                SendOptions {
+                    endpoint,
+                    name: Some(plan.name.clone()),
+                    code: plan.code.clone(),
+                    source_id: plan.source_id,
+                    paths: plan.paths.clone(),
+                    compression: plan.compression,
+                    events: plan.events.clone(),
+                },
+                archive,
+                transfer_id,
+            )
             .await
         }
         RouteKind::Libp2pDcutr | RouteKind::WebRtcTurn | RouteKind::Libp2pRelay => {
@@ -589,19 +718,75 @@ async fn send_candidate(
             if addresses.is_empty() {
                 anyhow::bail!("libp2p candidate missing multiaddr");
             }
-            peerline_net::send_libp2p(Libp2pSendOptions {
-                peer_id,
-                addresses,
-                name: name.clone(),
-                code: code.clone(),
-                paths: paths.to_vec(),
-                compression,
-                route: candidate.route.connection_route(),
-                events,
-            })
+            peerline_net::send_prebuilt_libp2p(
+                Libp2pSendOptions {
+                    peer_id,
+                    addresses,
+                    name: plan.name.clone(),
+                    code: plan.code.clone(),
+                    source_id: plan.source_id,
+                    paths: plan.paths.clone(),
+                    compression: plan.compression,
+                    route: candidate.route.connection_route(),
+                    events: plan.events.clone(),
+                },
+                archive,
+                transfer_id,
+            )
             .await
         }
     }
+}
+
+fn clone_archive(
+    archive: &peerline_transfer::Archive,
+) -> anyhow::Result<peerline_transfer::Archive> {
+    peerline_transfer::Archive::from_existing(
+        archive.manifest.clone(),
+        archive.compression,
+        archive.resource_id,
+        archive.reader()?,
+        archive.len(),
+    )
+}
+
+fn emit_send_message(
+    events: &Option<mpsc::UnboundedSender<PeerlineEvent>>,
+    message: impl Into<String>,
+) {
+    if let Some(sender) = events {
+        let _ = sender.send(PeerlineEvent::Message(message.into()));
+    }
+}
+
+fn retry_delay(attempt: usize) -> Duration {
+    let base_ms = match attempt {
+        0 | 1 => 0,
+        2 => 500,
+        3 => 1_000,
+        4 => 2_000,
+        5 => 4_000,
+        _ => 8_000,
+    };
+    let jitter_ms = (base_ms as f64 * 0.2) as i64;
+    if jitter_ms <= 0 {
+        return Duration::from_millis(base_ms);
+    }
+    let delta = rand::thread_rng().gen_range(-jitter_ms..=jitter_ms);
+    let adjusted = (base_ms as i64 + delta).max(0) as u64;
+    Duration::from_millis(adjusted)
+}
+
+fn is_fatal_error(error: &anyhow::Error) -> bool {
+    if let Some(transfer_error) = error.downcast_ref::<peerline_net::direct::TransferError>() {
+        return transfer_error.kind() == peerline_net::direct::TransferErrorKind::Fatal;
+    }
+    let message = error.to_string();
+    message.contains("receiver name mismatch")
+        || message.contains("incompatible peerline protocol version")
+        || message.contains("authentication")
+        || message.contains("hash mismatch")
+        || message.contains("protocol version")
 }
 
 fn route_label(route: &RouteKind) -> &'static str {
@@ -728,6 +913,7 @@ mod tests {
             code: Some("rose-lime-iris-jade-1234".into()),
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(direct_endpoint_arg(&args).is_none());
 
@@ -743,6 +929,7 @@ mod tests {
             code: Some("rose-lime-iris-jade-1234".into()),
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(matches!(
             direct_endpoint_arg(&ip_only),
@@ -755,6 +942,7 @@ mod tests {
             code: Some("rose-lime-iris-jade-1234".into()),
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(matches!(
             direct_endpoint_arg(&ip_port),
@@ -770,6 +958,7 @@ mod tests {
             code: None,
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(resolve_named_send(name_only).is_err());
 
@@ -779,6 +968,7 @@ mod tests {
             code: Some("rose-lime-iris-jade-1234".into()),
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(resolve_named_send(code_only).is_err());
     }
@@ -788,6 +978,34 @@ mod tests {
         assert!(!route_allowed(&RouteKind::Libp2pRelay, false));
         assert!(route_allowed(&RouteKind::Libp2pRelay, true));
         assert!(route_allowed(&RouteKind::Libp2pDcutr, false));
+    }
+
+    #[test]
+    fn retry_attempts_must_be_positive() {
+        assert!(parse_retry_attempts("0").is_err());
+        assert_eq!(parse_retry_attempts("1").unwrap(), 1);
+        assert_eq!(parse_retry_attempts("5").unwrap(), 5);
+    }
+
+    #[test]
+    fn retry_delay_caps_at_eight_seconds() {
+        assert_eq!(retry_delay(1), Duration::from_millis(0));
+        assert!(retry_delay(2) <= Duration::from_millis(600));
+        assert!(retry_delay(5) <= Duration::from_millis(4_800));
+        assert!(retry_delay(6) <= Duration::from_millis(9_600));
+    }
+
+    #[test]
+    fn fatal_error_detection_matches_protocol_and_auth_failures() {
+        assert!(is_fatal_error(&anyhow::anyhow!("receiver name mismatch")));
+        assert!(is_fatal_error(&anyhow::anyhow!(
+            "incompatible peerline protocol version 1; expected 2"
+        )));
+        assert!(is_fatal_error(&anyhow::anyhow!("authentication failed")));
+        assert!(is_fatal_error(&anyhow::anyhow!("hash mismatch")));
+        assert!(!is_fatal_error(&anyhow::anyhow!(
+            "connection reset by peer"
+        )));
     }
 
     #[test]
