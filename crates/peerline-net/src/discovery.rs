@@ -9,7 +9,7 @@ use crate::rendezvous::{self, RendezvousConfig};
 use endpoints::LocalDirectNetworks;
 use futures::StreamExt;
 use peerline_core::{ConnectionRoute, HumanCode, HumanName, LookupKey, NameCode};
-use peerline_rendezvous_model::PeerDescriptor;
+use peerline_rendezvous_model::{PeerDescriptor, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
 use snapshot::DiscoverySnapshot;
 use std::{
@@ -103,13 +103,12 @@ pub fn descriptor_record_key(lookup_key: &LookupKey) -> libp2p::kad::RecordKey {
 }
 
 pub(crate) fn make_peer_descriptor(
-    protocol_version: u16,
     peer_id: impl Into<String>,
     direct_endpoints: Vec<String>,
     libp2p_endpoints: Vec<String>,
 ) -> PeerDescriptor {
     PeerDescriptor {
-        protocol_version,
+        protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
         peer_id: peer_id.into(),
         direct_endpoints,
         libp2p_endpoints,

@@ -1,8 +1,5 @@
 use super::{Libp2pRecvOptions, behaviour::TransferBehaviour};
-use crate::{
-    discovery::{direct_endpoints, make_peer_descriptor},
-    protocol::PROTOCOL_VERSION,
-};
+use crate::discovery::{direct_endpoints, make_peer_descriptor};
 use libp2p::{Swarm, kad};
 use peerline_rendezvous_model::PeerDescriptor;
 
@@ -13,7 +10,6 @@ pub(crate) fn publish_receiver_descriptor(
     options: &Libp2pRecvOptions,
 ) -> anyhow::Result<PeerDescriptor> {
     let descriptor = make_peer_descriptor(
-        PROTOCOL_VERSION,
         swarm.local_peer_id().to_string(),
         direct_endpoints(
             options.direct_bind,

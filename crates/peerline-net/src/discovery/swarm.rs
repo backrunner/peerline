@@ -68,7 +68,6 @@ pub(super) fn publish_descriptor(
     allow_loopback: bool,
 ) -> anyhow::Result<PeerDescriptor> {
     let descriptor = make_peer_descriptor(
-        1,
         swarm.local_peer_id().to_string(),
         direct_endpoints(direct_bind, allow_loopback)
             .into_iter()

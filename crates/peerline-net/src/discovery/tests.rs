@@ -10,7 +10,7 @@ use super::{
 };
 use libp2p::{Multiaddr, PeerId};
 use peerline_core::{HumanCode, HumanName, NameCode};
-use peerline_rendezvous_model::PeerDescriptor;
+use peerline_rendezvous_model::{PeerDescriptor, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION};
 use std::net::{IpAddr, Ipv4Addr};
 
 #[test]
@@ -78,7 +78,7 @@ fn dht_publish_and_discovery_keys_use_the_same_lookup_key() {
 #[test]
 fn descriptor_candidates_never_rank_loopback_first() {
     let descriptor = PeerDescriptor {
-        protocol_version: 1,
+        protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
         peer_id: "peer".into(),
         direct_endpoints: vec![
             "127.0.0.1:43117".into(),
@@ -167,7 +167,7 @@ fn diversity_floor_requires_observed_peers_and_descriptor() {
     let local_peer = PeerId::random();
     snapshot.observe_local_peer(local_peer);
     snapshot.insert_descriptor(PeerDescriptor {
-        protocol_version: 1,
+        protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
         peer_id: local_peer.to_string(),
         direct_endpoints: vec!["192.168.1.20:43117".into()],
         libp2p_endpoints: vec![],
@@ -179,7 +179,7 @@ fn diversity_floor_requires_observed_peers_and_descriptor() {
 #[test]
 fn discovered_lan_candidates_require_matching_local_network() {
     let descriptor = PeerDescriptor {
-        protocol_version: 1,
+        protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
         peer_id: "peer".into(),
         direct_endpoints: vec![
             "192.168.1.20:43117".into(),
@@ -208,7 +208,7 @@ fn discovered_lan_candidates_require_matching_local_network() {
 #[test]
 fn remote_loopback_direct_candidates_are_not_discovered() {
     let descriptor = PeerDescriptor {
-        protocol_version: 1,
+        protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
         peer_id: "peer".into(),
         direct_endpoints: vec!["127.0.0.1:43117".into(), "10.10.0.8:43117".into()],
         libp2p_endpoints: vec![],
@@ -229,7 +229,7 @@ fn mdns_observed_peers_keep_unverified_lan_candidates() {
     let peer = PeerId::random();
     snapshot.observe_local_peer(peer);
     snapshot.insert_descriptor(PeerDescriptor {
-        protocol_version: 1,
+        protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
         peer_id: peer.to_string(),
         direct_endpoints: vec!["192.168.50.20:43117".into()],
         libp2p_endpoints: vec![],
@@ -250,7 +250,7 @@ fn empty_descriptors_do_not_count_as_usable_candidates() {
     let peer = PeerId::random();
     snapshot.observe_local_peer(peer);
     snapshot.insert_descriptor(PeerDescriptor {
-        protocol_version: 1,
+        protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
         peer_id: peer.to_string(),
         direct_endpoints: vec![],
         libp2p_endpoints: vec![],
@@ -265,7 +265,7 @@ fn empty_descriptors_do_not_count_as_usable_candidates() {
 fn invalid_peer_ids_are_ignored_during_discovery() {
     let mut snapshot = DiscoverySnapshot::new();
     snapshot.insert_descriptor(PeerDescriptor {
-        protocol_version: 1,
+        protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
         peer_id: "not-a-peer-id".into(),
         direct_endpoints: vec!["192.168.1.20:43117".into()],
         libp2p_endpoints: vec![],
@@ -282,7 +282,7 @@ fn future_timestamps_are_clamped_during_discovery() {
     let peer = PeerId::random();
     let before = now_unix_ms();
     snapshot.insert_descriptor(PeerDescriptor {
-        protocol_version: 1,
+        protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
         peer_id: peer.to_string(),
         direct_endpoints: vec!["192.168.1.20:43117".into()],
         libp2p_endpoints: vec![],

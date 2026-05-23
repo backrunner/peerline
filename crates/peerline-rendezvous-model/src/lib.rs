@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 pub const HEADER_TIMESTAMP: &str = "x-peerline-timestamp";
 pub const HEADER_SIGNATURE: &str = "x-peerline-signature";
 pub const HEADER_VERSION: &str = "x-peerline-version";
+/// Schema version for rendezvous `PeerDescriptor` records.
+///
+/// This is independent from the transfer protocol version used by direct and
+/// libp2p sessions.
+pub const RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerDescriptor {

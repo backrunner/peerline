@@ -1,5 +1,6 @@
 use peerline_rendezvous_model::{
-    HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_VERSION, PeerDescriptor, RendezvousDiscoverRequest,
+    HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_VERSION, PeerDescriptor,
+    RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION, RendezvousDiscoverRequest,
     RendezvousDiscoverResponse, RendezvousRecord, RendezvousRegisterRequest,
     RendezvousRegisterResponse, RendezvousUnregisterResponse, request_path_and_query,
     verify_peerline_request_signature,
@@ -18,7 +19,8 @@ const REQUIRE_MTLS_BINDING: &str = "PEERLINE_RENDEZVOUS_REQUIRE_MTLS";
 const CLIENT_CERT_FINGERPRINTS_BINDING: &str =
     "PEERLINE_RENDEZVOUS_ALLOWED_CLIENT_CERT_FINGERPRINTS";
 
-const DESCRIPTOR_PROTOCOL_VERSION: u16 = 1;
+// v0.1.0-beta.1 clients accidentally used the transfer protocol version here.
+const LEGACY_TRANSFER_DESCRIPTOR_PROTOCOL_VERSION: u16 = 2;
 const DEFAULT_MAX_TTL_SECS: u32 = 180;
 const DEFAULT_DISCOVER_LIMIT: u32 = 32;
 const MAX_DISCOVER_LIMIT: u32 = 128;
@@ -279,6 +281,7 @@ impl RendezvousShard {
         self.cleanup_expired(now)?;
 
         let mut descriptor = request.descriptor;
+        descriptor.protocol_version = RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION;
         descriptor.published_unix_ms = now as u64;
         let peer_id = descriptor.peer_id.clone();
         let direct_endpoint_count = descriptor.direct_endpoints.len();
@@ -865,7 +868,9 @@ fn install_schema(sql: &SqlStorage) -> Result<()> {
 }
 
 fn validate_descriptor(descriptor: &PeerDescriptor) -> std::result::Result<(), Rejection> {
-    if descriptor.protocol_version != DESCRIPTOR_PROTOCOL_VERSION {
+    if descriptor.protocol_version != RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION
+        && descriptor.protocol_version != LEGACY_TRANSFER_DESCRIPTOR_PROTOCOL_VERSION
+    {
         return Err(Rejection::new(
             "unsupported descriptor protocol version",
             400,
@@ -1072,6 +1077,18 @@ mod tests {
     }
 
     #[test]
+    fn accepts_current_and_legacy_descriptor_protocol_versions() {
+        let mut descriptor = valid_descriptor();
+        assert!(validate_descriptor(&descriptor).is_ok());
+
+        descriptor.protocol_version = LEGACY_TRANSFER_DESCRIPTOR_PROTOCOL_VERSION;
+        assert!(validate_descriptor(&descriptor).is_ok());
+
+        descriptor.protocol_version = LEGACY_TRANSFER_DESCRIPTOR_PROTOCOL_VERSION + 1;
+        assert!(validate_descriptor(&descriptor).is_err());
+    }
+
+    #[test]
     fn rejects_discover_cursors_outside_sqlite_integer_range() {
         assert_eq!(sqlite_cookie(0), Some(0));
         assert_eq!(sqlite_cookie(i64::MAX as u64), Some(i64::MAX));
@@ -1092,5 +1109,15 @@ mod tests {
                 .len(),
             MAX_REQUEST_ID_LEN
         );
+    }
+
+    fn valid_descriptor() -> PeerDescriptor {
+        PeerDescriptor {
+            protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
+            peer_id: "12D3KooWJ6cigH96Q8ngveZkSjcVcs4ehcrgK9tSbMgCtwuvmn7T".into(),
+            direct_endpoints: vec!["192.168.1.20:43117".into()],
+            libp2p_endpoints: Vec::new(),
+            published_unix_ms: 0,
+        }
     }
 }
