@@ -76,9 +76,9 @@ impl HumanCode {
         let mut rng = rand::thread_rng();
         let first = random_word(&mut rng);
         let second = random_word(&mut rng);
-        let first_number: u16 = rng.gen_range(1000..=9999);
-        let second_number: u16 = rng.gen_range(1000..=9999);
-        Self(format!("{first}-{second}-{first_number}-{second_number}"))
+        let third = random_word(&mut rng);
+        let number: u32 = rng.gen_range(100_000..=999_999);
+        Self(format!("{first}-{second}-{third}-{number}"))
     }
 
     pub fn as_str(&self) -> &str {
@@ -249,9 +249,8 @@ mod tests {
         assert_eq!(parts.len(), 4, "{code}");
         assert!(parts[0].chars().all(|ch| ch.is_ascii_lowercase()));
         assert!(parts[1].chars().all(|ch| ch.is_ascii_lowercase()));
-        assert_eq!(parts[2].len(), 4, "{code}");
-        assert_eq!(parts[3].len(), 4, "{code}");
-        assert!(parts[2].chars().all(|ch| ch.is_ascii_digit()));
+        assert!(parts[2].chars().all(|ch| ch.is_ascii_lowercase()));
+        assert_eq!(parts[3].len(), 6, "{code}");
         assert!(parts[3].chars().all(|ch| ch.is_ascii_digit()));
         assert!(code.entropy_bits_estimate() >= 40.0, "{code}");
     }

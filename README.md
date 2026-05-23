@@ -74,7 +74,7 @@ The receiver prints values like:
 ```text
 peerline recv
 name: frost-827
-code: fig-mint-1234-5678
+code: fig-mint-rose-123456
 direct: 0.0.0.0:43117
 waiting for transfers over direct TCP or libp2p...
 idle timeout: 10 min (change with --idle-timeout-minutes)
@@ -83,8 +83,8 @@ idle timeout: 10 min (change with --idle-timeout-minutes)
 Send a file, multiple files, or a folder by name and code:
 
 ```sh
-peerline send frost-827 fig-mint-1234-5678 ./file.txt
-peerline send frost-827 fig-mint-1234-5678 ./file.txt ./notes.md ./photos
+peerline send frost-827 fig-mint-rose-123456 ./file.txt
+peerline send frost-827 fig-mint-rose-123456 ./file.txt ./notes.md ./photos
 ```
 
 Receive with a saved name:
@@ -97,14 +97,14 @@ peerline recv
 After a name is saved, you can receive with only a fresh code:
 
 ```sh
-peerline recv fig-mint-1234-5678
+peerline recv fig-mint-rose-123456
 ```
 
 Use a direct IP address when discovery is not needed:
 
 ```sh
-peerline send 192.168.1.23:43117 ./file.txt --code=fig-mint-1234-5678
-peerline send 192.168.1.23 ./folder --code=fig-mint-1234-5678
+peerline send 192.168.1.23:43117 ./file.txt --code=fig-mint-rose-123456
+peerline send 192.168.1.23 ./folder --code=fig-mint-rose-123456
 ```
 
 When the port is omitted, Peerline probes the default direct window `43117-43121`.
