@@ -155,31 +155,41 @@ fn default_bootstrap_peers_are_configured_for_public_dht() {
 }
 
 #[test]
-fn default_webrtc_ice_servers_include_open_relay_turn_candidates() {
+fn default_webrtc_ice_servers_include_stun_and_turn_candidates() {
     let servers = default_webrtc_ice_servers();
-    assert_eq!(servers.len(), 1);
+    assert_eq!(servers.len(), 2);
 
-    let server = &servers[0];
-    assert!(server.username.parse::<u64>().is_ok());
-    assert!(!server.credential.is_empty());
+    let stun = &servers[0];
+    assert!(stun.username.is_empty());
+    assert!(stun.credential.is_empty());
+    assert_eq!(
+        stun.urls,
+        vec![
+            String::from("stun:stun.l.google.com:19302"),
+            String::from("stun:stun1.l.google.com:19302"),
+            String::from("stun:stun2.l.google.com:19302"),
+            String::from("stun:stun3.l.google.com:19302"),
+            String::from("stun:stun4.l.google.com:19302"),
+        ]
+    );
+
+    let turn = &servers[1];
+    assert!(turn.username.parse::<u64>().is_ok());
+    assert!(!turn.credential.is_empty());
     assert!(
-        server
-            .urls
+        turn.urls
             .contains(&"turn:staticauth.openrelay.metered.ca:80?transport=udp".into())
     );
     assert!(
-        server
-            .urls
+        turn.urls
             .contains(&"turn:staticauth.openrelay.metered.ca:443?transport=udp".into())
     );
     assert!(
-        server
-            .urls
+        turn.urls
             .contains(&"turn:staticauth.openrelay.metered.ca:443?transport=tcp".into())
     );
     assert!(
-        server
-            .urls
+        turn.urls
             .contains(&"turns:staticauth.openrelay.metered.ca:443?transport=tcp".into())
     );
 }

@@ -109,11 +109,27 @@ impl Default for DiscoveryConfig {
 }
 
 pub fn default_webrtc_ice_servers() -> Vec<WebRtcIceServer> {
-    static_auth_turn_servers(
+    let mut servers = vec![google_stun_servers()];
+    servers.extend(static_auth_turn_servers(
         "staticauth.openrelay.metered.ca",
         "openrelayprojectsecret",
         Duration::from_secs(24 * 60 * 60),
-    )
+    ));
+    servers
+}
+
+fn google_stun_servers() -> WebRtcIceServer {
+    WebRtcIceServer {
+        urls: vec![
+            "stun:stun.l.google.com:19302".into(),
+            "stun:stun1.l.google.com:19302".into(),
+            "stun:stun2.l.google.com:19302".into(),
+            "stun:stun3.l.google.com:19302".into(),
+            "stun:stun4.l.google.com:19302".into(),
+        ],
+        username: String::new(),
+        credential: String::new(),
+    }
 }
 
 fn static_auth_turn_servers(host: &str, secret: &str, ttl: Duration) -> Vec<WebRtcIceServer> {
