@@ -152,6 +152,7 @@ async fn recv_ws_bound(
 ) -> anyhow::Result<crate::direct::ReceivedTransfer> {
     loop {
         let (stream, peer) = listener.accept().await?;
+        #[allow(clippy::result_large_err)]
         let accept = |req: &Request, response: Response| {
             tracing::debug!(path = %req.uri().path(), route = log_label, "accepted websocket bridge");
             Ok(response)

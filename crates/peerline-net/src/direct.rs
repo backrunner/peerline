@@ -457,12 +457,12 @@ fn direct_natpmp_pcp_gateway_and_local_endpoint(
             .ipv4
             .iter()
             .map(|net| IpAddr::V4(net.addr))
-            .find(|ip| is_usable_mapping_ip(ip)),
+            .find(is_usable_mapping_ip),
         IpAddr::V6(_) => interface
             .ipv6
             .iter()
             .map(|net| IpAddr::V6(net.addr))
-            .find(|ip| is_usable_mapping_ip(ip)),
+            .find(is_usable_mapping_ip),
     };
 
     let Some(local_ip) = local_ip else {

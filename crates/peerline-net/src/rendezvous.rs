@@ -854,14 +854,11 @@ mod tests {
     fn decode_chunked_body(bytes: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
         let mut index = 0usize;
-        loop {
-            let Some(line_end) = bytes[index..]
-                .windows(2)
-                .position(|window| window == b"\r\n")
-                .map(|position| index + position)
-            else {
-                break;
-            };
+        while let Some(line_end) = bytes[index..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|position| index + position)
+        {
             let line = String::from_utf8_lossy(&bytes[index..line_end]);
             let size = usize::from_str_radix(line.trim(), 16).unwrap_or_default();
             index = line_end + 2;

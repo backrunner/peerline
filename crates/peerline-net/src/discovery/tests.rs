@@ -396,15 +396,17 @@ fn future_timestamps_are_clamped_during_discovery() {
 
 #[test]
 fn discovery_flags_gate_expected_routes() {
-    let mut config = DiscoveryConfig::default();
-    config.enable_upnp = false;
-    config.enable_natpmp_pcp = false;
-    config.enable_quic = false;
-    config.enable_dcutr = false;
-    config.enable_turn = false;
-    config.enable_public_tunnels = false;
-    config.enable_tor = false;
-    config.allow_relay_data_fallback = false;
+    let config = DiscoveryConfig {
+        enable_upnp: false,
+        enable_natpmp_pcp: false,
+        enable_quic: false,
+        enable_dcutr: false,
+        enable_turn: false,
+        enable_public_tunnels: false,
+        enable_tor: false,
+        allow_relay_data_fallback: false,
+        ..Default::default()
+    };
 
     assert!(!config.port_mapping_enabled());
     assert!(config.route_enabled(&RouteKind::LanDirect));
@@ -431,9 +433,11 @@ fn discovery_grace_waits_for_route_diversity_including_webrtc() {
         tor_endpoints: vec![],
         published_unix_ms: 1,
     };
-    let mut config = DiscoveryConfig::default();
-    config.enable_public_tunnels = false;
-    config.enable_tor = false;
+    let config = DiscoveryConfig {
+        enable_public_tunnels: false,
+        enable_tor: false,
+        ..Default::default()
+    };
 
     snapshot.insert_descriptor(descriptor.clone());
 

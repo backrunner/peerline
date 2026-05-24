@@ -102,7 +102,6 @@ impl DiscoverySnapshot {
     ) -> Vec<SocketAddr> {
         self.descriptors
             .values()
-            .cloned()
             .filter(|descriptor| {
                 let allow_unverified_lan = self.local_peer_ids.contains(&descriptor.peer_id);
                 !discovered_direct_endpoint_candidates(
@@ -112,6 +111,7 @@ impl DiscoverySnapshot {
                 )
                 .is_empty()
             })
+            .cloned()
             .max_by_key(|descriptor| {
                 let allow_unverified_lan = self.local_peer_ids.contains(&descriptor.peer_id);
                 (
