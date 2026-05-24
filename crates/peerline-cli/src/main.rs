@@ -10,20 +10,26 @@ use peerline_core::{
     HumanName, NodeId, PeerlineEvent, TransferId, TransferStage, parse_ip_endpoint,
 };
 use peerline_net::{
-    Candidate, Libp2pRecvOptions, Libp2pSendOptions, RecvOptions, RouteKind, SendOptions,
-    bind_direct_listener,
+    Candidate, Libp2pRecvOptions, Libp2pSendOptions, PublicTunnelEndpoint, PublicTunnelProvider,
+    RecvOptions, RouteKind, SendOptions, bind_direct_listener,
 };
 use rand::Rng;
 use std::{
-    io::IsTerminal,
+    io::{ErrorKind, IsTerminal},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
+    process::Stdio,
     time::Duration,
 };
 use terminal::{init_tracing, register_activity_log_sender, spawn_send_tui, spawn_terminal_ui};
-use tokio::sync::{mpsc, watch};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncRead, BufReader},
+    process::{Child, Command as TokioCommand},
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 use wait::{
-    RecvOutcome, RetryDecision, TaskOutcome, drain_retry_signals, format_duration,
+    ReceiverPath, RecvOutcome, RetryDecision, TaskOutcome, drain_retry_signals, format_duration,
     parse_idle_timeout_minutes, recv_idle_timeout, spawn_event_fanout, wait_for_receiver,
     wait_for_recv_activity, wait_for_retry_or_quit, wait_with_quit,
 };
@@ -67,6 +73,22 @@ struct RecvArgs {
     allow_relay_fallback: bool,
     #[arg(long)]
     no_relay_fallback: bool,
+    #[arg(long)]
+    no_upnp: bool,
+    #[arg(long)]
+    no_nat_pmp_pcp: bool,
+    #[arg(long)]
+    no_quic: bool,
+    #[arg(long)]
+    no_dcutr: bool,
+    #[arg(long)]
+    no_turn: bool,
+    #[arg(long, conflicts_with_all = ["localtunnel", "tmole"])]
+    cloudflared: bool,
+    #[arg(long, conflicts_with_all = ["cloudflared", "tmole"])]
+    localtunnel: bool,
+    #[arg(long, conflicts_with_all = ["cloudflared", "localtunnel"])]
+    tmole: bool,
     #[arg(
         long,
         default_value_t = DEFAULT_RECV_IDLE_TIMEOUT_MINUTES,
@@ -89,6 +111,16 @@ struct SendArgs {
     allow_relay_fallback: bool,
     #[arg(long)]
     no_relay_fallback: bool,
+    #[arg(long)]
+    no_upnp: bool,
+    #[arg(long)]
+    no_nat_pmp_pcp: bool,
+    #[arg(long)]
+    no_quic: bool,
+    #[arg(long)]
+    no_dcutr: bool,
+    #[arg(long)]
+    no_turn: bool,
     #[arg(long, default_value_t = DEFAULT_RETRY_ATTEMPTS, value_parser = parse_retry_attempts)]
     retry_attempts: usize,
 }
@@ -147,6 +179,8 @@ async fn main() -> anyhow::Result<()> {
 async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     let store = ConfigStore::user_default()?;
     let config = store.load()?;
+    let tunnel_provider = recv_public_tunnel_provider(&args);
+    let discovery = recv_discovery_config(&args);
     let (name, code) = resolve_recv_identity(config.name, args.first, args.second)?;
     let _node_id = store.node_id()?;
     let idle_timeout = recv_idle_timeout(args.idle_timeout_minutes);
@@ -160,7 +194,8 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     println!("code: {code}");
     println!("direct: {actual_bind}");
     println!(
-        "waiting for transfers over direct TCP, libp2p TCP/QUIC/WebRTC, and relay fallback..."
+        "waiting for transfers over {}...",
+        recv_route_status(&discovery, tunnel_provider)
     );
     match idle_timeout {
         Some(timeout) => println!(
@@ -180,7 +215,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
             name: name.clone(),
             code: code.clone(),
             bind: actual_bind.to_string(),
-            route_status: "direct TCP ready; libp2p DHT/mDNS/relay/WebRTC ready".into(),
+            route_status: recv_route_status(&discovery, tunnel_provider),
             stage: peerline_core::TransferStage::Discovering,
             progress: None,
         };
@@ -198,13 +233,22 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     if code.is_low_entropy() {
         tracing::warn!("code entropy looks low; generated codes are safer on public networks");
     }
-    let discovery = peerline_net::DiscoveryConfig {
-        allow_relay_data_fallback: relay_fallback_enabled(
-            args.allow_relay_fallback,
-            args.no_relay_fallback,
-        ),
-        ..Default::default()
+    let public_tunnel = match tunnel_provider {
+        Some(provider) => Some(start_public_tunnel(provider).await?),
+        None => None,
     };
+    let public_tunnel_endpoints = public_tunnel
+        .as_ref()
+        .map(|tunnel| vec![tunnel.endpoint.clone()])
+        .unwrap_or_default();
+    if let Some(tunnel) = public_tunnel.as_ref() {
+        println!(
+            "public tunnel: {} {} (local {})",
+            tunnel.provider.label(),
+            tunnel.endpoint.url,
+            tunnel.local_addr
+        );
+    }
 
     let mut transfers = 0usize;
     let mut files = 0usize;
@@ -214,29 +258,55 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
         let _ = network_events.send(PeerlineEvent::Message(
             "ready for the next transfer".to_string(),
         ));
-        let direct_fut = Box::pin(peerline_net::recv_once_bound(
-            &listener,
-            RecvOptions {
-                name: name.clone(),
-                code: code.clone(),
-                bind: actual_bind,
-                destination: destination.clone(),
-                overwrite: args.overwrite,
-                events: events.clone(),
-            },
-        ));
-        let libp2p_fut = Box::pin(peerline_net::recv_libp2p(Libp2pRecvOptions {
-            name: name.clone(),
-            code: code.clone(),
-            direct_bind: actual_bind,
-            destination: destination.clone(),
-            overwrite: args.overwrite,
-            discovery: discovery.clone(),
-            events: events.clone(),
-        }));
+        let mut receiver_paths = vec![
+            ReceiverPath::new(
+                "direct",
+                peerline_net::recv_once_bound(
+                    &listener,
+                    RecvOptions {
+                        name: name.clone(),
+                        code: code.clone(),
+                        bind: actual_bind,
+                        destination: destination.clone(),
+                        overwrite: args.overwrite,
+                        events: events.clone(),
+                    },
+                ),
+            ),
+            ReceiverPath::new(
+                "libp2p",
+                peerline_net::recv_libp2p(Libp2pRecvOptions {
+                    name: name.clone(),
+                    code: code.clone(),
+                    direct_bind: actual_bind,
+                    destination: destination.clone(),
+                    overwrite: args.overwrite,
+                    discovery: discovery.clone(),
+                    public_tunnel_endpoints: public_tunnel_endpoints.clone(),
+                    events: events.clone(),
+                }),
+            ),
+        ];
+        if let Some(tunnel) = public_tunnel.as_ref() {
+            receiver_paths.push(ReceiverPath::new(
+                "public-tunnel",
+                peerline_net::recv_public_tunnel_bound(
+                    &tunnel.listener,
+                    RecvOptions {
+                        name: name.clone(),
+                        code: code.clone(),
+                        bind: actual_bind,
+                        destination: destination.clone(),
+                        overwrite: args.overwrite,
+                        events: events.clone(),
+                    },
+                    tunnel.endpoint.url.clone(),
+                ),
+            ));
+        }
 
         match wait_for_recv_activity(
-            wait_for_receiver(direct_fut, libp2p_fut),
+            wait_for_receiver(receiver_paths),
             &mut quit_rx,
             &mut activity_rx,
             idle_timeout,
@@ -411,26 +481,24 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
     let retry_attempts = args.retry_attempts;
     let source_id = ConfigStore::user_default()?.node_id()?;
     let compression = args.compression.into();
-    let allow_relay_fallback =
-        relay_fallback_enabled(args.allow_relay_fallback, args.no_relay_fallback);
+    let discovery = send_discovery_config(&args);
     let (name, code, paths) = resolve_named_send(args)?;
     let mut ui = spawn_send_tui(
         "peer",
         name.to_string(),
         code.clone(),
-        "discovering routes through rendezvous, DHT, and mDNS...".into(),
+        send_route_status(&discovery),
         true,
     );
     if ui.events.is_none() {
-        println!("discovering {name} through rendezvous, DHT, and mDNS...");
+        println!(
+            "discovering {name} through {}",
+            send_route_status(&discovery)
+        );
     }
     if code.is_low_entropy() {
         tracing::warn!("code entropy looks low; generated codes are safer on public networks");
     }
-    let discovery = peerline_net::DiscoveryConfig {
-        allow_relay_data_fallback: allow_relay_fallback,
-        ..Default::default()
-    };
     let mut round = 1usize;
 
     loop {
@@ -654,7 +722,7 @@ async fn named_send_attempt(
     let mut attempts = FuturesUnordered::new();
     let mut queued_attempts = 0usize;
     for candidate in candidates {
-        if !route_allowed(&candidate.route, plan.discovery.allow_relay_data_fallback) {
+        if !route_allowed(&candidate.route, &plan.discovery) {
             continue;
         }
 
@@ -755,7 +823,33 @@ async fn send_candidate(
             )
             .await
         }
-        RouteKind::Libp2pDcutr | RouteKind::WebRtcDirect | RouteKind::Libp2pRelay => {
+        RouteKind::PublicTunnel => {
+            let endpoint = candidate
+                .addresses
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("public tunnel candidate missing URL"))?;
+            peerline_net::send_prebuilt_public_tunnel(
+                SendOptions {
+                    endpoint: "127.0.0.1:0".parse().expect("static endpoint"),
+                    name: Some(plan.name.clone()),
+                    code: plan.code.clone(),
+                    source_id: plan.source_id,
+                    paths: plan.paths.clone(),
+                    compression: plan.compression,
+                    events: plan.events.clone(),
+                },
+                archive,
+                transfer_id,
+                endpoint,
+            )
+            .await
+        }
+        RouteKind::Libp2pQuic
+        | RouteKind::Libp2pDcutr
+        | RouteKind::WebRtcDirect
+        | RouteKind::WebRtcTurn
+        | RouteKind::Libp2pRelay => {
             let peer_id = candidate.peer_id.parse::<libp2p::PeerId>()?;
             let addresses = candidate
                 .addresses
@@ -849,18 +943,343 @@ fn route_label(route: &RouteKind) -> &'static str {
     match route {
         RouteKind::LanDirect => "lan-direct",
         RouteKind::PublicDirect => "public-direct",
+        RouteKind::PublicTunnel => "public-tunnel",
+        RouteKind::Libp2pQuic => "libp2p-quic",
         RouteKind::Libp2pDcutr => "libp2p-dcutr",
         RouteKind::WebRtcDirect => "webrtc-direct",
+        RouteKind::WebRtcTurn => "webrtc-turn",
         RouteKind::Libp2pRelay => "libp2p-relay",
     }
 }
 
-fn route_allowed(route: &RouteKind, allow_relay_fallback: bool) -> bool {
-    !matches!(route, RouteKind::Libp2pRelay) || allow_relay_fallback
+fn route_allowed(route: &RouteKind, discovery: &peerline_net::DiscoveryConfig) -> bool {
+    discovery.route_enabled(route)
 }
 
 fn relay_fallback_enabled(allow_relay_fallback: bool, no_relay_fallback: bool) -> bool {
     allow_relay_fallback || !no_relay_fallback
+}
+
+fn recv_discovery_config(args: &RecvArgs) -> peerline_net::DiscoveryConfig {
+    let mut discovery = peerline_net::DiscoveryConfig {
+        allow_relay_data_fallback: relay_fallback_enabled(
+            args.allow_relay_fallback,
+            args.no_relay_fallback,
+        ),
+        ..Default::default()
+    };
+    apply_discovery_flags(
+        &mut discovery,
+        args.no_upnp,
+        args.no_nat_pmp_pcp,
+        args.no_quic,
+        args.no_dcutr,
+        args.no_turn,
+    );
+    discovery
+}
+
+fn send_discovery_config(args: &SendArgs) -> peerline_net::DiscoveryConfig {
+    let mut discovery = peerline_net::DiscoveryConfig {
+        allow_relay_data_fallback: relay_fallback_enabled(
+            args.allow_relay_fallback,
+            args.no_relay_fallback,
+        ),
+        ..Default::default()
+    };
+    apply_discovery_flags(
+        &mut discovery,
+        args.no_upnp,
+        args.no_nat_pmp_pcp,
+        args.no_quic,
+        args.no_dcutr,
+        args.no_turn,
+    );
+    discovery
+}
+
+fn apply_discovery_flags(
+    discovery: &mut peerline_net::DiscoveryConfig,
+    no_upnp: bool,
+    no_nat_pmp_pcp: bool,
+    no_quic: bool,
+    no_dcutr: bool,
+    no_turn: bool,
+) {
+    if no_upnp {
+        discovery.enable_upnp = false;
+    }
+    if no_nat_pmp_pcp {
+        discovery.enable_natpmp_pcp = false;
+    }
+    if no_quic {
+        discovery.enable_quic = false;
+    }
+    if no_dcutr {
+        discovery.enable_dcutr = false;
+    }
+    if no_turn {
+        discovery.enable_turn = false;
+    }
+    if !discovery.enable_turn {
+        discovery.webrtc_ice_servers =
+            peerline_net::without_turn_ice_servers(&discovery.webrtc_ice_servers);
+    }
+}
+
+fn recv_public_tunnel_provider(args: &RecvArgs) -> Option<PublicTunnelProvider> {
+    if args.cloudflared {
+        Some(PublicTunnelProvider::Cloudflared)
+    } else if args.localtunnel {
+        Some(PublicTunnelProvider::Localtunnel)
+    } else if args.tmole {
+        Some(PublicTunnelProvider::Tmole)
+    } else {
+        None
+    }
+}
+
+fn recv_route_status(
+    discovery: &peerline_net::DiscoveryConfig,
+    tunnel_provider: Option<PublicTunnelProvider>,
+) -> String {
+    let mut routes = vec!["direct TCP".to_string()];
+    if let Some(provider) = tunnel_provider {
+        routes.push(format!("{} public tunnel", provider.label()));
+    }
+    routes.push("libp2p TCP".into());
+    if discovery.enable_quic {
+        routes.push("libp2p QUIC".into());
+    }
+    if discovery.enable_dcutr {
+        routes.push("DCUtR".into());
+    }
+    routes.push(if discovery.enable_turn {
+        "WebRTC/TURN".into()
+    } else {
+        "WebRTC direct".into()
+    });
+    if discovery.allow_relay_data_fallback {
+        routes.push("relay fallback".into());
+    }
+    routes.join(", ")
+}
+
+fn send_route_status(discovery: &peerline_net::DiscoveryConfig) -> String {
+    let mut routes = vec!["rendezvous".to_string(), "DHT".into(), "mDNS".into()];
+    if discovery.enable_public_tunnels {
+        routes.push("public tunnel".into());
+    }
+    routes.push("direct TCP".into());
+    if discovery.enable_quic {
+        routes.push("QUIC".into());
+    }
+    if discovery.enable_dcutr {
+        routes.push("DCUtR".into());
+    }
+    routes.push(if discovery.enable_turn {
+        "WebRTC/TURN".into()
+    } else {
+        "WebRTC direct".into()
+    });
+    if discovery.allow_relay_data_fallback {
+        routes.push("relay fallback".into());
+    }
+    routes.join(", ")
+}
+
+struct RunningPublicTunnel {
+    provider: PublicTunnelProvider,
+    endpoint: PublicTunnelEndpoint,
+    listener: tokio::net::TcpListener,
+    local_addr: SocketAddr,
+    _process: TunnelProcess,
+}
+
+struct TunnelProcess {
+    child: Child,
+    readers: Vec<JoinHandle<()>>,
+}
+
+impl Drop for TunnelProcess {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+        for reader in &self.readers {
+            reader.abort();
+        }
+    }
+}
+
+async fn start_public_tunnel(
+    provider: PublicTunnelProvider,
+) -> anyhow::Result<RunningPublicTunnel> {
+    let (listener, local_addr) = peerline_net::bind_public_tunnel_listener().await?;
+    let (command, args, mut child) = spawn_public_tunnel_process(provider, local_addr.port())?;
+    tracing::info!(
+        provider = provider.label(),
+        command = %command,
+        args = ?args,
+        local = %local_addr,
+        "started public tunnel command"
+    );
+
+    let (url_tx, mut url_rx) = mpsc::unbounded_channel();
+    let mut readers = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        readers.push(spawn_tunnel_output_reader(
+            provider,
+            "stdout",
+            stdout,
+            url_tx.clone(),
+        ));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        readers.push(spawn_tunnel_output_reader(
+            provider, "stderr", stderr, url_tx,
+        ));
+    }
+
+    let url = match tokio::time::timeout(Duration::from_secs(45), url_rx.recv()).await {
+        Ok(Some(url)) => url,
+        Ok(None) => anyhow::bail!("{} did not report a public URL", provider.label()),
+        Err(_) => anyhow::bail!(
+            "{} did not report a public URL within 45 seconds",
+            provider.label()
+        ),
+    };
+    let endpoint = PublicTunnelEndpoint {
+        provider: provider.label().into(),
+        url,
+    };
+
+    Ok(RunningPublicTunnel {
+        provider,
+        endpoint,
+        listener,
+        local_addr,
+        _process: TunnelProcess { child, readers },
+    })
+}
+
+fn spawn_public_tunnel_process(
+    provider: PublicTunnelProvider,
+    port: u16,
+) -> anyhow::Result<(String, Vec<String>, Child)> {
+    let candidates = public_tunnel_command_candidates(provider, port);
+    let mut not_found = Vec::new();
+    for (command, args) in candidates {
+        let mut process = TokioCommand::new(&command);
+        process
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match process.spawn() {
+            Ok(child) => return Ok((command, args, child)),
+            Err(error) if error.kind() == ErrorKind::NotFound => not_found.push(command),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!(
+        "could not find {} tunnel command ({})",
+        provider.label(),
+        not_found.join(", ")
+    )
+}
+
+fn public_tunnel_command_candidates(
+    provider: PublicTunnelProvider,
+    port: u16,
+) -> Vec<(String, Vec<String>)> {
+    match provider {
+        PublicTunnelProvider::Cloudflared => vec![(
+            "cloudflared".into(),
+            vec![
+                "tunnel".into(),
+                "--url".into(),
+                format!("http://127.0.0.1:{port}"),
+            ],
+        )],
+        PublicTunnelProvider::Localtunnel => ["lt", "localtunnel"]
+            .into_iter()
+            .map(|command| {
+                (
+                    command.into(),
+                    vec![
+                        "--port".into(),
+                        port.to_string(),
+                        "--local-host".into(),
+                        "127.0.0.1".into(),
+                    ],
+                )
+            })
+            .collect(),
+        PublicTunnelProvider::Tmole => {
+            vec![("tmole".into(), vec![port.to_string()])]
+        }
+    }
+}
+
+fn spawn_tunnel_output_reader<R>(
+    provider: PublicTunnelProvider,
+    stream_name: &'static str,
+    reader: R,
+    url_sender: mpsc::UnboundedSender<String>,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    tracing::debug!(
+                        provider = provider.label(),
+                        stream = stream_name,
+                        line = %line,
+                        "public tunnel output"
+                    );
+                    if let Some(url) = extract_public_tunnel_url(&line) {
+                        let _ = url_sender.send(url);
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::debug!(%error, provider = provider.label(), stream = stream_name, "public tunnel output reader failed");
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn extract_public_tunnel_url(line: &str) -> Option<String> {
+    let mut fallback = None;
+    for token in line.split_whitespace() {
+        let Some(start) = token
+            .find("https://")
+            .or_else(|| token.find("http://"))
+            .or_else(|| token.find("wss://"))
+            .or_else(|| token.find("ws://"))
+        else {
+            continue;
+        };
+        let raw = token[start..].trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | '<' | '>' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+        });
+        let raw = raw.trim_end_matches('.');
+        let Ok(url) = peerline_net::normalize_public_tunnel_url(raw) else {
+            continue;
+        };
+        if url.starts_with("wss://") {
+            return Some(url);
+        }
+        fallback = Some(url);
+    }
+    fallback
 }
 
 fn set(args: SetArgs) -> anyhow::Result<()> {
@@ -974,6 +1393,11 @@ mod tests {
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
             no_relay_fallback: false,
+            no_upnp: false,
+            no_nat_pmp_pcp: false,
+            no_quic: false,
+            no_dcutr: false,
+            no_turn: false,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(direct_endpoint_arg(&args).is_none());
@@ -991,6 +1415,11 @@ mod tests {
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
             no_relay_fallback: false,
+            no_upnp: false,
+            no_nat_pmp_pcp: false,
+            no_quic: false,
+            no_dcutr: false,
+            no_turn: false,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(matches!(
@@ -1005,6 +1434,11 @@ mod tests {
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
             no_relay_fallback: false,
+            no_upnp: false,
+            no_nat_pmp_pcp: false,
+            no_quic: false,
+            no_dcutr: false,
+            no_turn: false,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(matches!(
@@ -1022,6 +1456,11 @@ mod tests {
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
             no_relay_fallback: false,
+            no_upnp: false,
+            no_nat_pmp_pcp: false,
+            no_quic: false,
+            no_dcutr: false,
+            no_turn: false,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(resolve_named_send(name_only).is_err());
@@ -1033,6 +1472,11 @@ mod tests {
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
             no_relay_fallback: false,
+            no_upnp: false,
+            no_nat_pmp_pcp: false,
+            no_quic: false,
+            no_dcutr: false,
+            no_turn: false,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(resolve_named_send(code_only).is_err());
@@ -1043,9 +1487,12 @@ mod tests {
         assert!(relay_fallback_enabled(false, false));
         assert!(!relay_fallback_enabled(false, true));
         assert!(relay_fallback_enabled(true, true));
-        assert!(!route_allowed(&RouteKind::Libp2pRelay, false));
-        assert!(route_allowed(&RouteKind::Libp2pRelay, true));
-        assert!(route_allowed(&RouteKind::Libp2pDcutr, false));
+        let enabled = peerline_net::DiscoveryConfig::default();
+        let mut disabled_relay = enabled.clone();
+        disabled_relay.allow_relay_data_fallback = false;
+        assert!(!route_allowed(&RouteKind::Libp2pRelay, &disabled_relay));
+        assert!(route_allowed(&RouteKind::Libp2pRelay, &enabled));
+        assert!(route_allowed(&RouteKind::Libp2pDcutr, &enabled));
     }
 
     #[test]

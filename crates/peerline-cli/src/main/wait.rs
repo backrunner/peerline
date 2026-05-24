@@ -1,3 +1,4 @@
+use futures::StreamExt;
 use peerline_core::{PeerlineEvent, TransferStage};
 use peerline_net::ReceivedTransfer;
 use std::{future::Future, pin::Pin, time::Duration};
@@ -218,47 +219,36 @@ pub(super) fn drain_retry_signals(retry_rx: &mut Option<mpsc::UnboundedReceiver<
     }
 }
 
-pub(super) async fn wait_for_receiver<D, L>(
-    mut direct_fut: Pin<Box<D>>,
-    mut libp2p_fut: Pin<Box<L>>,
-) -> anyhow::Result<ReceivedTransfer>
-where
-    D: Future<Output = anyhow::Result<ReceivedTransfer>>,
-    L: Future<Output = anyhow::Result<ReceivedTransfer>>,
-{
-    let mut direct_done = false;
-    let mut libp2p_done = false;
-    let mut last_error = None;
+pub(super) struct ReceiverPath<'a> {
+    future: Pin<Box<dyn Future<Output = (&'static str, anyhow::Result<ReceivedTransfer>)> + 'a>>,
+}
 
-    loop {
-        if direct_done && libp2p_done {
-            break;
+impl<'a> ReceiverPath<'a> {
+    pub(super) fn new<F>(label: &'static str, future: F) -> Self
+    where
+        F: Future<Output = anyhow::Result<ReceivedTransfer>> + 'a,
+    {
+        Self {
+            future: Box::pin(async move { (label, future.await) }),
         }
+    }
+}
 
-        tokio::select! {
-            result = direct_fut.as_mut(), if !direct_done => {
-                direct_done = true;
-                match result {
-                    Ok(received) => {
-                        return Ok(received);
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "direct receiver path stopped");
-                        last_error = Some(error);
-                    }
-                }
-            }
-            result = libp2p_fut.as_mut(), if !libp2p_done => {
-                libp2p_done = true;
-                match result {
-                    Ok(received) => {
-                        return Ok(received);
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "libp2p receiver path stopped");
-                        last_error = Some(error);
-                    }
-                }
+pub(super) async fn wait_for_receiver(
+    paths: Vec<ReceiverPath<'_>>,
+) -> anyhow::Result<ReceivedTransfer> {
+    let mut last_error = None;
+    let mut pending = paths
+        .into_iter()
+        .map(|path| path.future)
+        .collect::<futures::stream::FuturesUnordered<_>>();
+
+    while let Some((label, result)) = pending.next().await {
+        match result {
+            Ok(received) => return Ok(received),
+            Err(error) => {
+                tracing::warn!(%error, path = label, "receiver path stopped");
+                last_error = Some(error);
             }
         }
     }
