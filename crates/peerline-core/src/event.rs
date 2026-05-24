@@ -5,9 +5,12 @@ use serde::{Deserialize, Serialize};
 pub enum ConnectionRoute {
     LanDirect,
     PublicDirect,
+    PublicTunnel,
+    Libp2pQuic,
     Libp2pDcutr,
     Libp2pRelay,
     WebRtcDirect,
+    WebRtcTurn,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

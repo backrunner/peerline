@@ -1,6 +1,6 @@
-use super::{Candidate, RouteKind};
+use super::{Candidate, DiscoveryConfig, RouteKind};
 use libp2p::Multiaddr;
-use peerline_rendezvous_model::PeerDescriptor;
+use peerline_rendezvous_model::{PeerDescriptor, PublicTunnelEndpoint};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 pub(super) fn discovered_direct_endpoint_candidates(
@@ -49,6 +49,7 @@ pub(super) fn descriptor_candidates_for_discovery(
     descriptor: &PeerDescriptor,
     local_networks: Option<&LocalDirectNetworks>,
     allow_unverified_lan: bool,
+    config: &DiscoveryConfig,
 ) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     let peer_id = descriptor.peer_id.clone();
@@ -62,15 +63,47 @@ pub(super) fn descriptor_candidates_for_discovery(
             });
     candidates.extend(direct);
 
+    let public_tunnels = public_tunnel_endpoint_candidates(descriptor)
+        .into_iter()
+        .map(|endpoint| Candidate {
+            peer_id: peer_id.clone(),
+            addresses: vec![endpoint.url],
+            route: RouteKind::PublicTunnel,
+        });
+    candidates.extend(public_tunnels);
+
     let libp2p = libp2p_endpoint_candidates(descriptor)
         .into_iter()
         .map(|addr| Candidate {
             peer_id: peer_id.clone(),
             addresses: vec![addr.to_string()],
-            route: route_kind_from_multiaddr(&addr),
+            route: route_kind_from_multiaddr(&addr, config.enable_turn),
         });
     candidates.extend(libp2p);
-    rank_candidates(candidates)
+    rank_candidates(
+        candidates
+            .into_iter()
+            .filter(|candidate| config.route_enabled(&candidate.route)),
+    )
+}
+
+pub(crate) fn public_tunnel_endpoint_candidates(
+    descriptor: &PeerDescriptor,
+) -> Vec<PublicTunnelEndpoint> {
+    let mut endpoints = descriptor
+        .public_endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            let url = crate::tunnel::normalize_public_tunnel_url(&endpoint.url).ok()?;
+            Some(PublicTunnelEndpoint {
+                provider: endpoint.provider.clone(),
+                url,
+            })
+        })
+        .collect::<Vec<_>>();
+    endpoints.sort_by(|left, right| left.url.cmp(&right.url));
+    endpoints.dedup_by(|left, right| left.url == right.url);
+    endpoints
 }
 
 pub(crate) fn direct_endpoints(bind: SocketAddr, allow_loopback: bool) -> Vec<SocketAddr> {
@@ -306,11 +339,17 @@ fn libp2p_endpoint_priority(endpoint: &Multiaddr) -> u8 {
     }
 }
 
-fn route_kind_from_multiaddr(addr: &Multiaddr) -> RouteKind {
+fn route_kind_from_multiaddr(addr: &Multiaddr, enable_turn: bool) -> RouteKind {
     if is_relayed(addr) {
         RouteKind::Libp2pRelay
     } else if is_webrtc(addr) {
-        RouteKind::WebRtcDirect
+        if enable_turn {
+            RouteKind::WebRtcTurn
+        } else {
+            RouteKind::WebRtcDirect
+        }
+    } else if is_quic(addr) {
+        RouteKind::Libp2pQuic
     } else {
         RouteKind::Libp2pDcutr
     }
@@ -355,9 +394,12 @@ pub fn rank_candidates(candidates: impl IntoIterator<Item = Candidate>) -> Vec<C
     candidates.sort_by_key(|candidate| match candidate.route {
         RouteKind::LanDirect => 0,
         RouteKind::PublicDirect => 1,
-        RouteKind::Libp2pDcutr => 2,
-        RouteKind::WebRtcDirect => 3,
-        RouteKind::Libp2pRelay => 4,
+        RouteKind::PublicTunnel => 2,
+        RouteKind::Libp2pQuic => 3,
+        RouteKind::Libp2pDcutr => 4,
+        RouteKind::WebRtcDirect => 5,
+        RouteKind::WebRtcTurn => 6,
+        RouteKind::Libp2pRelay => 7,
     });
     candidates.dedup();
     candidates

@@ -8,6 +8,7 @@ use libp2p::{
     upnp, yamux,
 };
 use peerline_rendezvous_model::PeerDescriptor;
+use peerline_rendezvous_model::PublicTunnelEndpoint;
 use std::net::SocketAddr;
 
 #[derive(NetworkBehaviour)]
@@ -88,6 +89,7 @@ pub(super) fn publish_descriptor(
             .chain(swarm.external_addresses())
             .map(ToString::to_string)
             .collect(),
+        Vec::<PublicTunnelEndpoint>::new(),
     );
     tracing::debug!(
         peer_id = %descriptor.peer_id,

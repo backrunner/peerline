@@ -1117,6 +1117,7 @@ mod tests {
             peer_id: "12D3KooWJ6cigH96Q8ngveZkSjcVcs4ehcrgK9tSbMgCtwuvmn7T".into(),
             direct_endpoints: vec!["192.168.1.20:43117".into()],
             libp2p_endpoints: Vec::new(),
+            public_endpoints: Vec::new(),
             published_unix_ms: 0,
         }
     }

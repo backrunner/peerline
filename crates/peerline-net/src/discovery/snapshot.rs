@@ -1,5 +1,5 @@
 use super::{
-    Candidate,
+    Candidate, DiscoveryConfig,
     endpoints::{
         LocalDirectNetworks, descriptor_candidates_for_discovery,
         discovered_direct_endpoint_candidates,
@@ -65,6 +65,7 @@ impl DiscoverySnapshot {
     pub(super) fn best_descriptor(
         &self,
         local_networks: Option<&LocalDirectNetworks>,
+        config: &DiscoveryConfig,
     ) -> Option<PeerDescriptor> {
         self.descriptors
             .values()
@@ -74,6 +75,7 @@ impl DiscoverySnapshot {
                     descriptor,
                     local_networks,
                     allow_unverified_lan,
+                    config,
                 )
                 .is_empty()
             })
@@ -86,6 +88,7 @@ impl DiscoverySnapshot {
                         descriptor,
                         local_networks,
                         allow_unverified_lan,
+                        config,
                     )
                     .len(),
                     descriptor.peer_id.clone(),
@@ -97,7 +100,31 @@ impl DiscoverySnapshot {
         &self,
         local_networks: Option<&LocalDirectNetworks>,
     ) -> Vec<SocketAddr> {
-        self.best_descriptor(local_networks)
+        self.descriptors
+            .values()
+            .cloned()
+            .filter(|descriptor| {
+                let allow_unverified_lan = self.local_peer_ids.contains(&descriptor.peer_id);
+                !discovered_direct_endpoint_candidates(
+                    descriptor,
+                    local_networks,
+                    allow_unverified_lan,
+                )
+                .is_empty()
+            })
+            .max_by_key(|descriptor| {
+                let allow_unverified_lan = self.local_peer_ids.contains(&descriptor.peer_id);
+                (
+                    descriptor.published_unix_ms,
+                    discovered_direct_endpoint_candidates(
+                        descriptor,
+                        local_networks,
+                        allow_unverified_lan,
+                    )
+                    .len(),
+                    descriptor.peer_id.clone(),
+                )
+            })
             .map(|descriptor| {
                 let allow_unverified_lan = self.local_peer_ids.contains(&descriptor.peer_id);
                 discovered_direct_endpoint_candidates(
@@ -112,22 +139,34 @@ impl DiscoverySnapshot {
     pub(super) fn has_usable_candidates(
         &self,
         local_networks: Option<&LocalDirectNetworks>,
+        config: &DiscoveryConfig,
     ) -> bool {
         self.descriptors.values().any(|descriptor| {
             let allow_unverified_lan = self.local_peer_ids.contains(&descriptor.peer_id);
-            !descriptor_candidates_for_discovery(descriptor, local_networks, allow_unverified_lan)
-                .is_empty()
+            !descriptor_candidates_for_discovery(
+                descriptor,
+                local_networks,
+                allow_unverified_lan,
+                config,
+            )
+            .is_empty()
         })
     }
 
     pub(super) fn into_candidates(
         self,
         local_networks: Option<&LocalDirectNetworks>,
+        config: &DiscoveryConfig,
     ) -> Vec<Candidate> {
         let local_peer_ids = self.local_peer_ids;
         rank_candidates(self.descriptors.into_values().flat_map(|descriptor| {
             let allow_unverified_lan = local_peer_ids.contains(&descriptor.peer_id);
-            descriptor_candidates_for_discovery(&descriptor, local_networks, allow_unverified_lan)
+            descriptor_candidates_for_discovery(
+                &descriptor,
+                local_networks,
+                allow_unverified_lan,
+                config,
+            )
         }))
     }
 }

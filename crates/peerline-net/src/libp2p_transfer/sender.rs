@@ -86,9 +86,12 @@ fn route_label(route: &ConnectionRoute) -> &'static str {
     match route {
         ConnectionRoute::LanDirect => "lan-direct",
         ConnectionRoute::PublicDirect => "public-direct",
+        ConnectionRoute::PublicTunnel => "public-tunnel",
+        ConnectionRoute::Libp2pQuic => "libp2p-quic",
         ConnectionRoute::Libp2pDcutr => "libp2p-dcutr",
         ConnectionRoute::Libp2pRelay => "libp2p-relay",
         ConnectionRoute::WebRtcDirect => "webrtc-direct",
+        ConnectionRoute::WebRtcTurn => "webrtc-turn",
     }
 }
 

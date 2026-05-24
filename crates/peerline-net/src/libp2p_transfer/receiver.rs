@@ -43,18 +43,25 @@ pub(crate) async fn recv_libp2p(
     let provider_key = provider_record_key(&lookup_key);
 
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+    if options.discovery.enable_quic {
+        swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+    }
     let _ = swarm.listen_on("/ip4/0.0.0.0/udp/0/webrtc-direct".parse()?);
     apply_bootstrap(&mut swarm, &options.discovery);
     maybe_enable_relay_listeners(&mut swarm, &options.discovery);
+    let connecting_route = if options.discovery.enable_quic {
+        ConnectionRoute::Libp2pQuic
+    } else {
+        ConnectionRoute::Libp2pDcutr
+    };
     emit_event(
         &options.events,
-        PeerlineEvent::StageChanged(TransferStage::Connecting(ConnectionRoute::Libp2pDcutr)),
+        PeerlineEvent::StageChanged(TransferStage::Connecting(connecting_route)),
     );
     emit_event(
         &options.events,
         PeerlineEvent::Message(
-            "listening on direct TCP, libp2p TCP/QUIC/WebRTC-direct, and relay fallback".into(),
+            "listening on direct TCP, libp2p TCP/QUIC/WebRTC, public tunnel publishing, and relay fallback".into(),
         ),
     );
 
@@ -64,10 +71,15 @@ pub(crate) async fn recv_libp2p(
         time::Instant::now() + descriptor_publish_interval,
         descriptor_publish_interval,
     );
-    let direct_mapping = options
-        .discovery
-        .enable_upnp
-        .then(|| crate::direct::spawn_direct_port_mapping(options.direct_bind));
+    let direct_mapping = options.discovery.port_mapping_enabled().then(|| {
+        crate::direct::spawn_direct_port_mapping(
+            options.direct_bind,
+            crate::direct::DirectPortMappingConfig {
+                enable_upnp: options.discovery.enable_upnp,
+                enable_natpmp_pcp: options.discovery.enable_natpmp_pcp,
+            },
+        )
+    });
     let mut direct_mapping_rx = direct_mapping
         .as_ref()
         .map(crate::direct::DirectPortMapping::subscribe);

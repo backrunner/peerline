@@ -55,6 +55,11 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
         lookup_timeout: Duration::from_secs(5),
         enable_mdns: false,
         enable_upnp: false,
+        enable_natpmp_pcp: false,
+        enable_quic: true,
+        enable_dcutr: true,
+        enable_turn: true,
+        enable_public_tunnels: true,
         allow_loopback_endpoints: false,
         allow_relay_data_fallback: false,
         bootstrap_peers: vec![bootstrap_peer],
@@ -70,6 +75,7 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
         destination: dst_dir.clone(),
         overwrite: false,
         discovery: discovery.clone(),
+        public_tunnel_endpoints: vec![],
         events: None,
     }));
 
@@ -157,6 +163,11 @@ async fn libp2p_resumes_after_sender_disconnects_mid_transfer() {
         lookup_timeout: Duration::from_secs(5),
         enable_mdns: false,
         enable_upnp: false,
+        enable_natpmp_pcp: false,
+        enable_quic: true,
+        enable_dcutr: true,
+        enable_turn: true,
+        enable_public_tunnels: true,
         allow_loopback_endpoints: false,
         allow_relay_data_fallback: false,
         bootstrap_peers: vec![bootstrap_peer],
@@ -173,6 +184,7 @@ async fn libp2p_resumes_after_sender_disconnects_mid_transfer() {
         destination: dst_dir.clone(),
         overwrite: false,
         discovery: discovery.clone(),
+        public_tunnel_endpoints: vec![],
         events: Some(events),
     }));
 

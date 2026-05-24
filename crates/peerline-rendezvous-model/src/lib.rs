@@ -16,7 +16,15 @@ pub struct PeerDescriptor {
     pub peer_id: String,
     pub direct_endpoints: Vec<String>,
     pub libp2p_endpoints: Vec<String>,
+    #[serde(default)]
+    pub public_endpoints: Vec<PublicTunnelEndpoint>,
     pub published_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicTunnelEndpoint {
+    pub provider: String,
+    pub url: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

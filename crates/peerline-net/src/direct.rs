@@ -30,11 +30,17 @@ use tokio::{
 
 const DIRECT_PORT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const DIRECT_SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
-const DIRECT_UPNP_MAPPING_LEASE_SECONDS: u32 = 3600;
-const DIRECT_UPNP_RENEW_AFTER: Duration =
-    Duration::from_secs(DIRECT_UPNP_MAPPING_LEASE_SECONDS as u64 / 2);
-const DIRECT_UPNP_RETRY_AFTER: Duration = Duration::from_secs(60);
-const DIRECT_UPNP_DESCRIPTION: &str = "peerline direct tcp";
+const DIRECT_PORT_MAPPING_LEASE_SECONDS: u32 = 3600;
+const DIRECT_PORT_MAPPING_RENEW_AFTER: Duration =
+    Duration::from_secs(DIRECT_PORT_MAPPING_LEASE_SECONDS as u64 / 2);
+const DIRECT_PORT_MAPPING_RETRY_AFTER: Duration = Duration::from_secs(60);
+const DIRECT_PORT_MAPPING_DESCRIPTION: &str = "peerline direct tcp";
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DirectPortMappingConfig {
+    pub enable_upnp: bool,
+    pub enable_natpmp_pcp: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct RecvOptions {
@@ -99,10 +105,13 @@ impl Default for RecvOptions {
     }
 }
 
-pub(crate) fn spawn_direct_port_mapping(bind: SocketAddr) -> DirectPortMapping {
+pub(crate) fn spawn_direct_port_mapping(
+    bind: SocketAddr,
+    config: DirectPortMappingConfig,
+) -> DirectPortMapping {
     let (sender, receiver) = watch::channel(Vec::new());
     let join = tokio::spawn(async move {
-        run_direct_port_mapping(bind, sender).await;
+        run_direct_port_mapping(bind, config, sender).await;
     });
     DirectPortMapping {
         receiver,
@@ -110,9 +119,13 @@ pub(crate) fn spawn_direct_port_mapping(bind: SocketAddr) -> DirectPortMapping {
     }
 }
 
-async fn run_direct_port_mapping(bind: SocketAddr, sender: watch::Sender<Vec<SocketAddr>>) {
+async fn run_direct_port_mapping(
+    bind: SocketAddr,
+    config: DirectPortMappingConfig,
+    sender: watch::Sender<Vec<SocketAddr>>,
+) {
     if bind.port() == 0 {
-        tracing::debug!("skipping direct TCP UPnP mapping for ephemeral port");
+        tracing::debug!("skipping direct port mapping for ephemeral port");
         return;
     }
 
@@ -121,48 +134,181 @@ async fn run_direct_port_mapping(bind: SocketAddr, sender: watch::Sender<Vec<Soc
             return;
         }
 
-        match try_direct_port_mapping(bind).await {
+        match try_direct_port_mapping(bind, config).await {
             Ok(Some(mapping)) => {
-                let external_endpoint = mapping.external_endpoint;
+                let external_endpoint = mapping.external_endpoint();
                 tracing::debug!(
-                    local_endpoint = %mapping.local_endpoint,
+                    local_endpoint = %mapping.local_endpoint(),
                     %external_endpoint,
-                    "direct TCP UPnP port mapping established"
+                    protocol = mapping.label(),
+                    "direct port mapping established"
                 );
                 let _ = sender.send(vec![external_endpoint]);
                 maintain_direct_port_mapping(mapping, &sender).await;
             }
             Ok(None) => {
                 let _ = sender.send(Vec::new());
-                tracing::debug!("direct TCP UPnP mapping unavailable");
+                tracing::debug!("direct port mapping unavailable");
             }
             Err(error) => {
                 let _ = sender.send(Vec::new());
-                tracing::debug!(%error, "direct TCP UPnP mapping failed");
+                tracing::debug!(%error, "direct port mapping failed");
             }
         }
 
         tokio::select! {
             _ = sender.closed() => return,
-            _ = time::sleep(DIRECT_UPNP_RETRY_AFTER) => {}
+            _ = time::sleep(DIRECT_PORT_MAPPING_RETRY_AFTER) => {}
         }
     }
 }
 
 type TokioGateway = igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>;
 
-struct DirectPortMappingLease {
-    gateway: TokioGateway,
-    local_endpoint: SocketAddr,
-    external_endpoint: SocketAddr,
+#[derive(Debug)]
+enum DirectPortMappingLease {
+    Upnp {
+        gateway: TokioGateway,
+        local_endpoint: SocketAddr,
+        external_endpoint: SocketAddr,
+    },
+    CrabNat {
+        mapping: crab_nat::PortMapping,
+        local_endpoint: SocketAddr,
+        external_endpoint: SocketAddr,
+    },
+}
+
+impl DirectPortMappingLease {
+    fn local_endpoint(&self) -> SocketAddr {
+        match self {
+            Self::Upnp { local_endpoint, .. } | Self::CrabNat { local_endpoint, .. } => {
+                *local_endpoint
+            }
+        }
+    }
+
+    fn external_endpoint(&self) -> SocketAddr {
+        match self {
+            Self::Upnp {
+                external_endpoint, ..
+            }
+            | Self::CrabNat {
+                external_endpoint, ..
+            } => *external_endpoint,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Upnp { .. } => "upnp",
+            Self::CrabNat { mapping, .. } => match mapping.mapping_type() {
+                crab_nat::PortMappingType::NatPmp => "nat-pmp",
+                crab_nat::PortMappingType::Pcp { .. } => "pcp",
+            },
+        }
+    }
+
+    async fn renew(&mut self) -> anyhow::Result<()> {
+        match self {
+            Self::Upnp {
+                gateway,
+                local_endpoint,
+                external_endpoint,
+            } => {
+                gateway
+                    .add_port(
+                        igd_next::PortMappingProtocol::TCP,
+                        external_endpoint.port(),
+                        *local_endpoint,
+                        DIRECT_PORT_MAPPING_LEASE_SECONDS,
+                        DIRECT_PORT_MAPPING_DESCRIPTION,
+                    )
+                    .await?;
+            }
+            Self::CrabNat {
+                mapping,
+                external_endpoint,
+                ..
+            } => {
+                mapping.renew().await?;
+                let external_ip = direct_natpmp_pcp_external_ip(mapping.gateway(), mapping).await?;
+                *external_endpoint = SocketAddr::new(external_ip, mapping.external_port().get());
+            }
+        }
+        Ok(())
+    }
+
+    async fn remove(self) {
+        match self {
+            Self::Upnp {
+                gateway,
+                external_endpoint,
+                ..
+            } => {
+                if let Err(error) = gateway
+                    .remove_port(igd_next::PortMappingProtocol::TCP, external_endpoint.port())
+                    .await
+                {
+                    tracing::debug!(
+                        external_endpoint = %external_endpoint,
+                        %error,
+                        "could not remove direct UPnP port mapping"
+                    );
+                }
+            }
+            Self::CrabNat { mapping, .. } => {
+                if let Err((error, mapping)) = mapping.try_drop().await {
+                    tracing::debug!(
+                        gateway = %mapping.gateway(),
+                        external_port = %mapping.external_port(),
+                        %error,
+                        "could not remove direct NAT-PMP/PCP port mapping"
+                    );
+                }
+            }
+        }
+    }
 }
 
 async fn try_direct_port_mapping(
     bind: SocketAddr,
+    config: DirectPortMappingConfig,
+) -> anyhow::Result<Option<DirectPortMappingLease>> {
+    let mut last_error = None;
+    if config.enable_upnp {
+        match try_direct_upnp_port_mapping(bind).await {
+            Ok(Some(mapping)) => return Ok(Some(mapping)),
+            Ok(None) => {}
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    if config.enable_natpmp_pcp {
+        match try_direct_natpmp_pcp_port_mapping(bind).await {
+            Ok(Some(mapping)) => return Ok(Some(mapping)),
+            Ok(None) => {}
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    if let Some(error) = last_error {
+        Err(error)
+    } else {
+        Ok(None)
+    }
+}
+
+async fn try_direct_upnp_port_mapping(
+    bind: SocketAddr,
 ) -> anyhow::Result<Option<DirectPortMappingLease>> {
     let local_endpoints = direct_port_mapping_local_endpoints(bind);
     if local_endpoints.is_empty() {
-        tracing::debug!(%bind, "no local IPv4 address available for direct TCP UPnP mapping");
+        tracing::debug!(%bind, "no local IPv4 address available for direct UPnP mapping");
         return Ok(None);
     }
 
@@ -174,7 +320,7 @@ async fn try_direct_port_mapping(
     .await?;
     let external_ip = gateway.get_external_ip().await?;
     if !is_public_endpoint_ip(&external_ip) {
-        tracing::debug!(%external_ip, "direct TCP UPnP gateway external address is not public");
+        tracing::debug!(%external_ip, "direct UPnP gateway external address is not public");
         return Ok(None);
     }
 
@@ -184,13 +330,13 @@ async fn try_direct_port_mapping(
                 igd_next::PortMappingProtocol::TCP,
                 bind.port(),
                 local_endpoint,
-                DIRECT_UPNP_MAPPING_LEASE_SECONDS,
-                DIRECT_UPNP_DESCRIPTION,
+                DIRECT_PORT_MAPPING_LEASE_SECONDS,
+                DIRECT_PORT_MAPPING_DESCRIPTION,
             )
             .await
         {
             Ok(()) => {
-                return Ok(Some(DirectPortMappingLease {
+                return Ok(Some(DirectPortMappingLease::Upnp {
                     gateway,
                     local_endpoint,
                     external_endpoint: SocketAddr::new(external_ip, bind.port()),
@@ -200,7 +346,7 @@ async fn try_direct_port_mapping(
                 tracing::debug!(
                     %local_endpoint,
                     %error,
-                    "could not map direct TCP UPnP port with matching external port"
+                    "could not map direct UPnP port with matching external port"
                 );
             }
         }
@@ -209,13 +355,13 @@ async fn try_direct_port_mapping(
             .add_any_port(
                 igd_next::PortMappingProtocol::TCP,
                 local_endpoint,
-                DIRECT_UPNP_MAPPING_LEASE_SECONDS,
-                DIRECT_UPNP_DESCRIPTION,
+                DIRECT_PORT_MAPPING_LEASE_SECONDS,
+                DIRECT_PORT_MAPPING_DESCRIPTION,
             )
             .await
         {
             Ok(external_port) => {
-                return Ok(Some(DirectPortMappingLease {
+                return Ok(Some(DirectPortMappingLease::Upnp {
                     gateway,
                     local_endpoint,
                     external_endpoint: SocketAddr::new(external_ip, external_port),
@@ -225,7 +371,7 @@ async fn try_direct_port_mapping(
                 tracing::debug!(
                     %local_endpoint,
                     %error,
-                    "could not map direct TCP UPnP port with router-selected external port"
+                    "could not map direct UPnP port with router-selected external port"
                 );
             }
         }
@@ -234,64 +380,151 @@ async fn try_direct_port_mapping(
     Ok(None)
 }
 
+async fn try_direct_natpmp_pcp_port_mapping(
+    bind: SocketAddr,
+) -> anyhow::Result<Option<DirectPortMappingLease>> {
+    let Some((gateway, local_endpoint)) = direct_natpmp_pcp_gateway_and_local_endpoint(bind)?
+    else {
+        return Ok(None);
+    };
+
+    let internal_port = match std::num::NonZeroU16::new(bind.port()) {
+        Some(port) => port,
+        None => return Ok(None),
+    };
+    let mapping = match crab_nat::PortMapping::new(
+        gateway,
+        local_endpoint.ip(),
+        crab_nat::InternetProtocol::Tcp,
+        internal_port,
+        crab_nat::PortMappingOptions {
+            external_port: Some(internal_port),
+            lifetime_seconds: Some(DIRECT_PORT_MAPPING_LEASE_SECONDS),
+            ..Default::default()
+        },
+    )
+    .await
+    {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            tracing::debug!(%error, %bind, "direct NAT-PMP/PCP port mapping failed");
+            return Ok(None);
+        }
+    };
+
+    let external_ip = direct_natpmp_pcp_external_ip(gateway, &mapping).await?;
+    if !is_public_endpoint_ip(&external_ip) {
+        tracing::debug!(%external_ip, "direct NAT-PMP/PCP gateway external address is not public");
+        let _ = mapping.try_drop().await;
+        return Ok(None);
+    }
+
+    let external_endpoint = SocketAddr::new(external_ip, mapping.external_port().get());
+    Ok(Some(DirectPortMappingLease::CrabNat {
+        mapping,
+        local_endpoint,
+        external_endpoint,
+    }))
+}
+
+fn direct_natpmp_pcp_gateway_and_local_endpoint(
+    bind: SocketAddr,
+) -> anyhow::Result<Option<(IpAddr, SocketAddr)>> {
+    let interface = match default_net::get_default_interface() {
+        Ok(interface) => interface,
+        Err(error) => {
+            tracing::debug!(%error, "could not determine default interface for NAT-PMP/PCP");
+            return Ok(None);
+        }
+    };
+    let gateway = match interface
+        .gateway
+        .map(|gateway| gateway.ip_addr)
+        .or_else(|| {
+            default_net::get_default_gateway()
+                .ok()
+                .map(|gateway| gateway.ip_addr)
+        }) {
+        Some(gateway) => gateway,
+        None => {
+            tracing::debug!("could not determine default gateway for NAT-PMP/PCP");
+            return Ok(None);
+        }
+    };
+
+    let local_ip = match gateway {
+        IpAddr::V4(_) => interface
+            .ipv4
+            .iter()
+            .map(|net| IpAddr::V4(net.addr))
+            .find(|ip| is_usable_mapping_ip(ip)),
+        IpAddr::V6(_) => interface
+            .ipv6
+            .iter()
+            .map(|net| IpAddr::V6(net.addr))
+            .find(|ip| is_usable_mapping_ip(ip)),
+    };
+
+    let Some(local_ip) = local_ip else {
+        tracing::debug!(%gateway, "could not determine local address for NAT-PMP/PCP");
+        return Ok(None);
+    };
+
+    let local_endpoint = if bind.ip().is_unspecified() {
+        SocketAddr::new(local_ip, bind.port())
+    } else if bind.ip().is_ipv4() == local_ip.is_ipv4() && is_usable_mapping_ip(&bind.ip()) {
+        bind
+    } else {
+        tracing::debug!(%bind, %gateway, "bind address does not match default gateway family for NAT-PMP/PCP");
+        return Ok(None);
+    };
+
+    Ok(Some((gateway, local_endpoint)))
+}
+
+async fn direct_natpmp_pcp_external_ip(
+    gateway: IpAddr,
+    mapping: &crab_nat::PortMapping,
+) -> anyhow::Result<IpAddr> {
+    match mapping.mapping_type() {
+        crab_nat::PortMappingType::Pcp { external_ip, .. } => Ok(external_ip),
+        crab_nat::PortMappingType::NatPmp => match gateway {
+            IpAddr::V4(gateway) => Ok(IpAddr::V4(
+                crab_nat::natpmp::external_address(IpAddr::V4(gateway), None).await?,
+            )),
+            IpAddr::V6(_) => anyhow::bail!("NAT-PMP requires an IPv4 gateway"),
+        },
+    }
+}
+
 async fn maintain_direct_port_mapping(
-    mapping: DirectPortMappingLease,
+    mut mapping: DirectPortMappingLease,
     sender: &watch::Sender<Vec<SocketAddr>>,
 ) {
     loop {
         tokio::select! {
             _ = sender.closed() => {
-                remove_direct_port_mapping(&mapping).await;
+                mapping.remove().await;
                 return;
             }
-            _ = time::sleep(DIRECT_UPNP_RENEW_AFTER) => {}
+            _ = time::sleep(DIRECT_PORT_MAPPING_RENEW_AFTER) => {}
         }
 
-        match mapping
-            .gateway
-            .add_port(
-                igd_next::PortMappingProtocol::TCP,
-                mapping.external_endpoint.port(),
-                mapping.local_endpoint,
-                DIRECT_UPNP_MAPPING_LEASE_SECONDS,
-                DIRECT_UPNP_DESCRIPTION,
-            )
-            .await
-        {
-            Ok(()) => {
-                tracing::debug!(
-                    local_endpoint = %mapping.local_endpoint,
-                    external_endpoint = %mapping.external_endpoint,
-                    "direct TCP UPnP port mapping renewed"
-                );
-            }
-            Err(error) => {
-                tracing::debug!(
-                    local_endpoint = %mapping.local_endpoint,
-                    external_endpoint = %mapping.external_endpoint,
-                    %error,
-                    "direct TCP UPnP port mapping renewal failed"
-                );
-                let _ = sender.send(Vec::new());
-                return;
-            }
+        if let Err(error) = mapping.renew().await {
+            tracing::debug!(
+                local_endpoint = %mapping.local_endpoint(),
+                external_endpoint = %mapping.external_endpoint(),
+                %error,
+                "direct port mapping renewal failed"
+            );
+            let _ = sender.send(Vec::new());
+            return;
         }
-    }
-}
-
-async fn remove_direct_port_mapping(mapping: &DirectPortMappingLease) {
-    if let Err(error) = mapping
-        .gateway
-        .remove_port(
-            igd_next::PortMappingProtocol::TCP,
-            mapping.external_endpoint.port(),
-        )
-        .await
-    {
         tracing::debug!(
-            external_endpoint = %mapping.external_endpoint,
-            %error,
-            "could not remove direct TCP UPnP port mapping"
+            local_endpoint = %mapping.local_endpoint(),
+            external_endpoint = %mapping.external_endpoint(),
+            protocol = mapping.label(),
+            "direct port mapping renewed"
         );
     }
 }
@@ -327,6 +560,18 @@ fn is_usable_mapping_ipv4(ip: &Ipv4Addr) -> bool {
         && !ip.is_link_local()
         && !ip.is_multicast()
         && !ip.is_broadcast()
+}
+
+fn is_usable_mapping_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_usable_mapping_ipv4(ip),
+        IpAddr::V6(ip) => {
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_unicast_link_local()
+                && !ip.is_multicast()
+        }
+    }
 }
 
 fn is_public_endpoint_ip(ip: &IpAddr) -> bool {

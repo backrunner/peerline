@@ -120,9 +120,16 @@ pub(crate) fn decode_wire(payload: &[u8]) -> anyhow::Result<WireFrame> {
 }
 
 pub(crate) fn direct_transcript(name: Option<&HumanName>) -> Transcript {
+    direct_transcript_for_route(name, "direct-tcp")
+}
+
+pub(crate) fn direct_transcript_for_route(
+    name: Option<&HumanName>,
+    route_label: &str,
+) -> Transcript {
     let transcript = Transcript::new("peerline:direct:v1")
         .append("version", PROTOCOL_VERSION.to_be_bytes())
-        .append("route", b"direct-tcp");
+        .append("route", route_label.as_bytes());
     match name {
         Some(name) => transcript.append("name", name.as_str().as_bytes()),
         None => transcript.append("name", b"direct-ip"),

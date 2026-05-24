@@ -11,7 +11,9 @@ use endpoints::LocalDirectNetworks;
 use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use peerline_core::{ConnectionRoute, HumanCode, HumanName, LookupKey, NameCode};
-use peerline_rendezvous_model::{PeerDescriptor, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION};
+use peerline_rendezvous_model::{
+    PeerDescriptor, PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use snapshot::DiscoverySnapshot;
@@ -33,9 +35,12 @@ pub use endpoints::rank_candidates;
 pub enum RouteKind {
     LanDirect,
     PublicDirect,
+    PublicTunnel,
+    Libp2pQuic,
     Libp2pDcutr,
     Libp2pRelay,
     WebRtcDirect,
+    WebRtcTurn,
 }
 
 impl RouteKind {
@@ -43,9 +48,12 @@ impl RouteKind {
         match self {
             RouteKind::LanDirect => ConnectionRoute::LanDirect,
             RouteKind::PublicDirect => ConnectionRoute::PublicDirect,
+            RouteKind::PublicTunnel => ConnectionRoute::PublicTunnel,
+            RouteKind::Libp2pQuic => ConnectionRoute::Libp2pQuic,
             RouteKind::Libp2pDcutr => ConnectionRoute::Libp2pDcutr,
             RouteKind::Libp2pRelay => ConnectionRoute::Libp2pRelay,
             RouteKind::WebRtcDirect => ConnectionRoute::WebRtcDirect,
+            RouteKind::WebRtcTurn => ConnectionRoute::WebRtcTurn,
         }
     }
 }
@@ -72,6 +80,11 @@ pub struct DiscoveryConfig {
     pub lookup_timeout: Duration,
     pub enable_mdns: bool,
     pub enable_upnp: bool,
+    pub enable_natpmp_pcp: bool,
+    pub enable_quic: bool,
+    pub enable_dcutr: bool,
+    pub enable_turn: bool,
+    pub enable_public_tunnels: bool,
     pub allow_loopback_endpoints: bool,
     pub allow_relay_data_fallback: bool,
     pub bootstrap_peers: Vec<String>,
@@ -90,20 +103,46 @@ impl Default for DiscoveryConfig {
         });
         let relay_peers =
             peers_from_env("PEERLINE_RELAY_PEERS").unwrap_or_else(|| bootstrap_peers.clone());
-        let webrtc_ice_servers =
+        let mut webrtc_ice_servers =
             webrtc_ice_servers_from_env().unwrap_or_else(default_webrtc_ice_servers);
+        let enable_turn = env_flag("PEERLINE_DISABLE_TURN").is_none();
+        if !enable_turn {
+            webrtc_ice_servers = without_turn_ice_servers(&webrtc_ice_servers);
+        }
         Self {
             // Prefer the first usable descriptor so named send feels immediate.
             min_candidate_diversity: 1,
             lookup_timeout: Duration::from_secs(15),
             enable_mdns: env_flag("PEERLINE_DISABLE_MDNS").is_none(),
             enable_upnp: env_flag("PEERLINE_DISABLE_UPNP").is_none(),
+            enable_natpmp_pcp: env_flag("PEERLINE_DISABLE_NATPMP_PCP").is_none(),
+            enable_quic: env_flag("PEERLINE_DISABLE_QUIC").is_none(),
+            enable_dcutr: env_flag("PEERLINE_DISABLE_DCUTR").is_none(),
+            enable_turn,
+            enable_public_tunnels: env_flag("PEERLINE_DISABLE_PUBLIC_TUNNELS").is_none(),
             allow_loopback_endpoints: env_flag("PEERLINE_ALLOW_LOOPBACK_DISCOVERY").is_some(),
             allow_relay_data_fallback: env_flag("PEERLINE_DISABLE_RELAY_FALLBACK").is_none(),
             bootstrap_peers,
             relay_peers,
             webrtc_ice_servers,
             rendezvous: RendezvousConfig::default(),
+        }
+    }
+}
+
+impl DiscoveryConfig {
+    pub fn port_mapping_enabled(&self) -> bool {
+        self.enable_upnp || self.enable_natpmp_pcp
+    }
+
+    pub fn route_enabled(&self, route: &RouteKind) -> bool {
+        match route {
+            RouteKind::PublicTunnel => self.enable_public_tunnels,
+            RouteKind::Libp2pQuic => self.enable_quic,
+            RouteKind::Libp2pDcutr => self.enable_dcutr,
+            RouteKind::WebRtcTurn => self.enable_turn,
+            RouteKind::Libp2pRelay => self.allow_relay_data_fallback,
+            RouteKind::LanDirect | RouteKind::PublicDirect | RouteKind::WebRtcDirect => true,
         }
     }
 }
@@ -116,6 +155,30 @@ pub fn default_webrtc_ice_servers() -> Vec<WebRtcIceServer> {
         Duration::from_secs(24 * 60 * 60),
     ));
     servers
+}
+
+pub fn without_turn_ice_servers(servers: &[WebRtcIceServer]) -> Vec<WebRtcIceServer> {
+    servers
+        .iter()
+        .filter_map(|server| {
+            let urls = server
+                .urls
+                .iter()
+                .filter(|url| !is_turn_url(url))
+                .cloned()
+                .collect::<Vec<_>>();
+            (!urls.is_empty()).then(|| WebRtcIceServer {
+                urls,
+                username: server.username.clone(),
+                credential: server.credential.clone(),
+            })
+        })
+        .collect()
+}
+
+fn is_turn_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("turn:") || lower.starts_with("turns:")
 }
 
 fn google_stun_servers() -> WebRtcIceServer {
@@ -183,12 +246,14 @@ pub(crate) fn make_peer_descriptor(
     peer_id: impl Into<String>,
     direct_endpoints: Vec<String>,
     libp2p_endpoints: Vec<String>,
+    public_endpoints: Vec<PublicTunnelEndpoint>,
 ) -> PeerDescriptor {
     PeerDescriptor {
         protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
         peer_id: peer_id.into(),
         direct_endpoints,
         libp2p_endpoints,
+        public_endpoints,
         published_unix_ms: now_unix_ms(),
     }
 }
@@ -269,10 +334,11 @@ pub async fn discover_peer_candidates(
     config: DiscoveryConfig,
 ) -> anyhow::Result<Vec<Candidate>> {
     let local_networks = LocalDirectNetworks::current();
+    let route_config = config.clone();
     Ok(
         discover_peer_descriptors(name, code, config, local_networks.as_ref())
             .await?
-            .map(|snapshot| snapshot.into_candidates(local_networks.as_ref()))
+            .map(|snapshot| snapshot.into_candidates(local_networks.as_ref(), &route_config))
             .unwrap_or_default(),
     )
 }
@@ -283,10 +349,11 @@ pub async fn discover_peer_descriptor(
     config: DiscoveryConfig,
 ) -> anyhow::Result<Option<PeerDescriptor>> {
     let local_networks = LocalDirectNetworks::current();
+    let route_config = config.clone();
     Ok(
         discover_peer_descriptors(name, code, config, local_networks.as_ref())
             .await?
-            .and_then(|snapshot| snapshot.best_descriptor(local_networks.as_ref())),
+            .and_then(|snapshot| snapshot.best_descriptor(local_networks.as_ref(), &route_config)),
     )
 }
 
@@ -342,7 +409,7 @@ async fn discover_peer_descriptors(
                             snapshot.insert_descriptor(descriptor);
                         }
                         if snapshot.is_diverse_enough(config.min_candidate_diversity)
-                            && snapshot.has_usable_candidates(local_networks)
+                            && snapshot.has_usable_candidates(local_networks, &config)
                         {
                             break;
                         }
@@ -359,7 +426,7 @@ async fn discover_peer_descriptors(
             event = swarm.select_next_some() => {
                 handle_discovery_swarm_event(&mut swarm, &mut snapshot, event);
                 if snapshot.is_diverse_enough(config.min_candidate_diversity)
-                    && snapshot.has_usable_candidates(local_networks)
+                    && snapshot.has_usable_candidates(local_networks, &config)
                 {
                     break;
                 }
@@ -368,7 +435,7 @@ async fn discover_peer_descriptors(
     }
 
     if snapshot.is_diverse_enough(config.min_candidate_diversity)
-        && snapshot.has_usable_candidates(local_networks)
+        && snapshot.has_usable_candidates(local_networks, &config)
     {
         Ok(Some(snapshot))
     } else {
@@ -385,7 +452,9 @@ async fn run_descriptor_publisher(
     let mut swarm = build_discovery_swarm(true, config.enable_mdns, config.enable_upnp)?;
     apply_bootstrap(&mut swarm, &config);
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+    if config.enable_quic {
+        swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+    }
 
     let name_code = NameCode::new(name, code);
     let record_key = descriptor_record_key(&name_code.lookup_key());
@@ -393,9 +462,15 @@ async fn run_descriptor_publisher(
     let allow_loopback = config.allow_loopback_endpoints;
     let publish_interval = Duration::from_secs(60);
     let mut interval = time::interval_at(time::Instant::now() + publish_interval, publish_interval);
-    let direct_mapping = config
-        .enable_upnp
-        .then(|| crate::direct::spawn_direct_port_mapping(direct_bind));
+    let direct_mapping = config.port_mapping_enabled().then(|| {
+        crate::direct::spawn_direct_port_mapping(
+            direct_bind,
+            crate::direct::DirectPortMappingConfig {
+                enable_upnp: config.enable_upnp,
+                enable_natpmp_pcp: config.enable_natpmp_pcp,
+            },
+        )
+    });
     let mut direct_mapping_rx = direct_mapping
         .as_ref()
         .map(crate::direct::DirectPortMapping::subscribe);
