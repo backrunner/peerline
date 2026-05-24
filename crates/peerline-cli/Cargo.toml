@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+futures.workspace = true
 rand.workspace = true
 peerline-core = { path = "../peerline-core" }
 peerline-net = { path = "../peerline-net" }

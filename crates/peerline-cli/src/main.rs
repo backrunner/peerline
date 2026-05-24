@@ -4,6 +4,7 @@ mod terminal;
 mod wait;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use futures::{StreamExt, stream::FuturesUnordered};
 use peerline_core::{
     Compression, ConfigStore, DEFAULT_DIRECT_PORT, DEFAULT_DIRECT_PORT_WINDOW, HumanCode,
     HumanName, NodeId, PeerlineEvent, TransferId, TransferStage, parse_ip_endpoint,
@@ -572,6 +573,7 @@ async fn direct_send_with_retries(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("send failed without an error")))
 }
 
+#[derive(Clone)]
 struct NamedSendPlan {
     name: HumanName,
     code: HumanCode,
@@ -647,7 +649,8 @@ async fn named_send_attempt(
         }
     };
 
-    let mut last_error = None;
+    let mut attempts = FuturesUnordered::new();
+    let mut queued_attempts = 0usize;
     for candidate in candidates {
         if !route_allowed(&candidate.route, plan.discovery.allow_relay_data_fallback) {
             continue;
@@ -661,20 +664,54 @@ async fn named_send_attempt(
             )));
         }
 
-        let attempt = send_candidate(&candidate, plan, clone_archive(&archive)?, transfer_id);
+        let candidate_plan = plan.clone();
+        let candidate_archive = clone_archive(&archive)?;
+        attempts.push(async move {
+            let candidate_route = candidate.route.clone();
+            let result =
+                send_candidate(&candidate, &candidate_plan, candidate_archive, transfer_id).await;
+            (candidate_route, result)
+        });
+        queued_attempts += 1;
+    }
 
-        match wait_with_quit(attempt, quit_rx).await {
-            Ok(TaskOutcome::Completed(sent)) => {
-                return Ok(TaskOutcome::Completed(sent));
+    let mut last_error = None;
+    while queued_attempts > 0 {
+        let quit_future = async {
+            if let Some(rx) = quit_rx.as_mut() {
+                wait_for_send_quit(rx).await
+            } else {
+                std::future::pending::<bool>().await
             }
-            Ok(TaskOutcome::Quit) => {
-                return Ok(TaskOutcome::Quit);
-            }
-            Err(error) => {
-                if let Some(sender) = plan.events.as_ref() {
-                    let _ = sender.send(PeerlineEvent::Message(error.to_string()));
+        };
+
+        tokio::select! {
+            maybe_result = attempts.next() => {
+                let Some((candidate_route, result)) = maybe_result else {
+                    break;
+                };
+                queued_attempts -= 1;
+                match result {
+                    Ok(sent) => {
+                        return Ok(TaskOutcome::Completed(sent));
+                    }
+                    Err(error) => {
+                        if let Some(sender) = plan.events.as_ref() {
+                            let _ = sender.send(PeerlineEvent::Message(format!(
+                                "{} via {} failed: {error}",
+                                plan.name,
+                                route_label(&candidate_route)
+                            )));
+                        }
+                        last_error = Some(error);
+                    }
                 }
-                last_error = Some(error);
+            }
+            quit = quit_future => {
+                if quit {
+                    return Ok(TaskOutcome::Quit);
+                }
+                *quit_rx = None;
             }
         }
     }
@@ -766,6 +803,13 @@ fn emit_send_message(
 ) {
     if let Some(sender) = events {
         let _ = sender.send(PeerlineEvent::Message(message.into()));
+    }
+}
+
+async fn wait_for_send_quit(rx: &mut watch::Receiver<bool>) -> bool {
+    match rx.changed().await {
+        Ok(()) => *rx.borrow(),
+        Err(_) => false,
     }
 }
 
