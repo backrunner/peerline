@@ -86,12 +86,8 @@ struct RecvArgs {
     no_turn: bool,
     #[arg(long)]
     tor: bool,
-    #[arg(long, conflicts_with_all = ["localtunnel", "tmole"])]
-    cloudflared: bool,
-    #[arg(long, conflicts_with_all = ["cloudflared", "tmole"])]
-    localtunnel: bool,
-    #[arg(long, conflicts_with_all = ["cloudflared", "localtunnel"])]
-    tmole: bool,
+    #[arg(long, value_enum)]
+    tunnel: Option<TunnelProviderArg>,
     #[arg(
         long,
         default_value_t = DEFAULT_RECV_IDLE_TIMEOUT_MINUTES,
@@ -149,6 +145,24 @@ enum CompressionArg {
     None,
     Zstd,
     Lzma,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TunnelProviderArg {
+    Cloudflared,
+    Localtunnel,
+    #[value(alias("tunnelmole"))]
+    Tmole,
+}
+
+impl From<TunnelProviderArg> for PublicTunnelProvider {
+    fn from(value: TunnelProviderArg) -> Self {
+        match value {
+            TunnelProviderArg::Cloudflared => Self::Cloudflared,
+            TunnelProviderArg::Localtunnel => Self::Localtunnel,
+            TunnelProviderArg::Tmole => Self::Tmole,
+        }
+    }
 }
 
 impl From<CompressionArg> for Compression {
@@ -1122,15 +1136,7 @@ fn apply_discovery_flags(
 }
 
 fn recv_public_tunnel_provider(args: &RecvArgs) -> Option<PublicTunnelProvider> {
-    if args.cloudflared {
-        Some(PublicTunnelProvider::Cloudflared)
-    } else if args.localtunnel {
-        Some(PublicTunnelProvider::Localtunnel)
-    } else if args.tmole {
-        Some(PublicTunnelProvider::Tmole)
-    } else {
-        None
-    }
+    args.tunnel.map(Into::into)
 }
 
 fn recv_route_status(
@@ -1640,6 +1646,7 @@ fn resolve_named_send(args: SendArgs) -> anyhow::Result<(HumanName, HumanCode, V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::time::Duration;
 
     #[test]
@@ -1778,6 +1785,43 @@ mod tests {
         assert!(!route_allowed(&RouteKind::Libp2pRelay, &disabled_relay));
         assert!(route_allowed(&RouteKind::Libp2pRelay, &enabled));
         assert!(route_allowed(&RouteKind::Libp2pDcutr, &enabled));
+    }
+
+    #[test]
+    fn tunnel_flag_accepts_tunnelmole_alias() {
+        let cli = Cli::try_parse_from([
+            "peerline",
+            "recv",
+            "river-mango-42",
+            "rose-lime-iris-jade-1234",
+            "--tunnel",
+            "tunnelmole",
+        ])
+        .unwrap();
+
+        let Command::Recv(args) = cli.command else {
+            panic!("expected recv command");
+        };
+
+        assert!(matches!(args.tunnel, Some(TunnelProviderArg::Tmole)));
+        assert!(matches!(
+            recv_public_tunnel_provider(&args),
+            Some(PublicTunnelProvider::Tmole)
+        ));
+    }
+
+    #[test]
+    fn legacy_tunnel_flags_are_rejected() {
+        for flag in ["--cloudflared", "--localtunnel", "--tmole"] {
+            let parsed = Cli::try_parse_from([
+                "peerline",
+                "recv",
+                "river-mango-42",
+                "rose-lime-iris-jade-1234",
+                flag,
+            ]);
+            assert!(parsed.is_err(), "{flag} should no longer be accepted");
+        }
     }
 
     #[test]

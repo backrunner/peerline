@@ -119,10 +119,15 @@ peerline recv [NAME_OR_CODE] [CODE] --overwrite
 peerline recv [NAME_OR_CODE] [CODE] --no-tui
 peerline recv [NAME_OR_CODE] [CODE] --no-relay-fallback
 peerline recv [NAME_OR_CODE] [CODE] --idle-timeout-minutes 30
+peerline recv [NAME_OR_CODE] [CODE] --tunnel cloudflared
+peerline recv [NAME_OR_CODE] [CODE] --tunnel localtunnel
+peerline recv [NAME_OR_CODE] [CODE] --tunnel tmole
+peerline recv [NAME_OR_CODE] [CODE] --tunnel tunnelmole
 ```
 
 `--port` starts the 5-port direct window; Peerline will try that port and the next four.
 `--idle-timeout-minutes` defaults to `10`; set it to `0` to wait until you quit manually.
+`--tunnel` starts a public tunnel on the receiver side. `cloudflared`, `localtunnel`, `tmole`, and `tunnelmole` are accepted values.
 
 Sender options:
 
