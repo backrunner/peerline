@@ -23,10 +23,18 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::watch,
+    task::JoinHandle,
     time,
 };
 
 const DIRECT_PORT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const DIRECT_SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const DIRECT_UPNP_MAPPING_LEASE_SECONDS: u32 = 3600;
+const DIRECT_UPNP_RENEW_AFTER: Duration =
+    Duration::from_secs(DIRECT_UPNP_MAPPING_LEASE_SECONDS as u64 / 2);
+const DIRECT_UPNP_RETRY_AFTER: Duration = Duration::from_secs(60);
+const DIRECT_UPNP_DESCRIPTION: &str = "peerline direct tcp";
 
 #[derive(Clone, Debug)]
 pub struct RecvOptions {
@@ -63,6 +71,21 @@ pub struct SentTransfer {
     pub bytes: u64,
 }
 
+pub(crate) struct DirectPortMapping {
+    receiver: watch::Receiver<Vec<SocketAddr>>,
+    _join: JoinHandle<()>,
+}
+
+impl DirectPortMapping {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Vec<SocketAddr>> {
+        self.receiver.clone()
+    }
+
+    pub(crate) fn endpoints(&self) -> Vec<SocketAddr> {
+        self.receiver.borrow().clone()
+    }
+}
+
 impl Default for RecvOptions {
     fn default() -> Self {
         Self {
@@ -72,6 +95,259 @@ impl Default for RecvOptions {
             destination: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             overwrite: false,
             events: None,
+        }
+    }
+}
+
+pub(crate) fn spawn_direct_port_mapping(bind: SocketAddr) -> DirectPortMapping {
+    let (sender, receiver) = watch::channel(Vec::new());
+    let join = tokio::spawn(async move {
+        run_direct_port_mapping(bind, sender).await;
+    });
+    DirectPortMapping {
+        receiver,
+        _join: join,
+    }
+}
+
+async fn run_direct_port_mapping(bind: SocketAddr, sender: watch::Sender<Vec<SocketAddr>>) {
+    if bind.port() == 0 {
+        tracing::debug!("skipping direct TCP UPnP mapping for ephemeral port");
+        return;
+    }
+
+    loop {
+        if sender.is_closed() {
+            return;
+        }
+
+        match try_direct_port_mapping(bind).await {
+            Ok(Some(mapping)) => {
+                let external_endpoint = mapping.external_endpoint;
+                tracing::debug!(
+                    local_endpoint = %mapping.local_endpoint,
+                    %external_endpoint,
+                    "direct TCP UPnP port mapping established"
+                );
+                let _ = sender.send(vec![external_endpoint]);
+                maintain_direct_port_mapping(mapping, &sender).await;
+            }
+            Ok(None) => {
+                let _ = sender.send(Vec::new());
+                tracing::debug!("direct TCP UPnP mapping unavailable");
+            }
+            Err(error) => {
+                let _ = sender.send(Vec::new());
+                tracing::debug!(%error, "direct TCP UPnP mapping failed");
+            }
+        }
+
+        tokio::select! {
+            _ = sender.closed() => return,
+            _ = time::sleep(DIRECT_UPNP_RETRY_AFTER) => {}
+        }
+    }
+}
+
+type TokioGateway = igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>;
+
+struct DirectPortMappingLease {
+    gateway: TokioGateway,
+    local_endpoint: SocketAddr,
+    external_endpoint: SocketAddr,
+}
+
+async fn try_direct_port_mapping(
+    bind: SocketAddr,
+) -> anyhow::Result<Option<DirectPortMappingLease>> {
+    let local_endpoints = direct_port_mapping_local_endpoints(bind);
+    if local_endpoints.is_empty() {
+        tracing::debug!(%bind, "no local IPv4 address available for direct TCP UPnP mapping");
+        return Ok(None);
+    }
+
+    let gateway = igd_next::aio::tokio::search_gateway(igd_next::SearchOptions {
+        timeout: Some(Duration::from_secs(5)),
+        single_search_timeout: Some(Duration::from_secs(2)),
+        ..Default::default()
+    })
+    .await?;
+    let external_ip = gateway.get_external_ip().await?;
+    if !is_public_endpoint_ip(&external_ip) {
+        tracing::debug!(%external_ip, "direct TCP UPnP gateway external address is not public");
+        return Ok(None);
+    }
+
+    for local_endpoint in local_endpoints {
+        match gateway
+            .add_port(
+                igd_next::PortMappingProtocol::TCP,
+                bind.port(),
+                local_endpoint,
+                DIRECT_UPNP_MAPPING_LEASE_SECONDS,
+                DIRECT_UPNP_DESCRIPTION,
+            )
+            .await
+        {
+            Ok(()) => {
+                return Ok(Some(DirectPortMappingLease {
+                    gateway,
+                    local_endpoint,
+                    external_endpoint: SocketAddr::new(external_ip, bind.port()),
+                }));
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %local_endpoint,
+                    %error,
+                    "could not map direct TCP UPnP port with matching external port"
+                );
+            }
+        }
+
+        match gateway
+            .add_any_port(
+                igd_next::PortMappingProtocol::TCP,
+                local_endpoint,
+                DIRECT_UPNP_MAPPING_LEASE_SECONDS,
+                DIRECT_UPNP_DESCRIPTION,
+            )
+            .await
+        {
+            Ok(external_port) => {
+                return Ok(Some(DirectPortMappingLease {
+                    gateway,
+                    local_endpoint,
+                    external_endpoint: SocketAddr::new(external_ip, external_port),
+                }));
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %local_endpoint,
+                    %error,
+                    "could not map direct TCP UPnP port with router-selected external port"
+                );
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+async fn maintain_direct_port_mapping(
+    mapping: DirectPortMappingLease,
+    sender: &watch::Sender<Vec<SocketAddr>>,
+) {
+    loop {
+        tokio::select! {
+            _ = sender.closed() => {
+                remove_direct_port_mapping(&mapping).await;
+                return;
+            }
+            _ = time::sleep(DIRECT_UPNP_RENEW_AFTER) => {}
+        }
+
+        match mapping
+            .gateway
+            .add_port(
+                igd_next::PortMappingProtocol::TCP,
+                mapping.external_endpoint.port(),
+                mapping.local_endpoint,
+                DIRECT_UPNP_MAPPING_LEASE_SECONDS,
+                DIRECT_UPNP_DESCRIPTION,
+            )
+            .await
+        {
+            Ok(()) => {
+                tracing::debug!(
+                    local_endpoint = %mapping.local_endpoint,
+                    external_endpoint = %mapping.external_endpoint,
+                    "direct TCP UPnP port mapping renewed"
+                );
+            }
+            Err(error) => {
+                tracing::debug!(
+                    local_endpoint = %mapping.local_endpoint,
+                    external_endpoint = %mapping.external_endpoint,
+                    %error,
+                    "direct TCP UPnP port mapping renewal failed"
+                );
+                let _ = sender.send(Vec::new());
+                return;
+            }
+        }
+    }
+}
+
+async fn remove_direct_port_mapping(mapping: &DirectPortMappingLease) {
+    if let Err(error) = mapping
+        .gateway
+        .remove_port(
+            igd_next::PortMappingProtocol::TCP,
+            mapping.external_endpoint.port(),
+        )
+        .await
+    {
+        tracing::debug!(
+            external_endpoint = %mapping.external_endpoint,
+            %error,
+            "could not remove direct TCP UPnP port mapping"
+        );
+    }
+}
+
+fn direct_port_mapping_local_endpoints(bind: SocketAddr) -> Vec<SocketAddr> {
+    match bind.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            let mut endpoints = local_ip_address::list_afinet_netifas()
+                .map(|interfaces| {
+                    interfaces
+                        .into_iter()
+                        .filter_map(|(_, ip)| match ip {
+                            IpAddr::V4(ip) if is_usable_mapping_ipv4(&ip) => {
+                                Some(SocketAddr::new(IpAddr::V4(ip), bind.port()))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            endpoints.sort();
+            endpoints.dedup();
+            endpoints
+        }
+        IpAddr::V4(ip) if is_usable_mapping_ipv4(&ip) => vec![bind],
+        _ => Vec::new(),
+    }
+}
+
+fn is_usable_mapping_ipv4(ip: &Ipv4Addr) -> bool {
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_link_local()
+        && !ip.is_multicast()
+        && !ip.is_broadcast()
+}
+
+fn is_public_endpoint_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !(ip.octets()[0] == 0
+                || ip.is_private()
+                || (ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000 == 0b0100_0000))
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_documentation()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || (ip.octets()[0] & 240 == 240 && !ip.is_broadcast()))
+        }
+        IpAddr::V6(ip) => {
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast())
         }
     }
 }
@@ -286,6 +562,28 @@ async fn open_direct_session(
     })
 }
 
+async fn open_direct_session_with_timeout(
+    endpoint: SocketAddr,
+    name: Option<&HumanName>,
+    code: &HumanCode,
+    descriptor: TransferDescriptor,
+    timeout: Duration,
+) -> anyhow::Result<DirectSession> {
+    match time::timeout(
+        timeout,
+        open_direct_session(endpoint, name, code, descriptor),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "timed out connecting to {} after {} seconds",
+            endpoint,
+            timeout.as_secs()
+        ),
+    }
+}
+
 async fn complete_direct_transfer(
     mut session: DirectSession,
     archive: &Archive,
@@ -458,11 +756,12 @@ pub async fn send_prebuilt_direct(
         TransferStage::Connecting(connection_route_from_endpoint(&options.endpoint)),
     );
     emit_message(&options.events, format!("dialing {}", options.endpoint));
-    let session = open_direct_session(
+    let session = open_direct_session_with_timeout(
         options.endpoint,
         options.name.as_ref(),
         &options.code,
         descriptor.clone(),
+        DIRECT_SESSION_OPEN_TIMEOUT,
     )
     .await?;
     complete_direct_transfer(session, &archive, &options, transfer_id, descriptor).await

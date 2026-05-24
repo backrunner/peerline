@@ -62,8 +62,10 @@ struct RecvArgs {
     overwrite: bool,
     #[arg(long)]
     no_tui: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     allow_relay_fallback: bool,
+    #[arg(long)]
+    no_relay_fallback: bool,
     #[arg(
         long,
         default_value_t = DEFAULT_RECV_IDLE_TIMEOUT_MINUTES,
@@ -82,8 +84,10 @@ struct SendArgs {
     code: Option<String>,
     #[arg(long, value_enum, default_value_t = CompressionArg::Auto)]
     compression: CompressionArg,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     allow_relay_fallback: bool,
+    #[arg(long)]
+    no_relay_fallback: bool,
     #[arg(long, default_value_t = DEFAULT_RETRY_ATTEMPTS, value_parser = parse_retry_attempts)]
     retry_attempts: usize,
 }
@@ -192,7 +196,10 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
         tracing::warn!("code entropy looks low; generated codes are safer on public networks");
     }
     let discovery = peerline_net::DiscoveryConfig {
-        allow_relay_data_fallback: args.allow_relay_fallback,
+        allow_relay_data_fallback: relay_fallback_enabled(
+            args.allow_relay_fallback,
+            args.no_relay_fallback,
+        ),
         ..Default::default()
     };
 
@@ -401,7 +408,8 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
     let retry_attempts = args.retry_attempts;
     let source_id = ConfigStore::user_default()?.node_id()?;
     let compression = args.compression.into();
-    let allow_relay_fallback = args.allow_relay_fallback;
+    let allow_relay_fallback =
+        relay_fallback_enabled(args.allow_relay_fallback, args.no_relay_fallback);
     let (name, code, paths) = resolve_named_send(args)?;
     let mut ui = spawn_send_tui(
         "peer",
@@ -708,7 +716,7 @@ async fn send_candidate(
             )
             .await
         }
-        RouteKind::Libp2pDcutr | RouteKind::WebRtcTurn | RouteKind::Libp2pRelay => {
+        RouteKind::Libp2pDcutr | RouteKind::WebRtcDirect | RouteKind::Libp2pRelay => {
             let peer_id = candidate.peer_id.parse::<libp2p::PeerId>()?;
             let addresses = candidate
                 .addresses
@@ -728,6 +736,8 @@ async fn send_candidate(
                     paths: plan.paths.clone(),
                     compression: plan.compression,
                     route: candidate.route.connection_route(),
+                    enable_upnp: plan.discovery.enable_upnp,
+                    webrtc_ice_servers: plan.discovery.webrtc_ice_servers.clone(),
                     events: plan.events.clone(),
                 },
                 archive,
@@ -794,13 +804,17 @@ fn route_label(route: &RouteKind) -> &'static str {
         RouteKind::LanDirect => "lan-direct",
         RouteKind::PublicDirect => "public-direct",
         RouteKind::Libp2pDcutr => "libp2p-dcutr",
-        RouteKind::WebRtcTurn => "webrtc-turn",
+        RouteKind::WebRtcDirect => "webrtc-direct",
         RouteKind::Libp2pRelay => "libp2p-relay",
     }
 }
 
 fn route_allowed(route: &RouteKind, allow_relay_fallback: bool) -> bool {
     !matches!(route, RouteKind::Libp2pRelay) || allow_relay_fallback
+}
+
+fn relay_fallback_enabled(allow_relay_fallback: bool, no_relay_fallback: bool) -> bool {
+    allow_relay_fallback || !no_relay_fallback
 }
 
 fn set(args: SetArgs) -> anyhow::Result<()> {
@@ -913,6 +927,7 @@ mod tests {
             code: Some("rose-lime-iris-jade-1234".into()),
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
+            no_relay_fallback: false,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(direct_endpoint_arg(&args).is_none());
@@ -929,6 +944,7 @@ mod tests {
             code: Some("rose-lime-iris-jade-1234".into()),
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
+            no_relay_fallback: false,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(matches!(
@@ -942,6 +958,7 @@ mod tests {
             code: Some("rose-lime-iris-jade-1234".into()),
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
+            no_relay_fallback: false,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(matches!(
@@ -958,6 +975,7 @@ mod tests {
             code: None,
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
+            no_relay_fallback: false,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(resolve_named_send(name_only).is_err());
@@ -968,13 +986,17 @@ mod tests {
             code: Some("rose-lime-iris-jade-1234".into()),
             compression: CompressionArg::Auto,
             allow_relay_fallback: false,
+            no_relay_fallback: false,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(resolve_named_send(code_only).is_err());
     }
 
     #[test]
-    fn relay_fallback_requires_explicit_opt_in() {
+    fn relay_fallback_is_enabled_by_default_and_can_be_disabled() {
+        assert!(relay_fallback_enabled(false, false));
+        assert!(!relay_fallback_enabled(false, true));
+        assert!(relay_fallback_enabled(true, true));
         assert!(!route_allowed(&RouteKind::Libp2pRelay, false));
         assert!(route_allowed(&RouteKind::Libp2pRelay, true));
         assert!(route_allowed(&RouteKind::Libp2pDcutr, false));

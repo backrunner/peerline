@@ -89,6 +89,23 @@ pub(crate) fn direct_endpoints(bind: SocketAddr, allow_loopback: bool) -> Vec<So
     }
 }
 
+pub(crate) fn direct_endpoints_with_extra(
+    bind: SocketAddr,
+    allow_loopback: bool,
+    extra_endpoints: &[SocketAddr],
+) -> Vec<SocketAddr> {
+    let mut endpoints = direct_endpoints(bind, allow_loopback);
+    endpoints.extend(
+        extra_endpoints
+            .iter()
+            .copied()
+            .filter(|endpoint| is_usable_endpoint_ip(&endpoint.ip(), allow_loopback)),
+    );
+    endpoints.sort_by_key(direct_endpoint_priority);
+    endpoints.dedup();
+    endpoints
+}
+
 pub(super) fn direct_endpoints_from_ips(
     port: u16,
     ips: impl IntoIterator<Item = IpAddr>,
@@ -293,7 +310,7 @@ fn route_kind_from_multiaddr(addr: &Multiaddr) -> RouteKind {
     if is_relayed(addr) {
         RouteKind::Libp2pRelay
     } else if is_webrtc(addr) {
-        RouteKind::WebRtcTurn
+        RouteKind::WebRtcDirect
     } else {
         RouteKind::Libp2pDcutr
     }
@@ -339,7 +356,7 @@ pub fn rank_candidates(candidates: impl IntoIterator<Item = Candidate>) -> Vec<C
         RouteKind::LanDirect => 0,
         RouteKind::PublicDirect => 1,
         RouteKind::Libp2pDcutr => 2,
-        RouteKind::WebRtcTurn => 3,
+        RouteKind::WebRtcDirect => 3,
         RouteKind::Libp2pRelay => 4,
     });
     candidates.dedup();

@@ -21,7 +21,7 @@ Peerline has two roles:
 - Receiver: runs `peerline recv`, keeps listening for incoming transfers until you quit or the idle timeout expires, and prints a `name`, `code`, and direct endpoint.
 - Sender: runs `peerline send`, points at the receiver by name/code or IP/code, and provides the files or folders to send.
 
-For named transfers, the receiver publishes a short-lived descriptor keyed by the shared name and code. The sender derives the same lookup key, discovers candidate routes, and tries them in order. Peerline prefers direct LAN or public TCP endpoints first, then libp2p routes such as DCUtR and WebRTC TURN. Relay data fallback is available only when explicitly enabled.
+For named transfers, the receiver publishes a short-lived descriptor keyed by the shared name and code. The sender derives the same lookup key, discovers candidate routes, and tries them in order. Peerline prefers direct LAN or public TCP endpoints first, then libp2p routes such as DCUtR and WebRTC direct. When direct and hole-punched routes are unavailable, Peerline falls back to libp2p relay transport by default while keeping file contents protected by Peerline's end-to-end encryption.
 
 Peerline also probes HTTP rendezvous first, with a default endpoint at `https://peerline.pwp.sh`, then falls back to DHT and mDNS. Official builds use a private mTLS-protected rendezvous endpoint; set `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH` or `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM` to a PEM bundle with the client certificate and private key, or set `PEERLINE_RENDEZVOUS_URLS` / `PEERLINE_RENDEZVOUS_URL` to point at another compatible rendezvous service. Use `PEERLINE_RENDEZVOUS_TOKEN` only when the rendezvous service expects a shared secret.
 
@@ -117,7 +117,7 @@ Receiver options:
 peerline recv [NAME_OR_CODE] [CODE] --port 43117
 peerline recv [NAME_OR_CODE] [CODE] --overwrite
 peerline recv [NAME_OR_CODE] [CODE] --no-tui
-peerline recv [NAME_OR_CODE] [CODE] --allow-relay-fallback
+peerline recv [NAME_OR_CODE] [CODE] --no-relay-fallback
 peerline recv [NAME_OR_CODE] [CODE] --idle-timeout-minutes 30
 ```
 
@@ -131,17 +131,30 @@ peerline send <name> <code> <path...> --compression auto
 peerline send <name> <code> <path...> --compression none
 peerline send <name> <code> <path...> --compression zstd
 peerline send <name> <code> <path...> --compression lzma
-peerline send <name> <code> <path...> --allow-relay-fallback
+peerline send <name> <code> <path...> --no-relay-fallback
 peerline send --name <name> --code <code> <path...>
 ```
 
-Relay fallback must be enabled on both sides when you want Peerline to use relay data paths. Direct and hole-punched routes are attempted before relay fallback.
+Relay fallback is enabled by default. Direct and hole-punched routes are attempted before relay fallback; pass `--no-relay-fallback` on both sides when you want to require a direct or hole-punched path.
 In the send TUI, a failed attempt stays on screen and offers `r` to retry the same send or `q`/Esc to quit.
+
+Network environment variables:
+
+```sh
+PEERLINE_RELAY_PEERS=/ip4/203.0.113.10/tcp/4001/p2p/...
+PEERLINE_DISABLE_RELAY_FALLBACK=1
+PEERLINE_DISABLE_UPNP=1
+PEERLINE_BOOTSTRAP=/dnsaddr/bootstrap.libp2p.io/p2p/...
+PEERLINE_WEBRTC_ICE_SERVERS='[{"urls":["turn:turn.example.net:3478?transport=udp"],"username":"user","credential":"pass"}]'
+```
+
+`PEERLINE_RELAY_PEERS` should contain comma-separated libp2p relay-capable peer multiaddrs. If it is not set, Peerline tries the bootstrap peers as relay candidates. UPnP is enabled by default for home-router TCP and libp2p external address discovery; set `PEERLINE_DISABLE_UPNP=1` to turn it off.
+WebRTC direct transport ships with default Open Relay Project TURN candidates for `staticauth.openrelay.metered.ca` on ports `80` and `443`, including UDP, TCP, and TLS-style `turns` URLs. Peerline generates short-lived static-auth credentials for those defaults. Set `PEERLINE_WEBRTC_ICE_SERVERS` to a JSON array of WebRTC ICE server objects to replace the defaults; set it to an empty string to disable configured ICE servers entirely.
 
 ## Current Status
 
 - Direct IP send and receive works.
-- Named discovery now uses HTTP rendezvous first, then Kademlia provider records, mDNS, DCUtR, relay fallback, and libp2p-webrtc's built-in ICE servers.
+- Named discovery now uses HTTP rendezvous first, then Kademlia provider records, mDNS, UPnP-assisted direct endpoints, DCUtR, relay fallback, and libp2p-webrtc direct.
 - Files, multiple files, and folders are archived with safe relative paths, BLAKE3 integrity checks, and streaming zstd/lzma compression support.
 - Receivers stay open across multiple incoming transfers, with a configurable idle auto-exit.
 - Conflicts default to non-overwrite behavior, with TUI-driven handling in the receiver flow.

@@ -1,12 +1,14 @@
 use super::{
-    Candidate, RouteKind, default_public_bootstrap_peers, descriptor_record_key,
+    Candidate, RouteKind, default_public_bootstrap_peers, default_webrtc_ice_servers,
+    descriptor_record_key,
     endpoints::{
         LocalDirectNetworks, descriptor_candidates_for_discovery, direct_endpoints_from_ips,
         discovered_direct_endpoint_candidates,
     },
-    now_unix_ms, provider_record_key, rank_candidates,
+    now_unix_ms, parse_webrtc_ice_servers_config, provider_record_key, rank_candidates,
     snapshot::DiscoverySnapshot,
     swarm::build_discovery_swarm,
+    turn_static_auth_credential,
 };
 use libp2p::{Multiaddr, PeerId};
 use peerline_core::{HumanCode, HumanName, NameCode};
@@ -153,8 +155,64 @@ fn default_bootstrap_peers_are_configured_for_public_dht() {
 }
 
 #[test]
+fn default_webrtc_ice_servers_include_open_relay_turn_candidates() {
+    let servers = default_webrtc_ice_servers();
+    assert_eq!(servers.len(), 1);
+
+    let server = &servers[0];
+    assert!(server.username.parse::<u64>().is_ok());
+    assert!(!server.credential.is_empty());
+    assert!(
+        server
+            .urls
+            .contains(&"turn:staticauth.openrelay.metered.ca:80?transport=udp".into())
+    );
+    assert!(
+        server
+            .urls
+            .contains(&"turn:staticauth.openrelay.metered.ca:443?transport=udp".into())
+    );
+    assert!(
+        server
+            .urls
+            .contains(&"turn:staticauth.openrelay.metered.ca:443?transport=tcp".into())
+    );
+    assert!(
+        server
+            .urls
+            .contains(&"turns:staticauth.openrelay.metered.ca:443?transport=tcp".into())
+    );
+}
+
+#[test]
+fn turn_static_auth_credentials_use_hmac_sha1() {
+    assert_eq!(
+        turn_static_auth_credential("openrelayprojectsecret", "1700000000"),
+        "DpIWs03rTmTd/9c5XqDD+kE/LoI="
+    );
+}
+
+#[test]
+fn webrtc_ice_servers_config_accepts_json_and_empty_disable_value() {
+    let parsed = parse_webrtc_ice_servers_config(
+        r#"[{"urls":["turn:turn.example.net:3478?transport=udp"],"username":"user","credential":"pass"}]"#,
+    )
+    .unwrap();
+
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(
+        parsed[0].urls,
+        vec!["turn:turn.example.net:3478?transport=udp"]
+    );
+    assert_eq!(parsed[0].username, "user");
+    assert_eq!(parsed[0].credential, "pass");
+    assert_eq!(parse_webrtc_ice_servers_config(" \n\t ").unwrap(), vec![]);
+    assert!(parse_webrtc_ice_servers_config("{").is_err());
+}
+
+#[test]
 fn mdns_can_be_disabled_for_deterministic_network_tests() {
-    let swarm = build_discovery_swarm(false, false).unwrap();
+    let swarm = build_discovery_swarm(false, false, false).unwrap();
     assert!(!swarm.behaviour().mdns.is_enabled());
 }
 

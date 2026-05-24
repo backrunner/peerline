@@ -1,10 +1,11 @@
 use super::{
-    DiscoveryConfig, endpoints::direct_endpoints, make_peer_descriptor, snapshot::DiscoverySnapshot,
+    DiscoveryConfig, endpoints::direct_endpoints_with_extra, make_peer_descriptor,
+    snapshot::DiscoverySnapshot,
 };
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, identify, kad, mdns, noise, ping,
     swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle},
-    yamux,
+    upnp, yamux,
 };
 use peerline_rendezvous_model::PeerDescriptor;
 use std::net::SocketAddr;
@@ -14,6 +15,7 @@ use std::net::SocketAddr;
 pub(super) struct DiscoveryBehaviour {
     pub(super) kad: kad::Behaviour<kad::store::MemoryStore>,
     pub(super) mdns: Toggle<mdns::tokio::Behaviour>,
+    pub(super) upnp: Toggle<upnp::tokio::Behaviour>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
 }
@@ -21,6 +23,7 @@ pub(super) struct DiscoveryBehaviour {
 pub(super) fn build_discovery_swarm(
     server_mode: bool,
     enable_mdns: bool,
+    enable_upnp: bool,
 ) -> anyhow::Result<Swarm<DiscoveryBehaviour>> {
     Ok(SwarmBuilder::with_new_identity()
         .with_tokio()
@@ -50,6 +53,12 @@ pub(super) fn build_discovery_swarm(
                     None
                 }
                 .into(),
+                upnp: if enable_upnp {
+                    Some(upnp::tokio::Behaviour::default())
+                } else {
+                    None
+                }
+                .into(),
                 identify: identify::Behaviour::new(identify::Config::new(
                     "/peerline/0.1.0".into(),
                     key.public(),
@@ -65,11 +74,12 @@ pub(super) fn publish_descriptor(
     record_key: kad::RecordKey,
     provider_key: kad::RecordKey,
     direct_bind: SocketAddr,
+    extra_direct_endpoints: &[SocketAddr],
     allow_loopback: bool,
 ) -> anyhow::Result<PeerDescriptor> {
     let descriptor = make_peer_descriptor(
         swarm.local_peer_id().to_string(),
-        direct_endpoints(direct_bind, allow_loopback)
+        direct_endpoints_with_extra(direct_bind, allow_loopback, extra_direct_endpoints)
             .into_iter()
             .map(|endpoint| endpoint.to_string())
             .collect(),
@@ -123,7 +133,10 @@ pub(super) fn handle_publish_swarm_event(
 ) -> bool {
     match event {
         SwarmEvent::Behaviour(event) => handle_discovery_event(swarm, event),
-        SwarmEvent::ConnectionEstablished { .. } => true,
+        SwarmEvent::ConnectionEstablished { .. }
+        | SwarmEvent::NewListenAddr { .. }
+        | SwarmEvent::ExternalAddrConfirmed { .. }
+        | SwarmEvent::ExternalAddrExpired { .. } => true,
         _ => false,
     }
 }
@@ -212,6 +225,27 @@ fn handle_discovery_event_with_snapshot(
             }
             changed
         }
+        DiscoveryBehaviourEvent::Upnp(event) => match event {
+            upnp::Event::NewExternalAddr(addr) => {
+                tracing::debug!(%addr, "UPnP external address confirmed");
+                if let Some(snapshot) = snapshot.as_mut() {
+                    snapshot.observe_local_peer(*swarm.local_peer_id());
+                }
+                true
+            }
+            upnp::Event::ExpiredExternalAddr(addr) => {
+                tracing::debug!(%addr, "UPnP external address expired");
+                true
+            }
+            upnp::Event::GatewayNotFound => {
+                tracing::debug!("UPnP gateway not found");
+                false
+            }
+            upnp::Event::NonRoutableGateway => {
+                tracing::debug!("UPnP gateway is not routable");
+                false
+            }
+        },
         _ => false,
     }
 }

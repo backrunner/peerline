@@ -12,7 +12,9 @@ use std::{
 use tokio::time;
 
 async fn spawn_bootstrap_peer() -> (String, tokio::task::JoinHandle<()>) {
-    let mut swarm = super::behaviour::build_receiver_swarm(false).await.unwrap();
+    let mut swarm = super::behaviour::build_receiver_swarm(false, false, &[])
+        .await
+        .unwrap();
     swarm
         .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .unwrap();
@@ -52,9 +54,12 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
         min_candidate_diversity: 1,
         lookup_timeout: Duration::from_secs(5),
         enable_mdns: false,
+        enable_upnp: false,
         allow_loopback_endpoints: false,
         allow_relay_data_fallback: false,
         bootstrap_peers: vec![bootstrap_peer],
+        relay_peers: vec![],
+        webrtc_ice_servers: vec![],
         rendezvous: RendezvousConfig::disabled(),
     };
 
@@ -105,6 +110,8 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
         paths: vec![src_dir.join("hello.txt")],
         compression: Compression::None,
         route: candidate.route.connection_route(),
+        enable_upnp: discovery.enable_upnp,
+        webrtc_ice_servers: discovery.webrtc_ice_servers.clone(),
         events: None,
     })
     .await
@@ -149,9 +156,12 @@ async fn libp2p_resumes_after_sender_disconnects_mid_transfer() {
         min_candidate_diversity: 1,
         lookup_timeout: Duration::from_secs(5),
         enable_mdns: false,
+        enable_upnp: false,
         allow_loopback_endpoints: false,
         allow_relay_data_fallback: false,
         bootstrap_peers: vec![bootstrap_peer],
+        relay_peers: vec![],
+        webrtc_ice_servers: vec![],
         rendezvous: RendezvousConfig::disabled(),
     };
 
@@ -205,6 +215,8 @@ async fn libp2p_resumes_after_sender_disconnects_mid_transfer() {
             paths: vec![src_dir.join("large.bin")],
             compression: Compression::None,
             route: route.clone(),
+            enable_upnp: discovery.enable_upnp,
+            webrtc_ice_servers: discovery.webrtc_ice_servers.clone(),
             events: None,
         },
         archive_one,
@@ -250,6 +262,8 @@ async fn libp2p_resumes_after_sender_disconnects_mid_transfer() {
             paths: vec![src_dir.join("large.bin")],
             compression: Compression::None,
             route,
+            enable_upnp: discovery.enable_upnp,
+            webrtc_ice_servers: discovery.webrtc_ice_servers.clone(),
             events: None,
         },
         archive_two,

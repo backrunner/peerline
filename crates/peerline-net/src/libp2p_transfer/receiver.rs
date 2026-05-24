@@ -21,7 +21,7 @@ use libp2p::{
 use peerline_core::{ConnectionRoute, LookupKey, PeerlineEvent, TransferId, TransferStage};
 use peerline_crypto::{ChunkAead, ServerHandshake, create_server_record, start_server_login};
 use peerline_transfer::unpack_archive_from_reader;
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, future, net::SocketAddr, time::Duration};
 use tokio::time;
 
 pub(crate) async fn recv_libp2p(
@@ -31,7 +31,12 @@ pub(crate) async fn recv_libp2p(
         &options.events,
         PeerlineEvent::StageChanged(TransferStage::Discovering),
     );
-    let mut swarm = build_receiver_swarm(options.discovery.enable_mdns).await?;
+    let mut swarm = build_receiver_swarm(
+        options.discovery.enable_mdns,
+        options.discovery.enable_upnp,
+        &options.discovery.webrtc_ice_servers,
+    )
+    .await?;
     let lookup_key =
         peerline_core::NameCode::new(options.name.clone(), options.code.clone()).lookup_key();
     let record_key = descriptor_record_key(&lookup_key);
@@ -53,12 +58,24 @@ pub(crate) async fn recv_libp2p(
         time::Instant::now() + descriptor_publish_interval,
         descriptor_publish_interval,
     );
+    let direct_mapping = options
+        .discovery
+        .enable_upnp
+        .then(|| crate::direct::spawn_direct_port_mapping(options.direct_bind));
+    let mut direct_mapping_rx = direct_mapping
+        .as_ref()
+        .map(crate::direct::DirectPortMapping::subscribe);
+    let mut mapped_direct_endpoints = direct_mapping
+        .as_ref()
+        .map(crate::direct::DirectPortMapping::endpoints)
+        .unwrap_or_default();
 
     let descriptor = publish_receiver_descriptor(
         &mut swarm,
         record_key.clone(),
         provider_key.clone(),
         &options,
+        &mapped_direct_endpoints,
     )?;
     let mut rendezvous_registration = rendezvous::RendezvousRegistrationGuard::new(
         options.name.clone(),
@@ -76,18 +93,24 @@ pub(crate) async fn recv_libp2p(
     loop {
         tokio::select! {
             _ = descriptor_interval.tick() => {
-                if let Ok(descriptor) = publish_receiver_descriptor(
+                republish_receiver_descriptor(
                     &mut swarm,
                     record_key.clone(),
                     provider_key.clone(),
                     &options,
-                ) {
-                    rendezvous::publish_peer_descriptor_background(
-                        options.name.clone(),
-                        options.code.clone(),
-                        descriptor,
-                        options.discovery.rendezvous.clone(),
-                    )
+                    &mapped_direct_endpoints,
+                );
+            }
+            endpoints = wait_for_direct_mapping_change(&mut direct_mapping_rx) => {
+                if let Some(endpoints) = endpoints {
+                    mapped_direct_endpoints = endpoints;
+                    republish_receiver_descriptor(
+                        &mut swarm,
+                        record_key.clone(),
+                        provider_key.clone(),
+                        &options,
+                        &mapped_direct_endpoints,
+                    );
                 }
             }
             event = swarm.select_next_some() => {
@@ -115,19 +138,13 @@ pub(crate) async fn recv_libp2p(
                         for addr in info.listen_addrs {
                             swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                         }
-                        if let Ok(descriptor) = publish_receiver_descriptor(
+                        republish_receiver_descriptor(
                             &mut swarm,
                             record_key.clone(),
                             provider_key.clone(),
                             &options,
-                        ) {
-                            rendezvous::publish_peer_descriptor_background(
-                                options.name.clone(),
-                                options.code.clone(),
-                                descriptor,
-                                options.discovery.rendezvous.clone(),
-                            )
-                        }
+                            &mapped_direct_endpoints,
+                        );
                     }
                     SwarmEvent::Behaviour(TransferBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
                         for (peer, addr) in peers {
@@ -140,19 +157,14 @@ pub(crate) async fn recv_libp2p(
                             relay::client::Event::ReservationReqAccepted { .. }
                                 | relay::client::Event::OutboundCircuitEstablished { .. }
                                 | relay::client::Event::InboundCircuitEstablished { .. }
-                        ) && let Ok(descriptor) = publish_receiver_descriptor(
+                        ) {
+                            republish_receiver_descriptor(
                                 &mut swarm,
                                 record_key.clone(),
                                 provider_key.clone(),
                                 &options,
-                            )
-                        {
-                            rendezvous::publish_peer_descriptor_background(
-                                options.name.clone(),
-                                options.code.clone(),
-                                descriptor,
-                                options.discovery.rendezvous.clone(),
-                            )
+                                &mapped_direct_endpoints,
+                            );
                         }
                     }
                     SwarmEvent::Behaviour(TransferBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
@@ -161,26 +173,55 @@ pub(crate) async fn recv_libp2p(
                     SwarmEvent::NewListenAddr { .. }
                     | SwarmEvent::ConnectionEstablished { .. }
                     | SwarmEvent::ExternalAddrConfirmed { .. }
+                    | SwarmEvent::ExternalAddrExpired { .. }
                     | SwarmEvent::NewExternalAddrCandidate { .. } => {
-                        if let Ok(descriptor) = publish_receiver_descriptor(
+                        republish_receiver_descriptor(
                             &mut swarm,
                             record_key.clone(),
                             provider_key.clone(),
                             &options,
-                        ) {
-                            rendezvous::publish_peer_descriptor_background(
-                                options.name.clone(),
-                                options.code.clone(),
-                                descriptor,
-                                options.discovery.rendezvous.clone(),
-                            )
-                        }
+                            &mapped_direct_endpoints,
+                        );
                     }
                     _ => {}
                 }
             }
         }
     }
+}
+
+fn republish_receiver_descriptor(
+    swarm: &mut Swarm<TransferBehaviour>,
+    record_key: kad::RecordKey,
+    provider_key: kad::RecordKey,
+    options: &Libp2pRecvOptions,
+    extra_direct_endpoints: &[SocketAddr],
+) {
+    if let Ok(descriptor) = publish_receiver_descriptor(
+        swarm,
+        record_key,
+        provider_key,
+        options,
+        extra_direct_endpoints,
+    ) {
+        rendezvous::publish_peer_descriptor_background(
+            options.name.clone(),
+            options.code.clone(),
+            descriptor,
+            options.discovery.rendezvous.clone(),
+        )
+    }
+}
+
+async fn wait_for_direct_mapping_change(
+    receiver: &mut Option<tokio::sync::watch::Receiver<Vec<SocketAddr>>>,
+) -> Option<Vec<SocketAddr>> {
+    let Some(receiver) = receiver.as_mut() else {
+        future::pending::<()>().await;
+        return None;
+    };
+    receiver.changed().await.ok()?;
+    Some(receiver.borrow().clone())
 }
 
 fn log_dht_publish_result(result: &kad::QueryResult) {

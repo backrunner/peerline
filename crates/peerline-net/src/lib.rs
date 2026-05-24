@@ -10,7 +10,7 @@ pub use direct::{
     bind_direct_listener_with_window, recv_once, recv_once_bound, send_direct, send_direct_probe,
     send_prebuilt_direct, send_prebuilt_direct_probe,
 };
-pub use discovery::{Candidate, DiscoveryConfig, RouteKind};
+pub use discovery::{Candidate, DiscoveryConfig, RouteKind, WebRtcIceServer};
 pub use libp2p_transfer::{
     Libp2pRecvOptions, Libp2pSendOptions, recv_libp2p, send_libp2p, send_prebuilt_libp2p,
 };

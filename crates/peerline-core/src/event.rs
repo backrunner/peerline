@@ -7,7 +7,7 @@ pub enum ConnectionRoute {
     PublicDirect,
     Libp2pDcutr,
     Libp2pRelay,
-    WebRtcTurn,
+    WebRtcDirect,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,11 +1,14 @@
 use super::codec::WireCodec;
-use crate::{discovery::DiscoveryConfig, protocol::LIBP2P_TRANSFER_PROTOCOL};
+use crate::{
+    discovery::{DiscoveryConfig, WebRtcIceServer},
+    protocol::LIBP2P_TRANSFER_PROTOCOL,
+};
 use libp2p::{
     PeerId, StreamProtocol, Swarm, SwarmBuilder, autonat, dcutr, identify, kad, mdns, noise, ping,
     relay,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, behaviour::toggle::Toggle},
-    yamux,
+    upnp, yamux,
 };
 use rand::thread_rng;
 use std::{error::Error as StdError, time::Duration};
@@ -15,6 +18,7 @@ use std::{error::Error as StdError, time::Duration};
 pub(crate) struct TransferBehaviour {
     pub(crate) kad: kad::Behaviour<kad::store::MemoryStore>,
     pub(crate) mdns: Toggle<mdns::tokio::Behaviour>,
+    pub(crate) upnp: Toggle<upnp::tokio::Behaviour>,
     pub(crate) identify: identify::Behaviour,
     pub(crate) ping: ping::Behaviour,
     pub(crate) relay: relay::client::Behaviour,
@@ -25,20 +29,27 @@ pub(crate) struct TransferBehaviour {
 
 pub(crate) async fn build_sender_swarm(
     enable_mdns: bool,
+    enable_upnp: bool,
+    webrtc_ice_servers: &[WebRtcIceServer],
 ) -> anyhow::Result<Swarm<TransferBehaviour>> {
-    build_swarm(enable_mdns, false).await
+    build_swarm(enable_mdns, enable_upnp, false, webrtc_ice_servers).await
 }
 
 pub(crate) async fn build_receiver_swarm(
     enable_mdns: bool,
+    enable_upnp: bool,
+    webrtc_ice_servers: &[WebRtcIceServer],
 ) -> anyhow::Result<Swarm<TransferBehaviour>> {
-    build_swarm(enable_mdns, true).await
+    build_swarm(enable_mdns, enable_upnp, true, webrtc_ice_servers).await
 }
 
 async fn build_swarm(
     enable_mdns: bool,
+    enable_upnp: bool,
     server_mode: bool,
+    webrtc_ice_servers: &[WebRtcIceServer],
 ) -> anyhow::Result<Swarm<TransferBehaviour>> {
+    let webrtc_ice_servers = webrtc_transport_ice_servers(webrtc_ice_servers);
     let builder = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -47,12 +58,13 @@ async fn build_swarm(
             yamux::Config::default,
         )?
         .with_quic()
-        .with_other_transport(|key| {
+        .with_other_transport(move |key| {
             let certificate = libp2p_webrtc::tokio::Certificate::generate(&mut thread_rng())
                 .map_err(|err| Box::new(err) as Box<dyn StdError + Send + Sync>)?;
-            Ok(libp2p_webrtc::tokio::Transport::new(
+            Ok(libp2p_webrtc::tokio::Transport::new_with_ice_servers(
                 key.clone(),
                 certificate,
+                webrtc_ice_servers.clone(),
             ))
         })?
         .with_dns()?
@@ -92,6 +104,12 @@ async fn build_swarm(
                     None
                 }
                 .into(),
+                upnp: if enable_upnp {
+                    Some(upnp::tokio::Behaviour::default())
+                } else {
+                    None
+                }
+                .into(),
                 identify: identify::Behaviour::new(identify::Config::new(
                     "/peerline/0.1.0".into(),
                     key.public(),
@@ -106,6 +124,19 @@ async fn build_swarm(
         .build())
 }
 
+fn webrtc_transport_ice_servers(
+    servers: &[WebRtcIceServer],
+) -> Vec<libp2p_webrtc::tokio::IceServer> {
+    servers
+        .iter()
+        .map(|server| libp2p_webrtc::tokio::IceServer {
+            urls: server.urls.clone(),
+            username: server.username.clone(),
+            credential: server.credential.clone(),
+        })
+        .collect()
+}
+
 pub(crate) fn maybe_enable_relay_listeners(
     swarm: &mut Swarm<TransferBehaviour>,
     config: &DiscoveryConfig,
@@ -115,7 +146,7 @@ pub(crate) fn maybe_enable_relay_listeners(
     }
 
     let local_peer_id = *swarm.local_peer_id();
-    for raw in &config.bootstrap_peers {
+    for raw in &config.relay_peers {
         let Ok(addr) = raw.parse::<libp2p::Multiaddr>() else {
             continue;
         };

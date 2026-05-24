@@ -8,7 +8,7 @@ mod session;
 #[cfg(test)]
 mod tests;
 
-use crate::discovery::DiscoveryConfig;
+use crate::discovery::{DiscoveryConfig, WebRtcIceServer};
 use peerline_core::{Compression, ConnectionRoute, HumanCode, HumanName, NodeId, PeerlineEvent};
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -24,6 +24,8 @@ pub struct Libp2pSendOptions {
     pub paths: Vec<PathBuf>,
     pub compression: Compression,
     pub route: ConnectionRoute,
+    pub enable_upnp: bool,
+    pub webrtc_ice_servers: Vec<WebRtcIceServer>,
     pub events: Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
 }
 

@@ -6,13 +6,17 @@ mod swarm;
 mod tests;
 
 use crate::rendezvous::{self, RendezvousConfig};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use endpoints::LocalDirectNetworks;
 use futures::StreamExt;
+use hmac::{Hmac, Mac};
 use peerline_core::{ConnectionRoute, HumanCode, HumanName, LookupKey, NameCode};
 use peerline_rendezvous_model::{PeerDescriptor, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use snapshot::DiscoverySnapshot;
 use std::{
+    future,
     net::SocketAddr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -22,7 +26,7 @@ use swarm::{
 };
 use tokio::{task::JoinHandle, time};
 
-pub(crate) use endpoints::direct_endpoints;
+pub(crate) use endpoints::direct_endpoints_with_extra;
 pub use endpoints::rank_candidates;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,7 +35,7 @@ pub enum RouteKind {
     PublicDirect,
     Libp2pDcutr,
     Libp2pRelay,
-    WebRtcTurn,
+    WebRtcDirect,
 }
 
 impl RouteKind {
@@ -41,7 +45,7 @@ impl RouteKind {
             RouteKind::PublicDirect => ConnectionRoute::PublicDirect,
             RouteKind::Libp2pDcutr => ConnectionRoute::Libp2pDcutr,
             RouteKind::Libp2pRelay => ConnectionRoute::Libp2pRelay,
-            RouteKind::WebRtcTurn => ConnectionRoute::WebRtcTurn,
+            RouteKind::WebRtcDirect => ConnectionRoute::WebRtcDirect,
         }
     }
 }
@@ -53,35 +57,92 @@ pub struct Candidate {
     pub route: RouteKind,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebRtcIceServer {
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub credential: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveryConfig {
     pub min_candidate_diversity: usize,
     pub lookup_timeout: Duration,
     pub enable_mdns: bool,
+    pub enable_upnp: bool,
     pub allow_loopback_endpoints: bool,
     pub allow_relay_data_fallback: bool,
     pub bootstrap_peers: Vec<String>,
+    pub relay_peers: Vec<String>,
+    pub webrtc_ice_servers: Vec<WebRtcIceServer>,
     pub rendezvous: RendezvousConfig,
 }
 
 impl Default for DiscoveryConfig {
     fn default() -> Self {
+        let bootstrap_peers = peers_from_env("PEERLINE_BOOTSTRAP").unwrap_or_else(|| {
+            default_public_bootstrap_peers()
+                .iter()
+                .map(|addr| (*addr).into())
+                .collect()
+        });
+        let relay_peers =
+            peers_from_env("PEERLINE_RELAY_PEERS").unwrap_or_else(|| bootstrap_peers.clone());
+        let webrtc_ice_servers =
+            webrtc_ice_servers_from_env().unwrap_or_else(default_webrtc_ice_servers);
         Self {
             // Prefer the first usable descriptor so named send feels immediate.
             min_candidate_diversity: 1,
             lookup_timeout: Duration::from_secs(15),
             enable_mdns: env_flag("PEERLINE_DISABLE_MDNS").is_none(),
+            enable_upnp: env_flag("PEERLINE_DISABLE_UPNP").is_none(),
             allow_loopback_endpoints: env_flag("PEERLINE_ALLOW_LOOPBACK_DISCOVERY").is_some(),
-            allow_relay_data_fallback: false,
-            bootstrap_peers: bootstrap_peers_from_env().unwrap_or_else(|| {
-                default_public_bootstrap_peers()
-                    .iter()
-                    .map(|addr| (*addr).into())
-                    .collect()
-            }),
+            allow_relay_data_fallback: env_flag("PEERLINE_DISABLE_RELAY_FALLBACK").is_none(),
+            bootstrap_peers,
+            relay_peers,
+            webrtc_ice_servers,
             rendezvous: RendezvousConfig::default(),
         }
     }
+}
+
+pub fn default_webrtc_ice_servers() -> Vec<WebRtcIceServer> {
+    static_auth_turn_servers(
+        "staticauth.openrelay.metered.ca",
+        "openrelayprojectsecret",
+        Duration::from_secs(24 * 60 * 60),
+    )
+}
+
+fn static_auth_turn_servers(host: &str, secret: &str, ttl: Duration) -> Vec<WebRtcIceServer> {
+    let expires = SystemTime::now()
+        .checked_add(ttl)
+        .unwrap_or_else(SystemTime::now)
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let username = expires.to_string();
+    let credential = turn_static_auth_credential(secret, &username);
+    vec![WebRtcIceServer {
+        urls: vec![
+            format!("turn:{host}:80?transport=udp"),
+            format!("turn:{host}:443?transport=udp"),
+            format!("turn:{host}:443?transport=tcp"),
+            format!("turns:{host}:443?transport=tcp"),
+        ],
+        username,
+        credential,
+    }]
+}
+
+fn turn_static_auth_credential(secret: &str, username: &str) -> String {
+    type HmacSha1 = Hmac<Sha1>;
+    let mut mac =
+        HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
+    mac.update(username.as_bytes());
+    BASE64_STANDARD.encode(mac.finalize().into_bytes())
 }
 
 pub fn default_public_bootstrap_peers() -> &'static [&'static str] {
@@ -238,7 +299,7 @@ async fn discover_peer_descriptors(
     tokio::pin!(rendezvous_lookup);
     let mut rendezvous_done = false;
 
-    let mut swarm = build_discovery_swarm(false, config.enable_mdns)?;
+    let mut swarm = build_discovery_swarm(false, config.enable_mdns, config.enable_upnp)?;
     apply_bootstrap(&mut swarm, &config);
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
@@ -305,7 +366,7 @@ async fn run_descriptor_publisher(
     direct_bind: SocketAddr,
     config: DiscoveryConfig,
 ) -> anyhow::Result<()> {
-    let mut swarm = build_discovery_swarm(true, config.enable_mdns)?;
+    let mut swarm = build_discovery_swarm(true, config.enable_mdns, config.enable_upnp)?;
     apply_bootstrap(&mut swarm, &config);
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
@@ -316,12 +377,23 @@ async fn run_descriptor_publisher(
     let allow_loopback = config.allow_loopback_endpoints;
     let publish_interval = Duration::from_secs(60);
     let mut interval = time::interval_at(time::Instant::now() + publish_interval, publish_interval);
+    let direct_mapping = config
+        .enable_upnp
+        .then(|| crate::direct::spawn_direct_port_mapping(direct_bind));
+    let mut direct_mapping_rx = direct_mapping
+        .as_ref()
+        .map(crate::direct::DirectPortMapping::subscribe);
+    let mut mapped_direct_endpoints = direct_mapping
+        .as_ref()
+        .map(crate::direct::DirectPortMapping::endpoints)
+        .unwrap_or_default();
 
     let descriptor = publish_descriptor(
         &mut swarm,
         record_key.clone(),
         provider_key.clone(),
         direct_bind,
+        &mapped_direct_endpoints,
         allow_loopback,
     )?;
     let _rendezvous_registration = rendezvous::RendezvousRegistrationGuard::new(
@@ -345,6 +417,7 @@ async fn run_descriptor_publisher(
                     record_key.clone(),
                     provider_key.clone(),
                     direct_bind,
+                    &mapped_direct_endpoints,
                     allow_loopback,
                 )?;
                 rendezvous::publish_peer_descriptor_background(
@@ -361,6 +434,7 @@ async fn run_descriptor_publisher(
                         record_key.clone(),
                         provider_key.clone(),
                         direct_bind,
+                        &mapped_direct_endpoints,
                         allow_loopback,
                     )
                 {
@@ -372,18 +446,67 @@ async fn run_descriptor_publisher(
                     )
                 }
             }
+            endpoints = wait_for_direct_mapping_change(&mut direct_mapping_rx) => {
+                if let Some(endpoints) = endpoints {
+                    mapped_direct_endpoints = endpoints;
+                    if let Ok(descriptor) = publish_descriptor(
+                        &mut swarm,
+                        record_key.clone(),
+                        provider_key.clone(),
+                        direct_bind,
+                        &mapped_direct_endpoints,
+                        allow_loopback,
+                    ) {
+                        rendezvous::publish_peer_descriptor_background(
+                            name_code.name.clone(),
+                            name_code.code.clone(),
+                            descriptor,
+                            config.rendezvous.clone(),
+                        )
+                    }
+                }
+            }
         }
     }
 }
 
-fn bootstrap_peers_from_env() -> Option<Vec<String>> {
-    std::env::var("PEERLINE_BOOTSTRAP").ok().map(|raw| {
+async fn wait_for_direct_mapping_change(
+    receiver: &mut Option<tokio::sync::watch::Receiver<Vec<SocketAddr>>>,
+) -> Option<Vec<SocketAddr>> {
+    let Some(receiver) = receiver.as_mut() else {
+        future::pending::<()>().await;
+        return None;
+    };
+    receiver.changed().await.ok()?;
+    Some(receiver.borrow().clone())
+}
+
+fn peers_from_env(name: &str) -> Option<Vec<String>> {
+    std::env::var(name).ok().map(|raw| {
         raw.split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .collect()
     })
+}
+
+fn webrtc_ice_servers_from_env() -> Option<Vec<WebRtcIceServer>> {
+    let raw = std::env::var("PEERLINE_WEBRTC_ICE_SERVERS").ok()?;
+    match parse_webrtc_ice_servers_config(&raw) {
+        Ok(servers) => Some(servers),
+        Err(error) => {
+            tracing::warn!(%error, "ignoring invalid PEERLINE_WEBRTC_ICE_SERVERS JSON");
+            None
+        }
+    }
+}
+
+fn parse_webrtc_ice_servers_config(raw: &str) -> Result<Vec<WebRtcIceServer>, serde_json::Error> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(raw)
 }
 
 fn env_flag(name: &str) -> Option<()> {

@@ -16,7 +16,7 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/backrunner/peerline"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
@@ -32,7 +32,9 @@ directories = "6.0.0"
 futures = "0.3.31"
 hex = "0.4.3"
 hkdf = "0.12.4"
+hmac = "0.12.1"
 if-addrs = "0.15.0"
+igd-next = { version = "0.16.2", features = ["aio_tokio"] }
 libp2p = { version = "0.56.0", default-features = false, features = [
     "autonat",
     "dcutr",
@@ -48,6 +50,7 @@ libp2p = { version = "0.56.0", default-features = false, features = [
     "request-response",
     "tcp",
     "tokio",
+    "upnp",
     "yamux",
 ] }
 libp2p-webrtc = { version = "0.9.0-alpha.1", features = ["tokio"] }
@@ -64,6 +67,7 @@ rpassword = "7.4.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
+sha1 = "0.10.6"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["full"] }
@@ -78,3 +82,6 @@ zstd = "0.13.3"
 
 [profile.release]
 strip = "symbols"
+
+[patch.crates-io]
+libp2p-webrtc = { path = "vendor/libp2p-webrtc" }

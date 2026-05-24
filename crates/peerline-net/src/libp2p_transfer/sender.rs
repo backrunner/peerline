@@ -15,7 +15,13 @@ use libp2p::{
 use peerline_core::{ConnectionRoute, PeerlineEvent, TransferId, TransferStage};
 use peerline_crypto::{ChunkAead, ClientHandshake, start_client_login};
 use peerline_transfer::{Archive, create_archive};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use std::time::Duration;
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt},
+    time,
+};
+
+const LIBP2P_REQUEST_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(45);
 
 fn emit_event(
     events: &Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
@@ -82,7 +88,7 @@ fn route_label(route: &ConnectionRoute) -> &'static str {
         ConnectionRoute::PublicDirect => "public-direct",
         ConnectionRoute::Libp2pDcutr => "libp2p-dcutr",
         ConnectionRoute::Libp2pRelay => "libp2p-relay",
-        ConnectionRoute::WebRtcTurn => "webrtc-turn",
+        ConnectionRoute::WebRtcDirect => "webrtc-direct",
     }
 }
 
@@ -127,7 +133,8 @@ pub(crate) async fn send_prebuilt_libp2p(
 
     let lookup_key =
         peerline_core::NameCode::new(options.name.clone(), options.code.clone()).lookup_key();
-    let mut swarm = build_sender_swarm(false).await?;
+    let mut swarm =
+        build_sender_swarm(false, options.enable_upnp, &options.webrtc_ice_servers).await?;
     let route_name = route_label(&options.route);
     let transcript = libp2p_transcript(
         &options.name,
@@ -298,46 +305,58 @@ async fn request_round_trip(
         .transfer
         .send_request_with_addresses(&peer, request, addresses);
 
-    loop {
-        match swarm.select_next_some().await {
-            SwarmEvent::Behaviour(TransferBehaviourEvent::Transfer(
-                RequestResponseEvent::Message {
-                    peer: message_peer,
-                    message:
-                        RequestResponseMessage::Response {
-                            request_id: response_id,
-                            response,
-                        },
-                    ..
-                },
-            )) if message_peer == peer && response_id == request_id => {
-                return Ok(response);
+    match time::timeout(LIBP2P_REQUEST_ROUND_TRIP_TIMEOUT, async {
+        loop {
+            match swarm.select_next_some().await {
+                SwarmEvent::Behaviour(TransferBehaviourEvent::Transfer(
+                    RequestResponseEvent::Message {
+                        peer: message_peer,
+                        message:
+                            RequestResponseMessage::Response {
+                                request_id: response_id,
+                                response,
+                            },
+                        ..
+                    },
+                )) if message_peer == peer && response_id == request_id => {
+                    return Ok(response);
+                }
+                SwarmEvent::Behaviour(TransferBehaviourEvent::Transfer(
+                    RequestResponseEvent::OutboundFailure {
+                        peer: failed_peer,
+                        request_id: failed_id,
+                        error,
+                        ..
+                    },
+                )) if failed_peer == peer && failed_id == request_id => {
+                    anyhow::bail!("libp2p request failed: {error}");
+                }
+                SwarmEvent::Behaviour(TransferBehaviourEvent::Transfer(
+                    RequestResponseEvent::InboundFailure { .. }
+                    | RequestResponseEvent::ResponseSent { .. }
+                    | RequestResponseEvent::Message {
+                        message: RequestResponseMessage::Request { .. },
+                        ..
+                    },
+                )) => {}
+                SwarmEvent::Behaviour(TransferBehaviourEvent::Dcutr(event)) => {
+                    tracing::debug!(?event, "dcutr event while waiting for response");
+                }
+                SwarmEvent::Behaviour(TransferBehaviourEvent::Relay(event)) => {
+                    tracing::debug!(?event, "relay event while waiting for response");
+                }
+                _ => {}
             }
-            SwarmEvent::Behaviour(TransferBehaviourEvent::Transfer(
-                RequestResponseEvent::OutboundFailure {
-                    peer: failed_peer,
-                    request_id: failed_id,
-                    error,
-                    ..
-                },
-            )) if failed_peer == peer && failed_id == request_id => {
-                anyhow::bail!("libp2p request failed: {error}");
-            }
-            SwarmEvent::Behaviour(TransferBehaviourEvent::Transfer(
-                RequestResponseEvent::InboundFailure { .. }
-                | RequestResponseEvent::ResponseSent { .. }
-                | RequestResponseEvent::Message {
-                    message: RequestResponseMessage::Request { .. },
-                    ..
-                },
-            )) => {}
-            SwarmEvent::Behaviour(TransferBehaviourEvent::Dcutr(event)) => {
-                tracing::debug!(?event, "dcutr event while waiting for response");
-            }
-            SwarmEvent::Behaviour(TransferBehaviourEvent::Relay(event)) => {
-                tracing::debug!(?event, "relay event while waiting for response");
-            }
-            _ => {}
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            anyhow::bail!(
+                "libp2p request timed out after {} seconds",
+                LIBP2P_REQUEST_ROUND_TRIP_TIMEOUT.as_secs()
+            )
         }
     }
 }
