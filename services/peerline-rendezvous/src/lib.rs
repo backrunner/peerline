@@ -1,9 +1,9 @@
 use peerline_rendezvous_model::{
     HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_VERSION, PeerDescriptor,
-    RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION, RendezvousDiscoverRequest,
+    PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION, RendezvousDiscoverRequest,
     RendezvousDiscoverResponse, RendezvousRecord, RendezvousRegisterRequest,
-    RendezvousRegisterResponse, RendezvousUnregisterResponse, request_path_and_query,
-    verify_peerline_request_signature,
+    RendezvousRegisterResponse, RendezvousUnregisterResponse, TorOnionEndpoint,
+    request_path_and_query, verify_peerline_request_signature,
 };
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -27,7 +27,10 @@ const MAX_DISCOVER_LIMIT: u32 = 128;
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_DIRECT_ENDPOINTS: usize = 8;
 const MAX_LIBP2P_ENDPOINTS: usize = 24;
+const MAX_PUBLIC_ENDPOINTS: usize = 8;
+const MAX_TOR_ENDPOINTS: usize = 8;
 const MAX_ENDPOINT_LEN: usize = 256;
+const MAX_ENDPOINT_PROVIDER_LEN: usize = 64;
 const RATE_WINDOW_MS: i64 = 60_000;
 const REGISTER_RATE_LIMIT: u32 = 30;
 const UNREGISTER_RATE_LIMIT: u32 = 60;
@@ -879,11 +882,17 @@ fn validate_descriptor(descriptor: &PeerDescriptor) -> std::result::Result<(), R
     if !is_valid_peer_id(&descriptor.peer_id) {
         return Err(Rejection::new("invalid peer id", 400));
     }
-    if descriptor.direct_endpoints.is_empty() && descriptor.libp2p_endpoints.is_empty() {
+    if descriptor.direct_endpoints.is_empty()
+        && descriptor.libp2p_endpoints.is_empty()
+        && descriptor.public_endpoints.is_empty()
+        && descriptor.tor_endpoints.is_empty()
+    {
         return Err(Rejection::new("no advertised endpoints", 400));
     }
     if descriptor.direct_endpoints.len() > MAX_DIRECT_ENDPOINTS
         || descriptor.libp2p_endpoints.len() > MAX_LIBP2P_ENDPOINTS
+        || descriptor.public_endpoints.len() > MAX_PUBLIC_ENDPOINTS
+        || descriptor.tor_endpoints.len() > MAX_TOR_ENDPOINTS
     {
         return Err(Rejection::new("too many advertised endpoints", 400));
     }
@@ -892,6 +901,17 @@ fn validate_descriptor(descriptor: &PeerDescriptor) -> std::result::Result<(), R
         .iter()
         .chain(descriptor.libp2p_endpoints.iter())
         .any(|endpoint| !is_valid_endpoint(endpoint))
+    {
+        return Err(Rejection::new("invalid advertised endpoint", 400));
+    }
+    if descriptor
+        .public_endpoints
+        .iter()
+        .any(|endpoint| !is_valid_public_tunnel_endpoint(endpoint))
+        || descriptor
+            .tor_endpoints
+            .iter()
+            .any(|endpoint| !is_valid_tor_onion_endpoint(endpoint))
     {
         return Err(Rejection::new("invalid advertised endpoint", 400));
     }
@@ -921,6 +941,20 @@ fn is_valid_endpoint(endpoint: &str) -> bool {
     !endpoint.is_empty()
         && endpoint.len() <= MAX_ENDPOINT_LEN
         && endpoint.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn is_valid_endpoint_provider(provider: &str) -> bool {
+    !provider.is_empty()
+        && provider.len() <= MAX_ENDPOINT_PROVIDER_LEN
+        && provider.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn is_valid_public_tunnel_endpoint(endpoint: &PublicTunnelEndpoint) -> bool {
+    is_valid_endpoint_provider(&endpoint.provider) && is_valid_endpoint(&endpoint.url)
+}
+
+fn is_valid_tor_onion_endpoint(endpoint: &TorOnionEndpoint) -> bool {
+    is_valid_endpoint(&endpoint.url)
 }
 
 fn namespace_from_path(path: &str) -> Option<&str> {
@@ -1077,6 +1111,65 @@ mod tests {
     }
 
     #[test]
+    fn accepts_public_tunnel_or_tor_only_descriptors() {
+        let mut descriptor = valid_descriptor();
+        descriptor.direct_endpoints.clear();
+        descriptor.public_endpoints = vec![PublicTunnelEndpoint {
+            provider: "cloudflared".into(),
+            url: "wss://example.com/transfer".into(),
+        }];
+        assert!(validate_descriptor(&descriptor).is_ok());
+
+        descriptor.public_endpoints.clear();
+        descriptor.tor_endpoints = vec![TorOnionEndpoint {
+            url: "ws://abcdefghijklmnopqrstuvwxyzabcdefghijklmnop.onion/".into(),
+        }];
+        assert!(validate_descriptor(&descriptor).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_public_tunnel_or_tor_endpoints() {
+        let mut descriptor = valid_descriptor();
+        descriptor.public_endpoints = vec![PublicTunnelEndpoint {
+            provider: "cloudflared".into(),
+            url: "wss://example.com/transfer\n".into(),
+        }];
+        assert!(validate_descriptor(&descriptor).is_err());
+
+        descriptor.public_endpoints = vec![PublicTunnelEndpoint {
+            provider: "bad provider".into(),
+            url: "wss://example.com/transfer".into(),
+        }];
+        assert!(validate_descriptor(&descriptor).is_err());
+
+        descriptor.public_endpoints.clear();
+        descriptor.tor_endpoints = vec![TorOnionEndpoint {
+            url: "ws://abcdefghijklmnopqrstuvwxyzabcdefghijklmnop.onion/ with-space".into(),
+        }];
+        assert!(validate_descriptor(&descriptor).is_err());
+    }
+
+    #[test]
+    fn rejects_too_many_public_tunnel_or_tor_endpoints() {
+        let mut descriptor = valid_descriptor();
+        descriptor.public_endpoints = (0..=MAX_PUBLIC_ENDPOINTS)
+            .map(|index| PublicTunnelEndpoint {
+                provider: "cloudflared".into(),
+                url: format!("wss://example{index}.com/transfer"),
+            })
+            .collect();
+        assert!(validate_descriptor(&descriptor).is_err());
+
+        descriptor.public_endpoints.clear();
+        descriptor.tor_endpoints = (0..=MAX_TOR_ENDPOINTS)
+            .map(|index| TorOnionEndpoint {
+                url: format!("ws://example{index}.onion/"),
+            })
+            .collect();
+        assert!(validate_descriptor(&descriptor).is_err());
+    }
+
+    #[test]
     fn accepts_current_and_legacy_descriptor_protocol_versions() {
         let mut descriptor = valid_descriptor();
         assert!(validate_descriptor(&descriptor).is_ok());
@@ -1118,6 +1211,7 @@ mod tests {
             direct_endpoints: vec!["192.168.1.20:43117".into()],
             libp2p_endpoints: Vec::new(),
             public_endpoints: Vec::new(),
+            tor_endpoints: Vec::new(),
             published_unix_ms: 0,
         }
     }
