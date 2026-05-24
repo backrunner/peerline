@@ -51,6 +51,12 @@ pub(crate) async fn recv_libp2p(
         &options.events,
         PeerlineEvent::StageChanged(TransferStage::Connecting(ConnectionRoute::Libp2pDcutr)),
     );
+    emit_event(
+        &options.events,
+        PeerlineEvent::Message(
+            "listening on direct TCP, libp2p TCP/QUIC/WebRTC-direct, and relay fallback".into(),
+        ),
+    );
 
     let mut sessions: HashMap<PeerId, ReceiverSession> = HashMap::new();
     let descriptor_publish_interval = Duration::from_secs(10);

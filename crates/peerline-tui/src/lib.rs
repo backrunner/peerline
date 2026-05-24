@@ -71,7 +71,7 @@ impl RecvView {
             name,
             code,
             bind,
-            route_status: "direct TCP ready; libp2p discovery publishing".to_string(),
+            route_status: "direct TCP ready; libp2p TCP/QUIC/WebRTC/relay ready".to_string(),
             stage: TransferStage::Discovering,
             progress: None,
         };

@@ -159,7 +159,9 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     println!("name: {name}");
     println!("code: {code}");
     println!("direct: {actual_bind}");
-    println!("waiting for transfers over direct TCP or libp2p...");
+    println!(
+        "waiting for transfers over direct TCP, libp2p TCP/QUIC/WebRTC, and relay fallback..."
+    );
     match idle_timeout {
         Some(timeout) => println!(
             "idle timeout: {} (change with --idle-timeout-minutes)",
