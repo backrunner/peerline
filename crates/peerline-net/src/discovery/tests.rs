@@ -13,7 +13,7 @@ use super::{
 use libp2p::{Multiaddr, PeerId};
 use peerline_core::{HumanCode, HumanName, NameCode};
 use peerline_rendezvous_model::{
-    PeerDescriptor, PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
+    PeerDescriptor, PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION, TorOnionEndpoint,
 };
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -91,6 +91,7 @@ fn descriptor_candidates_never_rank_loopback_first() {
         ],
         libp2p_endpoints: vec![],
         public_endpoints: vec![],
+        tor_endpoints: vec![],
         published_unix_ms: 0,
     };
 
@@ -243,6 +244,7 @@ fn diversity_floor_requires_observed_peers_and_descriptor() {
         direct_endpoints: vec!["192.168.1.20:43117".into()],
         libp2p_endpoints: vec![],
         public_endpoints: vec![],
+        tor_endpoints: vec![],
         published_unix_ms: 1,
     });
     assert!(snapshot.is_diverse_enough(3));
@@ -260,6 +262,7 @@ fn discovered_lan_candidates_require_matching_local_network() {
         ],
         libp2p_endpoints: vec![],
         public_endpoints: vec![],
+        tor_endpoints: vec![],
         published_unix_ms: 1,
     };
     let networks = LocalDirectNetworks::from_prefixes(
@@ -291,6 +294,7 @@ fn remote_loopback_direct_candidates_are_not_discovered() {
         direct_endpoints: vec!["127.0.0.1:43117".into(), "10.10.0.8:43117".into()],
         libp2p_endpoints: vec![],
         public_endpoints: vec![],
+        tor_endpoints: vec![],
         published_unix_ms: 1,
     };
     let networks =
@@ -318,6 +322,7 @@ fn mdns_observed_peers_keep_unverified_lan_candidates() {
         direct_endpoints: vec!["192.168.50.20:43117".into()],
         libp2p_endpoints: vec![],
         public_endpoints: vec![],
+        tor_endpoints: vec![],
         published_unix_ms: 1,
     });
     let networks =
@@ -340,6 +345,7 @@ fn empty_descriptors_do_not_count_as_usable_candidates() {
         direct_endpoints: vec![],
         libp2p_endpoints: vec![],
         public_endpoints: vec![],
+        tor_endpoints: vec![],
         published_unix_ms: 1,
     });
 
@@ -356,6 +362,7 @@ fn invalid_peer_ids_are_ignored_during_discovery() {
         direct_endpoints: vec!["192.168.1.20:43117".into()],
         libp2p_endpoints: vec![],
         public_endpoints: vec![],
+        tor_endpoints: vec![],
         published_unix_ms: 1,
     });
 
@@ -374,6 +381,7 @@ fn future_timestamps_are_clamped_during_discovery() {
         direct_endpoints: vec!["192.168.1.20:43117".into()],
         libp2p_endpoints: vec![],
         public_endpoints: vec![],
+        tor_endpoints: vec![],
         published_unix_ms: u64::MAX,
     });
     let after = now_unix_ms();
@@ -395,6 +403,7 @@ fn discovery_flags_gate_expected_routes() {
     config.enable_dcutr = false;
     config.enable_turn = false;
     config.enable_public_tunnels = false;
+    config.enable_tor = false;
     config.allow_relay_data_fallback = false;
 
     assert!(!config.port_mapping_enabled());
@@ -402,6 +411,7 @@ fn discovery_flags_gate_expected_routes() {
     assert!(config.route_enabled(&RouteKind::PublicDirect));
     assert!(config.route_enabled(&RouteKind::WebRtcDirect));
     assert!(!config.route_enabled(&RouteKind::PublicTunnel));
+    assert!(!config.route_enabled(&RouteKind::TorOnion));
     assert!(!config.route_enabled(&RouteKind::Libp2pQuic));
     assert!(!config.route_enabled(&RouteKind::Libp2pDcutr));
     assert!(!config.route_enabled(&RouteKind::WebRtcTurn));
@@ -419,6 +429,7 @@ fn public_tunnel_descriptors_become_candidates() {
             provider: "cloudflared".into(),
             url: "https://example.com/transfer".into(),
         }],
+        tor_endpoints: vec![],
         published_unix_ms: 1,
     };
 
@@ -432,4 +443,33 @@ fn public_tunnel_descriptors_become_candidates() {
     assert_eq!(candidates.len(), 1);
     assert!(matches!(candidates[0].route, RouteKind::PublicTunnel));
     assert_eq!(candidates[0].addresses, vec!["wss://example.com/transfer"]);
+}
+
+#[test]
+fn tor_onion_descriptors_become_candidates() {
+    let descriptor = PeerDescriptor {
+        protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
+        peer_id: "peer".into(),
+        direct_endpoints: vec![],
+        libp2p_endpoints: vec![],
+        public_endpoints: vec![],
+        tor_endpoints: vec![TorOnionEndpoint {
+            url: "abcdefghijklmnopqrstuvwxyzabcdefghijklmnop.onion".into(),
+        }],
+        published_unix_ms: 1,
+    };
+
+    let candidates = super::endpoints::descriptor_candidates_for_discovery(
+        &descriptor,
+        None,
+        false,
+        &DiscoveryConfig::default(),
+    );
+
+    assert_eq!(candidates.len(), 1);
+    assert!(matches!(candidates[0].route, RouteKind::TorOnion));
+    assert_eq!(
+        candidates[0].addresses,
+        vec!["ws://abcdefghijklmnopqrstuvwxyzabcdefghijklmnop.onion/"]
+    );
 }

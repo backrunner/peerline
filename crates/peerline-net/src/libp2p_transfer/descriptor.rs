@@ -27,6 +27,7 @@ pub(crate) fn publish_receiver_descriptor(
             .map(ToString::to_string)
             .collect(),
         options.public_tunnel_endpoints.clone(),
+        options.tor_onion_endpoints.clone(),
     );
     tracing::debug!(
         peer_id = %descriptor.peer_id,

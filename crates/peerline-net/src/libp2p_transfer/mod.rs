@@ -10,7 +10,7 @@ mod tests;
 
 use crate::discovery::{DiscoveryConfig, WebRtcIceServer};
 use peerline_core::{Compression, ConnectionRoute, HumanCode, HumanName, NodeId, PeerlineEvent};
-use peerline_rendezvous_model::PublicTunnelEndpoint;
+use peerline_rendezvous_model::{PublicTunnelEndpoint, TorOnionEndpoint};
 use std::{net::SocketAddr, path::PathBuf};
 
 pub(crate) const LIBP2P_ROUTE_LABEL: &str = "libp2p-request-response";
@@ -39,6 +39,7 @@ pub struct Libp2pRecvOptions {
     pub overwrite: bool,
     pub discovery: DiscoveryConfig,
     pub public_tunnel_endpoints: Vec<PublicTunnelEndpoint>,
+    pub tor_onion_endpoints: Vec<TorOnionEndpoint>,
     pub events: Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
 }
 

@@ -60,6 +60,8 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
         enable_dcutr: true,
         enable_turn: true,
         enable_public_tunnels: true,
+        enable_tor: true,
+        tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
         allow_loopback_endpoints: false,
         allow_relay_data_fallback: false,
         bootstrap_peers: vec![bootstrap_peer],
@@ -76,6 +78,7 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
         overwrite: false,
         discovery: discovery.clone(),
         public_tunnel_endpoints: vec![],
+        tor_onion_endpoints: vec![],
         events: None,
     }));
 
@@ -168,6 +171,8 @@ async fn libp2p_resumes_after_sender_disconnects_mid_transfer() {
         enable_dcutr: true,
         enable_turn: true,
         enable_public_tunnels: true,
+        enable_tor: true,
+        tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
         allow_loopback_endpoints: false,
         allow_relay_data_fallback: false,
         bootstrap_peers: vec![bootstrap_peer],
@@ -185,6 +190,7 @@ async fn libp2p_resumes_after_sender_disconnects_mid_transfer() {
         overwrite: false,
         discovery: discovery.clone(),
         public_tunnel_endpoints: vec![],
+        tor_onion_endpoints: vec![],
         events: Some(events),
     }));
 

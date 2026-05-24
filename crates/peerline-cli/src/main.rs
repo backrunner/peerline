@@ -11,13 +11,13 @@ use peerline_core::{
 };
 use peerline_net::{
     Candidate, Libp2pRecvOptions, Libp2pSendOptions, PublicTunnelEndpoint, PublicTunnelProvider,
-    RecvOptions, RouteKind, SendOptions, bind_direct_listener,
+    RecvOptions, RouteKind, SendOptions, TorOnionEndpoint, bind_direct_listener,
 };
 use rand::Rng;
 use std::{
     io::{ErrorKind, IsTerminal},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
@@ -49,6 +49,7 @@ struct Cli {
 
 const DEFAULT_RECV_IDLE_TIMEOUT_MINUTES: f64 = 10.0;
 const DEFAULT_RETRY_ATTEMPTS: usize = 5;
+const TOR_FALLBACK_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -83,6 +84,8 @@ struct RecvArgs {
     no_dcutr: bool,
     #[arg(long)]
     no_turn: bool,
+    #[arg(long)]
+    tor: bool,
     #[arg(long, conflicts_with_all = ["localtunnel", "tmole"])]
     cloudflared: bool,
     #[arg(long, conflicts_with_all = ["cloudflared", "tmole"])]
@@ -121,6 +124,10 @@ struct SendArgs {
     no_dcutr: bool,
     #[arg(long)]
     no_turn: bool,
+    #[arg(long)]
+    no_tor: bool,
+    #[arg(long, default_value_t = SocketAddr::from(([127, 0, 0, 1], 9050)))]
+    tor_socks_proxy: SocketAddr,
     #[arg(long, default_value_t = DEFAULT_RETRY_ATTEMPTS, value_parser = parse_retry_attempts)]
     retry_attempts: usize,
 }
@@ -195,7 +202,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     println!("direct: {actual_bind}");
     println!(
         "waiting for transfers over {}...",
-        recv_route_status(&discovery, tunnel_provider)
+        recv_route_status(&discovery, tunnel_provider, args.tor)
     );
     match idle_timeout {
         Some(timeout) => println!(
@@ -215,7 +222,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
             name: name.clone(),
             code: code.clone(),
             bind: actual_bind.to_string(),
-            route_status: recv_route_status(&discovery, tunnel_provider),
+            route_status: recv_route_status(&discovery, tunnel_provider, args.tor),
             stage: peerline_core::TransferStage::Discovering,
             progress: None,
         };
@@ -234,7 +241,15 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
         tracing::warn!("code entropy looks low; generated codes are safer on public networks");
     }
     let public_tunnel = match tunnel_provider {
-        Some(provider) => Some(start_public_tunnel(provider).await?),
+        Some(provider) => {
+            match wait_with_quit(start_public_tunnel(provider), &mut quit_rx).await? {
+                TaskOutcome::Completed(tunnel) => Some(tunnel),
+                TaskOutcome::Quit => {
+                    finish_recv(network_events, events, event_fanout, tui_task).await;
+                    return Ok(());
+                }
+            }
+        }
         None => None,
     };
     let public_tunnel_endpoints = public_tunnel
@@ -248,6 +263,24 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
             tunnel.endpoint.url,
             tunnel.local_addr
         );
+    }
+    let tor_onion = if args.tor {
+        match wait_with_quit(start_tor_onion(), &mut quit_rx).await? {
+            TaskOutcome::Completed(tor) => Some(tor),
+            TaskOutcome::Quit => {
+                finish_recv(network_events, events, event_fanout, tui_task).await;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    let tor_onion_endpoints = tor_onion
+        .as_ref()
+        .map(|tor| vec![tor.endpoint.clone()])
+        .unwrap_or_default();
+    if let Some(tor) = tor_onion.as_ref() {
+        println!("tor onion: {} (local {})", tor.endpoint.url, tor.local_addr);
     }
 
     let mut transfers = 0usize;
@@ -283,6 +316,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
                     overwrite: args.overwrite,
                     discovery: discovery.clone(),
                     public_tunnel_endpoints: public_tunnel_endpoints.clone(),
+                    tor_onion_endpoints: tor_onion_endpoints.clone(),
                     events: events.clone(),
                 }),
             ),
@@ -301,6 +335,23 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
                         events: events.clone(),
                     },
                     tunnel.endpoint.url.clone(),
+                ),
+            ));
+        }
+        if let Some(tor) = tor_onion.as_ref() {
+            receiver_paths.push(ReceiverPath::new(
+                "tor-onion",
+                peerline_net::recv_tor_onion_bound(
+                    &tor.listener,
+                    RecvOptions {
+                        name: name.clone(),
+                        code: code.clone(),
+                        bind: actual_bind,
+                        destination: destination.clone(),
+                        overwrite: args.overwrite,
+                        events: events.clone(),
+                    },
+                    tor.endpoint.url.clone(),
                 ),
             ));
         }
@@ -339,24 +390,13 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
                 let _ = network_events.send(PeerlineEvent::StageChanged(TransferStage::Failed(
                     error.to_string(),
                 )));
-                drop(events);
-                drop(network_events);
-                let _ = event_fanout.await;
-                if let Some(task) = tui_task {
-                    let _ = task.await;
-                }
+                finish_recv(network_events, events, event_fanout, tui_task).await;
                 return Err(error);
             }
         }
     }
 
-    let _ = network_events.send(PeerlineEvent::Shutdown);
-    drop(events);
-    drop(network_events);
-    let _ = event_fanout.await;
-    if let Some(task) = tui_task {
-        let _ = task.await;
-    }
+    finish_recv(network_events, events, event_fanout, tui_task).await;
     println!(
         "receiver stopped after {} transfer(s), {} file(s), {} bytes",
         transfers, files, bytes
@@ -370,6 +410,21 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
     }
 
     send_named_mode(args).await
+}
+
+async fn finish_recv(
+    network_events: mpsc::UnboundedSender<PeerlineEvent>,
+    events: Option<mpsc::UnboundedSender<PeerlineEvent>>,
+    event_fanout: JoinHandle<()>,
+    tui_task: Option<JoinHandle<anyhow::Result<()>>>,
+) {
+    let _ = network_events.send(PeerlineEvent::Shutdown);
+    drop(events);
+    drop(network_events);
+    let _ = event_fanout.await;
+    if let Some(task) = tui_task {
+        let _ = task.await;
+    }
 }
 
 async fn send_direct_mode(args: SendArgs, target: DirectTarget) -> anyhow::Result<()> {
@@ -719,6 +774,10 @@ async fn named_send_attempt(
         }
     };
 
+    let delay_tor = candidates.iter().any(|candidate| {
+        !matches!(candidate.route, RouteKind::TorOnion)
+            && route_allowed(&candidate.route, &plan.discovery)
+    });
     let mut attempts = FuturesUnordered::new();
     let mut queued_attempts = 0usize;
     for candidate in candidates {
@@ -736,7 +795,11 @@ async fn named_send_attempt(
 
         let candidate_plan = plan.clone();
         let candidate_archive = clone_archive(&archive)?;
+        let candidate_delay = delay_tor && matches!(candidate.route, RouteKind::TorOnion);
         attempts.push(async move {
+            if candidate_delay {
+                tokio::time::sleep(TOR_FALLBACK_DELAY).await;
+            }
             let candidate_route = candidate.route.clone();
             let result =
                 send_candidate(&candidate, &candidate_plan, candidate_archive, transfer_id).await;
@@ -845,6 +908,29 @@ async fn send_candidate(
             )
             .await
         }
+        RouteKind::TorOnion => {
+            let endpoint = candidate
+                .addresses
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Tor onion candidate missing URL"))?;
+            peerline_net::send_prebuilt_tor_onion(
+                SendOptions {
+                    endpoint: "127.0.0.1:0".parse().expect("static endpoint"),
+                    name: Some(plan.name.clone()),
+                    code: plan.code.clone(),
+                    source_id: plan.source_id,
+                    paths: plan.paths.clone(),
+                    compression: plan.compression,
+                    events: plan.events.clone(),
+                },
+                archive,
+                transfer_id,
+                endpoint,
+                plan.discovery.tor_socks_proxy,
+            )
+            .await
+        }
         RouteKind::Libp2pQuic
         | RouteKind::Libp2pDcutr
         | RouteKind::WebRtcDirect
@@ -944,6 +1030,7 @@ fn route_label(route: &RouteKind) -> &'static str {
         RouteKind::LanDirect => "lan-direct",
         RouteKind::PublicDirect => "public-direct",
         RouteKind::PublicTunnel => "public-tunnel",
+        RouteKind::TorOnion => "tor-onion",
         RouteKind::Libp2pQuic => "libp2p-quic",
         RouteKind::Libp2pDcutr => "libp2p-dcutr",
         RouteKind::WebRtcDirect => "webrtc-direct",
@@ -975,6 +1062,7 @@ fn recv_discovery_config(args: &RecvArgs) -> peerline_net::DiscoveryConfig {
         args.no_quic,
         args.no_dcutr,
         args.no_turn,
+        false,
     );
     discovery
 }
@@ -985,6 +1073,7 @@ fn send_discovery_config(args: &SendArgs) -> peerline_net::DiscoveryConfig {
             args.allow_relay_fallback,
             args.no_relay_fallback,
         ),
+        tor_socks_proxy: args.tor_socks_proxy,
         ..Default::default()
     };
     apply_discovery_flags(
@@ -994,6 +1083,7 @@ fn send_discovery_config(args: &SendArgs) -> peerline_net::DiscoveryConfig {
         args.no_quic,
         args.no_dcutr,
         args.no_turn,
+        args.no_tor,
     );
     discovery
 }
@@ -1005,6 +1095,7 @@ fn apply_discovery_flags(
     no_quic: bool,
     no_dcutr: bool,
     no_turn: bool,
+    no_tor: bool,
 ) {
     if no_upnp {
         discovery.enable_upnp = false;
@@ -1020,6 +1111,9 @@ fn apply_discovery_flags(
     }
     if no_turn {
         discovery.enable_turn = false;
+    }
+    if no_tor {
+        discovery.enable_tor = false;
     }
     if !discovery.enable_turn {
         discovery.webrtc_ice_servers =
@@ -1042,10 +1136,14 @@ fn recv_public_tunnel_provider(args: &RecvArgs) -> Option<PublicTunnelProvider> 
 fn recv_route_status(
     discovery: &peerline_net::DiscoveryConfig,
     tunnel_provider: Option<PublicTunnelProvider>,
+    tor_onion: bool,
 ) -> String {
     let mut routes = vec!["direct TCP".to_string()];
     if let Some(provider) = tunnel_provider {
         routes.push(format!("{} public tunnel", provider.label()));
+    }
+    if tor_onion {
+        routes.push("Tor onion".into());
     }
     routes.push("libp2p TCP".into());
     if discovery.enable_quic {
@@ -1069,6 +1167,9 @@ fn send_route_status(discovery: &peerline_net::DiscoveryConfig) -> String {
     let mut routes = vec!["rendezvous".to_string(), "DHT".into(), "mDNS".into()];
     if discovery.enable_public_tunnels {
         routes.push("public tunnel".into());
+    }
+    if discovery.enable_tor {
+        routes.push("Tor onion".into());
     }
     routes.push("direct TCP".into());
     if discovery.enable_quic {
@@ -1096,12 +1197,34 @@ struct RunningPublicTunnel {
     _process: TunnelProcess,
 }
 
+struct RunningTorOnion {
+    endpoint: TorOnionEndpoint,
+    listener: tokio::net::TcpListener,
+    local_addr: SocketAddr,
+    _process: TorProcess,
+}
+
 struct TunnelProcess {
     child: Child,
     readers: Vec<JoinHandle<()>>,
 }
 
+struct TorProcess {
+    child: Child,
+    readers: Vec<JoinHandle<()>>,
+    _temp_dir: tempfile::TempDir,
+}
+
 impl Drop for TunnelProcess {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+        for reader in &self.readers {
+            reader.abort();
+        }
+    }
+}
+
+impl Drop for TorProcess {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
         for reader in &self.readers {
@@ -1139,14 +1262,8 @@ async fn start_public_tunnel(
         ));
     }
 
-    let url = match tokio::time::timeout(Duration::from_secs(45), url_rx.recv()).await {
-        Ok(Some(url)) => url,
-        Ok(None) => anyhow::bail!("{} did not report a public URL", provider.label()),
-        Err(_) => anyhow::bail!(
-            "{} did not report a public URL within 45 seconds",
-            provider.label()
-        ),
-    };
+    let mut process = TunnelProcess { child, readers };
+    let url = wait_for_public_tunnel_url(provider, &mut url_rx, &mut process.child).await?;
     let endpoint = PublicTunnelEndpoint {
         provider: provider.label().into(),
         url,
@@ -1157,7 +1274,38 @@ async fn start_public_tunnel(
         endpoint,
         listener,
         local_addr,
-        _process: TunnelProcess { child, readers },
+        _process: process,
+    })
+}
+
+async fn start_tor_onion() -> anyhow::Result<RunningTorOnion> {
+    let (listener, local_addr) = peerline_net::bind_tor_onion_listener().await?;
+    let (mut child, temp_dir, hidden_service_dir) = spawn_tor_onion_process(local_addr.port())?;
+    tracing::info!(local = %local_addr, "started Tor onion service process");
+
+    let mut readers = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        readers.push(spawn_process_output_reader("tor", "stdout", stdout));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        readers.push(spawn_process_output_reader("tor", "stderr", stderr));
+    }
+
+    let mut process = TorProcess {
+        child,
+        readers,
+        _temp_dir: temp_dir,
+    };
+    let hostname = wait_for_tor_onion_hostname(&hidden_service_dir, &mut process.child).await?;
+    let endpoint = TorOnionEndpoint {
+        url: peerline_net::normalize_tor_onion_url(&hostname)?,
+    };
+
+    Ok(RunningTorOnion {
+        endpoint,
+        listener,
+        local_addr,
+        _process: process,
     })
 }
 
@@ -1184,6 +1332,67 @@ fn spawn_public_tunnel_process(
         provider.label(),
         not_found.join(", ")
     )
+}
+
+fn spawn_tor_onion_process(local_port: u16) -> anyhow::Result<(Child, tempfile::TempDir, PathBuf)> {
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data");
+    let hidden_service_dir = temp_dir.path().join("onion-service");
+    let torrc = temp_dir.path().join("torrc");
+    let torrc_contents = format!(
+        "DataDirectory {}\nSocksPort 0\nControlPort 0\nHiddenServiceDir {}\nHiddenServicePort 80 127.0.0.1:{local_port}\nLog notice stdout\n",
+        torrc_path(&data_dir),
+        torrc_path(&hidden_service_dir),
+    );
+    std::fs::write(&torrc, torrc_contents)?;
+
+    let mut process = TokioCommand::new("tor");
+    process
+        .arg("-f")
+        .arg(&torrc)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = process.spawn().map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            anyhow::anyhow!("could not find tor command; install Tor or run without --tor")
+        } else {
+            error.into()
+        }
+    })?;
+    Ok((child, temp_dir, hidden_service_dir))
+}
+
+fn torrc_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
+async fn wait_for_tor_onion_hostname(
+    hidden_service_dir: &Path,
+    child: &mut Child,
+) -> anyhow::Result<String> {
+    let hostname_path = hidden_service_dir.join("hostname");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("Tor exited before publishing an onion hostname: {status}");
+        }
+
+        match tokio::fs::read_to_string(&hostname_path).await {
+            Ok(hostname) => {
+                let hostname = hostname.trim();
+                if !hostname.is_empty() {
+                    return Ok(hostname.to_string());
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("Tor did not create an onion hostname within 90 seconds");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 fn public_tunnel_command_candidates(
@@ -1219,6 +1428,42 @@ fn public_tunnel_command_candidates(
     }
 }
 
+async fn wait_for_public_tunnel_url(
+    provider: PublicTunnelProvider,
+    url_rx: &mut mpsc::UnboundedReceiver<String>,
+    child: &mut Child,
+) -> anyhow::Result<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        match url_rx.try_recv() {
+            Ok(url) => return Ok(url),
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                anyhow::bail!("{} did not report a public URL", provider.label());
+            }
+        }
+
+        if let Some(status) = child.try_wait()? {
+            match tokio::time::timeout(Duration::from_secs(1), url_rx.recv()).await {
+                Ok(Some(url)) => return Ok(url),
+                Ok(None) | Err(_) => {
+                    anyhow::bail!(
+                        "{} exited before reporting a public URL: {status}",
+                        provider.label()
+                    );
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "{} did not report a public URL within 45 seconds",
+                provider.label()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 fn spawn_tunnel_output_reader<R>(
     provider: PublicTunnelProvider,
     stream_name: &'static str,
@@ -1246,6 +1491,36 @@ where
                 Ok(None) => break,
                 Err(error) => {
                     tracing::debug!(%error, provider = provider.label(), stream = stream_name, "public tunnel output reader failed");
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn spawn_process_output_reader<R>(
+    process_name: &'static str,
+    stream_name: &'static str,
+    reader: R,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    tracing::debug!(
+                        process = process_name,
+                        stream = stream_name,
+                        line = %line,
+                        "process output"
+                    );
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::debug!(%error, process = process_name, stream = stream_name, "process output reader failed");
                     break;
                 }
             }
@@ -1398,6 +1673,8 @@ mod tests {
             no_quic: false,
             no_dcutr: false,
             no_turn: false,
+            no_tor: false,
+            tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(direct_endpoint_arg(&args).is_none());
@@ -1420,6 +1697,8 @@ mod tests {
             no_quic: false,
             no_dcutr: false,
             no_turn: false,
+            no_tor: false,
+            tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(matches!(
@@ -1439,6 +1718,8 @@ mod tests {
             no_quic: false,
             no_dcutr: false,
             no_turn: false,
+            no_tor: false,
+            tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(matches!(
@@ -1461,6 +1742,8 @@ mod tests {
             no_quic: false,
             no_dcutr: false,
             no_turn: false,
+            no_tor: false,
+            tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(resolve_named_send(name_only).is_err());
@@ -1477,6 +1760,8 @@ mod tests {
             no_quic: false,
             no_dcutr: false,
             no_turn: false,
+            no_tor: false,
+            tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
         assert!(resolve_named_send(code_only).is_err());

@@ -173,6 +173,51 @@ async fn wait_for_quit(rx: &mut watch::Receiver<bool>) -> bool {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn wait_with_quit_drops_pending_future_when_quit_is_signaled() {
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let (quit_tx, quit_rx) = watch::channel(false);
+        let mut quit_rx = Some(quit_rx);
+
+        let future = async move {
+            let _guard = guard;
+            std::future::pending::<anyhow::Result<()>>().await
+        };
+
+        let send_quit = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let _ = quit_tx.send(true);
+        });
+
+        let outcome = wait_with_quit(future, &mut quit_rx).await;
+        send_quit.await.unwrap();
+
+        assert!(matches!(outcome, Ok(TaskOutcome::Quit)));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+}
+
 pub(super) async fn wait_for_retry_or_quit(
     quit_rx: &mut Option<watch::Receiver<bool>>,
     retry_rx: &mut Option<mpsc::UnboundedReceiver<()>>,

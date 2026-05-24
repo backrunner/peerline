@@ -19,8 +19,9 @@ use tokio::{
     net::TcpListener,
     time,
 };
+use tokio_socks::tcp::Socks5Stream;
 use tokio_tungstenite::{
-    WebSocketStream, accept_hdr_async, connect_async,
+    WebSocketStream, accept_hdr_async, client_async, connect_async,
     tungstenite::{
         Message,
         handshake::server::{Request, Response},
@@ -28,6 +29,7 @@ use tokio_tungstenite::{
 };
 
 const PUBLIC_TUNNEL_ROUTE_LABEL: &str = "public-tunnel";
+const TOR_ONION_ROUTE_LABEL: &str = "tor-onion";
 const PUBLIC_TUNNEL_SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,10 +71,43 @@ pub fn normalize_public_tunnel_url(raw: &str) -> anyhow::Result<String> {
     Ok(url.to_string())
 }
 
+pub fn normalize_tor_onion_url(raw: &str) -> anyhow::Result<String> {
+    let raw = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("ws://{raw}")
+    };
+    let mut url = reqwest::Url::parse(&raw)?;
+    match url.scheme() {
+        "http" => {
+            url.set_scheme("ws")
+                .map_err(|_| anyhow::anyhow!("could not convert onion URL to ws"))?;
+        }
+        "ws" => {}
+        "https" | "wss" => {
+            anyhow::bail!("Tor onion transport currently supports ws/http, not wss/https")
+        }
+        other => anyhow::bail!("unsupported onion URL scheme: {other}"),
+    }
+
+    let Some(host) = url.host_str() else {
+        anyhow::bail!("Tor onion URL is missing a host");
+    };
+    if !host.to_ascii_lowercase().ends_with(".onion") {
+        anyhow::bail!("Tor onion URL host must end with .onion");
+    }
+
+    Ok(url.to_string())
+}
+
 pub async fn bind_public_tunnel_listener() -> anyhow::Result<(TcpListener, SocketAddr)> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let actual = listener.local_addr()?;
     Ok((listener, actual))
+}
+
+pub async fn bind_tor_onion_listener() -> anyhow::Result<(TcpListener, SocketAddr)> {
+    bind_public_tunnel_listener().await
 }
 
 pub async fn recv_public_tunnel_bound(
@@ -80,28 +115,70 @@ pub async fn recv_public_tunnel_bound(
     options: RecvOptions,
     endpoint_label: String,
 ) -> anyhow::Result<crate::direct::ReceivedTransfer> {
+    recv_ws_bound(
+        listener,
+        options,
+        endpoint_label,
+        ConnectionRoute::PublicTunnel,
+        PUBLIC_TUNNEL_ROUTE_LABEL,
+        "public tunnel",
+    )
+    .await
+}
+
+pub async fn recv_tor_onion_bound(
+    listener: &TcpListener,
+    options: RecvOptions,
+    endpoint_label: String,
+) -> anyhow::Result<crate::direct::ReceivedTransfer> {
+    recv_ws_bound(
+        listener,
+        options,
+        endpoint_label,
+        ConnectionRoute::TorOnion,
+        TOR_ONION_ROUTE_LABEL,
+        "Tor onion",
+    )
+    .await
+}
+
+async fn recv_ws_bound(
+    listener: &TcpListener,
+    options: RecvOptions,
+    endpoint_label: String,
+    route: ConnectionRoute,
+    route_label: &'static str,
+    log_label: &'static str,
+) -> anyhow::Result<crate::direct::ReceivedTransfer> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let accept = |req: &Request, response: Response| {
-            tracing::debug!(path = %req.uri().path(), "accepted public tunnel websocket");
+            tracing::debug!(path = %req.uri().path(), route = log_label, "accepted websocket bridge");
             Ok(response)
         };
         let mut ws_stream = match accept_hdr_async(stream, accept).await {
             Ok(ws_stream) => ws_stream,
             Err(error) => {
-                tracing::debug!(%error, "public tunnel websocket handshake failed");
+                tracing::debug!(%error, route = log_label, "websocket bridge handshake failed");
                 continue;
             }
         };
 
         emit_event(
             &options.events,
-            PeerlineEvent::StageChanged(TransferStage::Connecting(ConnectionRoute::PublicTunnel)),
+            PeerlineEvent::StageChanged(TransferStage::Connecting(route.clone())),
         );
-        match receive_ws_stream(&mut ws_stream, endpoint_label.clone(), options.clone()).await {
+        match receive_ws_stream(
+            &mut ws_stream,
+            endpoint_label.clone(),
+            options.clone(),
+            route_label,
+        )
+        .await
+        {
             Ok(result) => return Ok(result),
             Err(error) => {
-                tracing::warn!(%error, %peer, "public tunnel transfer failed; waiting for another connection");
+                tracing::warn!(%error, %peer, route = log_label, "websocket bridge transfer failed; waiting for another connection");
                 emit_event(
                     &options.events,
                     PeerlineEvent::StageChanged(TransferStage::Failed(error.to_string())),
@@ -163,6 +240,46 @@ pub async fn send_prebuilt_public_tunnel(
     complete_public_tunnel_transfer(session, &archive, &options, transfer_id, descriptor).await
 }
 
+pub async fn send_prebuilt_tor_onion(
+    options: SendOptions,
+    archive: Archive,
+    transfer_id: TransferId,
+    endpoint: String,
+    socks_proxy: SocketAddr,
+) -> anyhow::Result<SentTransfer> {
+    let endpoint = normalize_tor_onion_url(&endpoint)?;
+    let descriptor = crate::direct::descriptor_for_archive(&options, &archive);
+    emit_stage(
+        &options.events,
+        TransferStage::Connecting(ConnectionRoute::TorOnion),
+    );
+    emit_message(
+        &options.events,
+        format!("dialing {} via SOCKS5 {}", endpoint, socks_proxy),
+    );
+
+    let session = match time::timeout(
+        PUBLIC_TUNNEL_SESSION_OPEN_TIMEOUT,
+        open_tor_onion_session(
+            endpoint.clone(),
+            socks_proxy,
+            options.name.as_ref(),
+            &options.code,
+            descriptor.clone(),
+        ),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => anyhow::bail!(
+            "timed out connecting to {} after {} seconds",
+            endpoint,
+            PUBLIC_TUNNEL_SESSION_OPEN_TIMEOUT.as_secs()
+        ),
+    };
+    complete_public_tunnel_transfer(session, &archive, &options, transfer_id, descriptor).await
+}
+
 struct PublicTunnelSession<S> {
     endpoint: String,
     stream: WebSocketStream<S>,
@@ -180,8 +297,56 @@ async fn open_public_tunnel_session(
     code: &peerline_core::HumanCode,
     descriptor: peerline_core::TransferDescriptor,
 ) -> anyhow::Result<PublicTunnelSession<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>> {
-    let (mut stream, _) = connect_async(&endpoint).await?;
-    let transcript = direct_transcript_for_route(name, PUBLIC_TUNNEL_ROUTE_LABEL);
+    let (stream, _) = connect_async(&endpoint).await?;
+    open_websocket_session(
+        stream,
+        endpoint,
+        name,
+        code,
+        descriptor,
+        PUBLIC_TUNNEL_ROUTE_LABEL,
+    )
+    .await
+}
+
+async fn open_tor_onion_session(
+    endpoint: String,
+    socks_proxy: SocketAddr,
+    name: Option<&peerline_core::HumanName>,
+    code: &peerline_core::HumanCode,
+    descriptor: peerline_core::TransferDescriptor,
+) -> anyhow::Result<PublicTunnelSession<Socks5Stream<tokio::net::TcpStream>>> {
+    let url = reqwest::Url::parse(&endpoint)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Tor onion URL is missing a host"))?
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(80);
+    let stream = Socks5Stream::connect(socks_proxy, (host.as_str(), port)).await?;
+    let (stream, _) = client_async(&endpoint, stream).await?;
+    open_websocket_session(
+        stream,
+        endpoint,
+        name,
+        code,
+        descriptor,
+        TOR_ONION_ROUTE_LABEL,
+    )
+    .await
+}
+
+async fn open_websocket_session<S>(
+    mut stream: WebSocketStream<S>,
+    endpoint: String,
+    name: Option<&peerline_core::HumanName>,
+    code: &peerline_core::HumanCode,
+    descriptor: peerline_core::TransferDescriptor,
+    route_label: &'static str,
+) -> anyhow::Result<PublicTunnelSession<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let transcript = direct_transcript_for_route(name, route_label);
     let opaque_client = start_client_login(code.as_str().as_bytes())?;
     let client_handshake = ClientHandshake::start();
     ws_write_wire(
@@ -212,7 +377,7 @@ async fn open_public_tunnel_session(
         WireFrame::Error { message } => {
             return Err(TransferError::fatal(anyhow::anyhow!(message)).into());
         }
-        _ => anyhow::bail!("unexpected public tunnel handshake frame"),
+        _ => anyhow::bail!("unexpected websocket handshake frame"),
     };
 
     Ok(PublicTunnelSession {
@@ -348,6 +513,7 @@ async fn receive_ws_stream<S>(
     stream: &mut WebSocketStream<S>,
     peer: String,
     options: RecvOptions,
+    route_label: &'static str,
 ) -> anyhow::Result<crate::direct::ReceivedTransfer>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -396,7 +562,7 @@ where
         &options.events,
         PeerlineEvent::StageChanged(TransferStage::Authenticating),
     );
-    let transcript = direct_transcript_for_route(intro.0.as_ref(), PUBLIC_TUNNEL_ROUTE_LABEL);
+    let transcript = direct_transcript_for_route(intro.0.as_ref(), route_label);
 
     let record = create_server_record(
         options.code.as_str().as_bytes(),
@@ -617,7 +783,7 @@ fn emit_progress(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_public_tunnel_url;
+    use super::{normalize_public_tunnel_url, normalize_tor_onion_url};
 
     #[test]
     fn normalizes_public_tunnel_urls_to_websocket_schemes() {
@@ -639,5 +805,28 @@ mod tests {
     fn rejects_loopback_public_tunnel_urls() {
         assert!(normalize_public_tunnel_url("https://127.0.0.1:8080").is_err());
         assert!(normalize_public_tunnel_url("ws://localhost:8080").is_err());
+    }
+
+    #[test]
+    fn normalizes_tor_onion_urls_to_websocket_schemes() {
+        assert_eq!(
+            normalize_tor_onion_url("abcdefghijklmnopqrstuvwxyzabcdefghijklmnop.onion").unwrap(),
+            "ws://abcdefghijklmnopqrstuvwxyzabcdefghijklmnop.onion/"
+        );
+        assert_eq!(
+            normalize_tor_onion_url("http://abcdefghijklmnopqrstuvwxyzabcdefghijklmnop.onion/x")
+                .unwrap(),
+            "ws://abcdefghijklmnopqrstuvwxyzabcdefghijklmnop.onion/x"
+        );
+    }
+
+    #[test]
+    fn rejects_non_onion_tor_urls() {
+        assert!(normalize_tor_onion_url("https://example.com").is_err());
+        assert!(normalize_tor_onion_url("ws://127.0.0.1:8080").is_err());
+        assert!(
+            normalize_tor_onion_url("wss://abcdefghijklmnopqrstuvwxyzabcdefghijklmnop.onion")
+                .is_err()
+        );
     }
 }

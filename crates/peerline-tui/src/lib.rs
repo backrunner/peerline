@@ -222,6 +222,7 @@ fn connection_route_label(route: &ConnectionRoute) -> &'static str {
         ConnectionRoute::LanDirect => "lan-direct",
         ConnectionRoute::PublicDirect => "public-direct",
         ConnectionRoute::PublicTunnel => "public-tunnel",
+        ConnectionRoute::TorOnion => "tor-onion",
         ConnectionRoute::Libp2pQuic => "libp2p-quic",
         ConnectionRoute::Libp2pDcutr => "libp2p-dcutr",
         ConnectionRoute::Libp2pRelay => "libp2p-relay",

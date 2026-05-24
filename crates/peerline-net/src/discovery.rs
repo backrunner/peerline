@@ -12,7 +12,7 @@ use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use peerline_core::{ConnectionRoute, HumanCode, HumanName, LookupKey, NameCode};
 use peerline_rendezvous_model::{
-    PeerDescriptor, PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
+    PeerDescriptor, PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION, TorOnionEndpoint,
 };
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
@@ -36,6 +36,7 @@ pub enum RouteKind {
     LanDirect,
     PublicDirect,
     PublicTunnel,
+    TorOnion,
     Libp2pQuic,
     Libp2pDcutr,
     Libp2pRelay,
@@ -49,6 +50,7 @@ impl RouteKind {
             RouteKind::LanDirect => ConnectionRoute::LanDirect,
             RouteKind::PublicDirect => ConnectionRoute::PublicDirect,
             RouteKind::PublicTunnel => ConnectionRoute::PublicTunnel,
+            RouteKind::TorOnion => ConnectionRoute::TorOnion,
             RouteKind::Libp2pQuic => ConnectionRoute::Libp2pQuic,
             RouteKind::Libp2pDcutr => ConnectionRoute::Libp2pDcutr,
             RouteKind::Libp2pRelay => ConnectionRoute::Libp2pRelay,
@@ -85,6 +87,8 @@ pub struct DiscoveryConfig {
     pub enable_dcutr: bool,
     pub enable_turn: bool,
     pub enable_public_tunnels: bool,
+    pub enable_tor: bool,
+    pub tor_socks_proxy: SocketAddr,
     pub allow_loopback_endpoints: bool,
     pub allow_relay_data_fallback: bool,
     pub bootstrap_peers: Vec<String>,
@@ -120,6 +124,8 @@ impl Default for DiscoveryConfig {
             enable_dcutr: env_flag("PEERLINE_DISABLE_DCUTR").is_none(),
             enable_turn,
             enable_public_tunnels: env_flag("PEERLINE_DISABLE_PUBLIC_TUNNELS").is_none(),
+            enable_tor: env_flag("PEERLINE_DISABLE_TOR").is_none(),
+            tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
             allow_loopback_endpoints: env_flag("PEERLINE_ALLOW_LOOPBACK_DISCOVERY").is_some(),
             allow_relay_data_fallback: env_flag("PEERLINE_DISABLE_RELAY_FALLBACK").is_none(),
             bootstrap_peers,
@@ -138,6 +144,7 @@ impl DiscoveryConfig {
     pub fn route_enabled(&self, route: &RouteKind) -> bool {
         match route {
             RouteKind::PublicTunnel => self.enable_public_tunnels,
+            RouteKind::TorOnion => self.enable_tor,
             RouteKind::Libp2pQuic => self.enable_quic,
             RouteKind::Libp2pDcutr => self.enable_dcutr,
             RouteKind::WebRtcTurn => self.enable_turn,
@@ -247,6 +254,7 @@ pub(crate) fn make_peer_descriptor(
     direct_endpoints: Vec<String>,
     libp2p_endpoints: Vec<String>,
     public_endpoints: Vec<PublicTunnelEndpoint>,
+    tor_endpoints: Vec<TorOnionEndpoint>,
 ) -> PeerDescriptor {
     PeerDescriptor {
         protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
@@ -254,6 +262,7 @@ pub(crate) fn make_peer_descriptor(
         direct_endpoints,
         libp2p_endpoints,
         public_endpoints,
+        tor_endpoints,
         published_unix_ms: now_unix_ms(),
     }
 }
