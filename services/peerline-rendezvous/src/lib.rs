@@ -1,9 +1,9 @@
 use peerline_rendezvous_model::{
-    HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_VERSION, PeerDescriptor,
-    PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION, RendezvousDiscoverRequest,
-    RendezvousDiscoverResponse, RendezvousRecord, RendezvousRegisterRequest,
-    RendezvousRegisterResponse, RendezvousUnregisterResponse, TorOnionEndpoint,
-    request_path_and_query, verify_peerline_request_signature,
+    HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_VERSION, PeerDescriptor, PublicTunnelEndpoint,
+    RENDEZVOUS_DEFAULT_MAX_TTL_SECS, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
+    RendezvousDiscoverRequest, RendezvousDiscoverResponse, RendezvousRecord,
+    RendezvousRegisterRequest, RendezvousRegisterResponse, RendezvousUnregisterResponse,
+    TorOnionEndpoint, request_path_and_query, verify_peerline_request_signature,
 };
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -21,7 +21,6 @@ const CLIENT_CERT_FINGERPRINTS_BINDING: &str =
 
 // v0.1.0-beta.1 clients accidentally used the transfer protocol version here.
 const LEGACY_TRANSFER_DESCRIPTOR_PROTOCOL_VERSION: u16 = 2;
-const DEFAULT_MAX_TTL_SECS: u32 = 180;
 const DEFAULT_DISCOVER_LIMIT: u32 = 32;
 const MAX_DISCOVER_LIMIT: u32 = 128;
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
@@ -144,7 +143,7 @@ impl DurableObject for RendezvousShard {
             max_ttl_secs: env_positive_u32(
                 &env,
                 "PEERLINE_RENDEZVOUS_MAX_TTL_SECS",
-                DEFAULT_MAX_TTL_SECS,
+                RENDEZVOUS_DEFAULT_MAX_TTL_SECS,
             ),
         }
     }
@@ -290,37 +289,68 @@ impl RendezvousShard {
         let direct_endpoint_count = descriptor.direct_endpoints.len();
         let libp2p_endpoint_count = descriptor.libp2p_endpoints.len();
         let descriptor_json = serde_json::to_string(&descriptor)?;
-        self.sql.exec(
-            "DELETE FROM registrations WHERE peer_id = ?;",
-            vec![peer_id.clone().into()],
-        )?;
-        let row: CookieRow = self
+        let existing_rows: Vec<CookieRow> = self
             .sql
             .exec(
-                "INSERT INTO registrations(peer_id, expires_unix_ms, descriptor_json)
-                 VALUES (?, ?, ?)
-                 RETURNING cookie;",
+                "SELECT cookie
+                 FROM registrations
+                 WHERE peer_id = ?
+                 ORDER BY cookie ASC
+                 LIMIT 1;",
+                vec![peer_id.clone().into()],
+            )?
+            .to_array()?;
+        let existing_cookie = existing_rows.first().map(|row| row.cookie);
+        let row = if let Some(cookie) = existing_cookie {
+            self.sql.exec(
+                "UPDATE registrations
+                 SET expires_unix_ms = ?, descriptor_json = ?
+                 WHERE cookie = ?;",
                 vec![
-                    peer_id.clone().into(),
                     expires_unix_ms.into(),
                     descriptor_json.into(),
+                    cookie.into(),
                 ],
-            )?
-            .one()?;
+            )?;
+            self.sql.exec(
+                "DELETE FROM registrations WHERE peer_id = ? AND cookie <> ?;",
+                vec![peer_id.clone().into(), cookie.into()],
+            )?;
+            CookieRow { cookie }
+        } else {
+            self.sql
+                .exec(
+                    "INSERT INTO registrations(peer_id, expires_unix_ms, descriptor_json)
+                     VALUES (?, ?, ?)
+                     RETURNING cookie;",
+                    vec![
+                        peer_id.clone().into(),
+                        expires_unix_ms.into(),
+                        descriptor_json.into(),
+                    ],
+                )?
+                .one()?
+        };
         let record = RendezvousRecord {
             sequence: row.cookie as u64,
             expires_unix_ms: expires_unix_ms as u64,
             descriptor,
         };
+        let was_refresh = existing_cookie.is_some();
 
         log_request_event(
             LogLevel::Info,
-            "rendezvous_register_ok",
+            if was_refresh {
+                "rendezvous_refresh_ok"
+            } else {
+                "rendezvous_register_ok"
+            },
             telemetry,
             Some(namespace),
             serde_json::json!({
                 "peer_id": peer_id,
                 "cookie": row.cookie,
+                "refreshed": was_refresh,
                 "ttl_seconds": ttl_seconds,
                 "direct_endpoint_count": direct_endpoint_count,
                 "libp2p_endpoint_count": libp2p_endpoint_count,
@@ -332,7 +362,7 @@ impl RendezvousShard {
             cookie: row.cookie as u64,
             record,
         })?
-        .with_status(201))
+        .with_status(if was_refresh { 200 } else { 201 }))
     }
 
     async fn discover(
@@ -403,11 +433,7 @@ impl RendezvousShard {
                  WHERE expires_unix_ms > ? AND cookie > ?
                  ORDER BY cookie ASC
                  LIMIT ?;",
-                vec![
-                    now.into(),
-                    after_cookie_i64.into(),
-                    i64::from(limit).into(),
-                ],
+                vec![now.into(), after_cookie_i64.into(), i64::from(limit).into()],
             )?
             .to_array()?;
         let records = rows

@@ -499,12 +499,6 @@ async fn run_descriptor_publisher(
     let _rendezvous_registration = rendezvous::RendezvousRegistrationGuard::new(
         name_code.name.clone(),
         name_code.code.clone(),
-        descriptor.peer_id.clone(),
-        config.rendezvous.clone(),
-    );
-    rendezvous::publish_peer_descriptor_background(
-        name_code.name.clone(),
-        name_code.code.clone(),
         descriptor,
         config.rendezvous.clone(),
     );
@@ -520,12 +514,7 @@ async fn run_descriptor_publisher(
                     &mapped_direct_endpoints,
                     allow_loopback,
                 )?;
-                rendezvous::publish_peer_descriptor_background(
-                    name_code.name.clone(),
-                    name_code.code.clone(),
-                    descriptor,
-                    config.rendezvous.clone(),
-                );
+                _rendezvous_registration.update_descriptor(descriptor);
             }
             event = swarm.select_next_some() => {
                 if handle_publish_swarm_event(&mut swarm, event)
@@ -538,12 +527,7 @@ async fn run_descriptor_publisher(
                         allow_loopback,
                     )
                 {
-                    rendezvous::publish_peer_descriptor_background(
-                        name_code.name.clone(),
-                        name_code.code.clone(),
-                        descriptor,
-                        config.rendezvous.clone(),
-                    )
+                    _rendezvous_registration.update_descriptor(descriptor);
                 }
             }
             endpoints = wait_for_direct_mapping_change(&mut direct_mapping_rx) => {
@@ -557,12 +541,7 @@ async fn run_descriptor_publisher(
                         &mapped_direct_endpoints,
                         allow_loopback,
                     ) {
-                        rendezvous::publish_peer_descriptor_background(
-                            name_code.name.clone(),
-                            name_code.code.clone(),
-                            descriptor,
-                            config.rendezvous.clone(),
-                        )
+                        _rendezvous_registration.update_descriptor(descriptor);
                     }
                 }
             }

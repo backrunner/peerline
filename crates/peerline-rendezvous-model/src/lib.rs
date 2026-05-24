@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 pub const HEADER_TIMESTAMP: &str = "x-peerline-timestamp";
 pub const HEADER_SIGNATURE: &str = "x-peerline-signature";
 pub const HEADER_VERSION: &str = "x-peerline-version";
+pub const RENDEZVOUS_DEFAULT_REGISTRATION_TTL_SECS: u32 = 120;
+pub const RENDEZVOUS_DEFAULT_KEEPALIVE_SECS: u32 = 60;
+pub const RENDEZVOUS_REGISTRATION_TOLERANCE_SECS: u32 =
+    RENDEZVOUS_DEFAULT_REGISTRATION_TTL_SECS - RENDEZVOUS_DEFAULT_KEEPALIVE_SECS;
+pub const RENDEZVOUS_DEFAULT_MAX_TTL_SECS: u32 =
+    RENDEZVOUS_DEFAULT_REGISTRATION_TTL_SECS + RENDEZVOUS_REGISTRATION_TOLERANCE_SECS;
 /// Schema version for rendezvous `PeerDescriptor` records.
 ///
 /// This is independent from the transfer protocol version used by direct and

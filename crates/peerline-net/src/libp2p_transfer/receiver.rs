@@ -98,12 +98,6 @@ pub(crate) async fn recv_libp2p(
     let mut rendezvous_registration = rendezvous::RendezvousRegistrationGuard::new(
         options.name.clone(),
         options.code.clone(),
-        descriptor.peer_id.clone(),
-        options.discovery.rendezvous.clone(),
-    );
-    rendezvous::publish_peer_descriptor_background(
-        options.name.clone(),
-        options.code.clone(),
         descriptor,
         options.discovery.rendezvous.clone(),
     );
@@ -117,6 +111,7 @@ pub(crate) async fn recv_libp2p(
                     provider_key.clone(),
                     &options,
                     &mapped_direct_endpoints,
+                    &rendezvous_registration,
                 );
             }
             endpoints = wait_for_direct_mapping_change(&mut direct_mapping_rx) => {
@@ -128,6 +123,7 @@ pub(crate) async fn recv_libp2p(
                         provider_key.clone(),
                         &options,
                         &mapped_direct_endpoints,
+                        &rendezvous_registration,
                     );
                 }
             }
@@ -162,6 +158,7 @@ pub(crate) async fn recv_libp2p(
                             provider_key.clone(),
                             &options,
                             &mapped_direct_endpoints,
+                            &rendezvous_registration,
                         );
                     }
                     SwarmEvent::Behaviour(TransferBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
@@ -182,6 +179,7 @@ pub(crate) async fn recv_libp2p(
                                 provider_key.clone(),
                                 &options,
                                 &mapped_direct_endpoints,
+                                &rendezvous_registration,
                             );
                         }
                     }
@@ -199,6 +197,7 @@ pub(crate) async fn recv_libp2p(
                             provider_key.clone(),
                             &options,
                             &mapped_direct_endpoints,
+                            &rendezvous_registration,
                         );
                     }
                     _ => {}
@@ -214,6 +213,7 @@ fn republish_receiver_descriptor(
     provider_key: kad::RecordKey,
     options: &Libp2pRecvOptions,
     extra_direct_endpoints: &[SocketAddr],
+    rendezvous_registration: &rendezvous::RendezvousRegistrationGuard,
 ) {
     if let Ok(descriptor) = publish_receiver_descriptor(
         swarm,
@@ -222,12 +222,7 @@ fn republish_receiver_descriptor(
         options,
         extra_direct_endpoints,
     ) {
-        rendezvous::publish_peer_descriptor_background(
-            options.name.clone(),
-            options.code.clone(),
-            descriptor,
-            options.discovery.rendezvous.clone(),
-        )
+        rendezvous_registration.update_descriptor(descriptor);
     }
 }
 

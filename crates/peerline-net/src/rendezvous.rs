@@ -1,9 +1,11 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use peerline_core::{HumanCode, HumanName, NameCode};
 use peerline_rendezvous_model::{
-    HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_VERSION, PeerDescriptor, RendezvousDiscoverResponse,
-    RendezvousRegisterRequest, RendezvousUnregisterResponse, request_path_and_query,
-    sign_peerline_request,
+    HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_VERSION, PeerDescriptor,
+    RENDEZVOUS_DEFAULT_KEEPALIVE_SECS, RENDEZVOUS_DEFAULT_MAX_TTL_SECS,
+    RENDEZVOUS_DEFAULT_REGISTRATION_TTL_SECS, RENDEZVOUS_REGISTRATION_TOLERANCE_SECS,
+    RendezvousDiscoverResponse, RendezvousRegisterRequest, RendezvousUnregisterResponse,
+    request_path_and_query, sign_peerline_request,
 };
 use reqwest::Url;
 use std::{
@@ -11,9 +13,17 @@ use std::{
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::{
+    sync::watch,
+    task::JoinHandle,
+    time::{self, MissedTickBehavior},
+};
 
-const DEFAULT_RENDEZVOUS_TTL_SECS: u32 = 120;
 const DEFAULT_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_RENDEZVOUS_TTL: Duration =
+    Duration::from_secs(RENDEZVOUS_DEFAULT_REGISTRATION_TTL_SECS as u64);
+const DEFAULT_RENDEZVOUS_KEEPALIVE: Duration =
+    Duration::from_secs(RENDEZVOUS_DEFAULT_KEEPALIVE_SECS as u64);
 const PEERLINE_RENDEZVOUS_HOST_ROOT: &str = "rendezvous.peerline.pwp.sh";
 const PEERLINE_RENDEZVOUS_HOST_ALPHA: &str = "alpha.rendezvous.peerline.pwp.sh";
 const PEERLINE_RENDEZVOUS_HOST_BETA: &str = "beta.rendezvous.peerline.pwp.sh";
@@ -36,6 +46,7 @@ pub struct RendezvousConfig {
     pub client_identity: Option<RendezvousClientIdentity>,
     pub request_timeout: Duration,
     pub registration_ttl: Duration,
+    pub registration_keepalive: Duration,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -60,7 +71,8 @@ impl RendezvousConfig {
             auth_token: None,
             client_identity: None,
             request_timeout: DEFAULT_RENDEZVOUS_TIMEOUT,
-            registration_ttl: Duration::from_secs(DEFAULT_RENDEZVOUS_TTL_SECS.into()),
+            registration_ttl: DEFAULT_RENDEZVOUS_TTL,
+            registration_keepalive: DEFAULT_RENDEZVOUS_KEEPALIVE,
         }
     }
 }
@@ -79,14 +91,22 @@ impl Default for RendezvousConfig {
             );
         }
 
+        let registration_ttl =
+            env_duration_secs("PEERLINE_RENDEZVOUS_TTL_SECS").unwrap_or(DEFAULT_RENDEZVOUS_TTL);
+        let registration_keepalive = normalize_registration_keepalive(
+            registration_ttl,
+            env_duration_secs("PEERLINE_RENDEZVOUS_KEEPALIVE_SECS")
+                .unwrap_or(DEFAULT_RENDEZVOUS_KEEPALIVE),
+        );
+
         Self {
             endpoints,
             auth_token: auth_token_from_env(),
             client_identity,
             request_timeout: env_duration_ms("PEERLINE_RENDEZVOUS_TIMEOUT_MS")
                 .unwrap_or(DEFAULT_RENDEZVOUS_TIMEOUT),
-            registration_ttl: env_duration_secs("PEERLINE_RENDEZVOUS_TTL_SECS")
-                .unwrap_or_else(|| Duration::from_secs(DEFAULT_RENDEZVOUS_TTL_SECS.into())),
+            registration_ttl,
+            registration_keepalive,
         }
     }
 }
@@ -105,6 +125,7 @@ impl fmt::Debug for RendezvousConfig {
             )
             .field("request_timeout", &self.request_timeout)
             .field("registration_ttl", &self.registration_ttl)
+            .field("registration_keepalive", &self.registration_keepalive)
             .finish()
     }
 }
@@ -151,12 +172,22 @@ pub async fn publish_peer_descriptor(
         {
             Ok(response) if response.status().is_success() => {
                 published += 1;
-                tracing::info!(
-                    endpoint = %endpoint,
-                    namespace = %namespace,
-                    peer_id = %descriptor.peer_id,
-                    "rendezvous registration accepted"
-                );
+                if response.status() == reqwest::StatusCode::CREATED {
+                    tracing::info!(
+                        endpoint = %endpoint,
+                        namespace = %namespace,
+                        peer_id = %descriptor.peer_id,
+                        "rendezvous registration accepted"
+                    );
+                } else {
+                    tracing::info!(
+                        endpoint = %endpoint,
+                        namespace = %namespace,
+                        peer_id = %descriptor.peer_id,
+                        status = %response.status(),
+                        "rendezvous registration refreshed"
+                    );
+                }
             }
             Ok(response) => {
                 tracing::debug!(
@@ -261,21 +292,50 @@ pub struct RendezvousRegistrationGuard {
     peer_id: String,
     config: RendezvousConfig,
     active: bool,
+    descriptor_tx: Option<watch::Sender<PeerDescriptor>>,
+    keepalive: Option<JoinHandle<()>>,
 }
 
 impl RendezvousRegistrationGuard {
     pub fn new(
         name: HumanName,
         code: HumanCode,
-        peer_id: impl Into<String>,
+        descriptor: PeerDescriptor,
         config: RendezvousConfig,
     ) -> Self {
+        let peer_id = descriptor.peer_id.clone();
+        let (descriptor_tx, descriptor_rx) = watch::channel(descriptor);
+        let keepalive = (!usable_endpoints(&config).is_empty()).then(|| {
+            tokio::spawn(run_registration_keepalive(
+                name.clone(),
+                code.clone(),
+                config.clone(),
+                descriptor_rx,
+            ))
+        });
+
         Self {
             name,
             code,
-            peer_id: peer_id.into(),
+            peer_id,
             config,
             active: true,
+            descriptor_tx: Some(descriptor_tx),
+            keepalive,
+        }
+    }
+
+    pub fn update_descriptor(&self, descriptor: PeerDescriptor) {
+        if descriptor.peer_id != self.peer_id {
+            tracing::warn!(
+                current_peer_id = %self.peer_id,
+                update_peer_id = %descriptor.peer_id,
+                "ignoring rendezvous descriptor update for different peer"
+            );
+            return;
+        }
+        if let Some(sender) = &self.descriptor_tx {
+            let _ = sender.send(descriptor);
         }
     }
 
@@ -284,11 +344,21 @@ impl RendezvousRegistrationGuard {
             return;
         }
         self.active = false;
+        if let Some(handle) = self.abort_keepalive() {
+            let _ = handle.await;
+        }
         if let Err(error) =
             unpublish_peer_descriptor(&self.name, &self.code, &self.peer_id, &self.config).await
         {
             tracing::debug!(%error, peer_id = %self.peer_id, "rendezvous unregister failed");
         }
+    }
+
+    fn abort_keepalive(&mut self) -> Option<JoinHandle<()>> {
+        self.descriptor_tx.take();
+        let handle = self.keepalive.take()?;
+        handle.abort();
+        Some(handle)
     }
 }
 
@@ -297,6 +367,7 @@ impl Drop for RendezvousRegistrationGuard {
         if !self.active {
             return;
         }
+        let _ = self.abort_keepalive();
         let name = self.name.clone();
         let code = self.code.clone();
         let peer_id = self.peer_id.clone();
@@ -309,6 +380,40 @@ impl Drop for RendezvousRegistrationGuard {
                     tracing::debug!(%error, peer_id = %peer_id, "rendezvous drop unregister failed");
                 }
             }));
+        }
+    }
+}
+
+async fn run_registration_keepalive(
+    name: HumanName,
+    code: HumanCode,
+    config: RendezvousConfig,
+    mut descriptor_rx: watch::Receiver<PeerDescriptor>,
+) {
+    let descriptor = descriptor_rx.borrow().clone();
+    if let Err(error) = publish_peer_descriptor(&name, &code, &descriptor, &config).await {
+        tracing::warn!(%error, "rendezvous registration refresh failed");
+    }
+
+    let mut interval = time::interval_at(
+        time::Instant::now() + registration_keepalive_interval(&config),
+        registration_keepalive_interval(&config),
+    );
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let descriptor = descriptor_rx.borrow().clone();
+                if let Err(error) = publish_peer_descriptor(&name, &code, &descriptor, &config).await {
+                    tracing::warn!(%error, "rendezvous registration refresh failed");
+                }
+            }
+            changed = descriptor_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -593,6 +698,29 @@ fn env_duration_secs(name: &str) -> Option<Duration> {
     Some(Duration::from_secs(seconds))
 }
 
+fn registration_keepalive_interval(config: &RendezvousConfig) -> Duration {
+    normalize_registration_keepalive(config.registration_ttl, config.registration_keepalive)
+}
+
+fn normalize_registration_keepalive(ttl: Duration, requested: Duration) -> Duration {
+    let ttl_secs = ttl
+        .min(Duration::from_secs(u64::from(
+            RENDEZVOUS_DEFAULT_MAX_TTL_SECS,
+        )))
+        .as_secs()
+        .max(1);
+    let requested_secs = requested.as_secs().max(1);
+    let tolerance_secs = if ttl_secs <= 1 {
+        0
+    } else {
+        (ttl_secs / 2)
+            .max(1)
+            .min(u64::from(RENDEZVOUS_REGISTRATION_TOLERANCE_SECS))
+    };
+    let latest_refresh_secs = ttl_secs.saturating_sub(tolerance_secs).max(1);
+    Duration::from_secs(requested_secs.min(latest_refresh_secs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,10 +770,52 @@ mod tests {
             auth_token: None,
             client_identity: None,
             request_timeout: DEFAULT_RENDEZVOUS_TIMEOUT,
-            registration_ttl: Duration::from_secs(DEFAULT_RENDEZVOUS_TTL_SECS.into()),
+            registration_ttl: DEFAULT_RENDEZVOUS_TTL,
+            registration_keepalive: DEFAULT_RENDEZVOUS_KEEPALIVE,
         };
 
         assert_eq!(usable_endpoints(&config), vec![&public]);
+    }
+
+    #[test]
+    fn default_keepalive_leaves_registration_tolerance() {
+        let config = RendezvousConfig::disabled();
+
+        assert_eq!(config.registration_ttl, Duration::from_secs(120));
+        assert_eq!(
+            registration_keepalive_interval(&config),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            config
+                .registration_ttl
+                .saturating_sub(registration_keepalive_interval(&config)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn oversized_keepalive_is_clamped_inside_ttl_tolerance() {
+        assert_eq!(
+            normalize_registration_keepalive(Duration::from_secs(120), Duration::from_secs(119)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            normalize_registration_keepalive(Duration::from_secs(30), Duration::from_secs(30)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            normalize_registration_keepalive(Duration::from_secs(2), Duration::from_secs(10)),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn keepalive_uses_server_default_ttl_cap_for_tolerance() {
+        assert_eq!(
+            normalize_registration_keepalive(Duration::from_secs(600), Duration::from_secs(500)),
+            Duration::from_secs(120)
+        );
     }
 
     #[test]
