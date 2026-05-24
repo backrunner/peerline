@@ -860,7 +860,7 @@ async fn complete_direct_transfer(
     )
     .await?;
 
-    let aead = ChunkAead::new(keys.send_key, *b"pl01");
+    let mut aead = ChunkAead::new(keys.send_key, *b"pl01");
     emit_transfer_started(
         &options.events,
         transfer_id,
@@ -884,7 +884,7 @@ async fn complete_direct_transfer(
         .await?;
     write_secure(
         &mut session.stream,
-        &aead,
+        &mut aead,
         &mut sequence,
         &SecureFrame::Header {
             compression: archive.compression,
@@ -900,7 +900,7 @@ async fn complete_direct_transfer(
         bytes_sent += read as u64;
         write_secure(
             &mut session.stream,
-            &aead,
+            &mut aead,
             &mut sequence,
             &SecureFrame::ArchiveChunk {
                 bytes: buffer[..read].to_vec(),
@@ -916,7 +916,7 @@ async fn complete_direct_transfer(
     }
     write_secure(
         &mut session.stream,
-        &aead,
+        &mut aead,
         &mut sequence,
         &SecureFrame::Done,
     )
@@ -1188,10 +1188,10 @@ async fn receive_stream(
     };
     let opaque_key = opaque_server.finish(&finish.0)?;
     let keys = server_handshake.finish(&intro.3, &finish.1, &opaque_key, &transcript)?;
-    let aead = ChunkAead::new(keys.recv_key, *b"pl01");
+    let mut aead = ChunkAead::new(keys.recv_key, *b"pl01");
 
     let mut expected_sequence = 0u64;
-    let header = read_secure(&mut stream, &aead, &mut expected_sequence).await?;
+    let header = read_secure(&mut stream, &mut aead, &mut expected_sequence).await?;
     let compression = match header {
         SecureFrame::Header { compression } => compression,
         _ => anyhow::bail!("secure stream must start with header"),
@@ -1206,7 +1206,7 @@ async fn receive_stream(
 
     std::fs::create_dir_all(&options.destination)?;
     loop {
-        match read_secure(&mut stream, &aead, &mut expected_sequence).await? {
+        match read_secure(&mut stream, &mut aead, &mut expected_sequence).await? {
             SecureFrame::ArchiveChunk { bytes } => {
                 let bytes_received = resume::append_chunk(&mut resume_state, &intro.1, &bytes)?;
                 emit_event(
@@ -1561,11 +1561,11 @@ mod tests {
             },
         )
         .await?;
-        let aead = ChunkAead::new(keys.send_key, *b"pl01");
+        let mut aead = ChunkAead::new(keys.send_key, *b"pl01");
         let mut sequence = 0u64;
         write_secure(
             &mut stream,
-            &aead,
+            &mut aead,
             &mut sequence,
             &SecureFrame::Header {
                 compression: archive.compression,
@@ -1583,7 +1583,7 @@ mod tests {
             remaining -= read;
             write_secure(
                 &mut stream,
-                &aead,
+                &mut aead,
                 &mut sequence,
                 &SecureFrame::ArchiveChunk {
                     bytes: buffer[..read].to_vec(),

@@ -3,7 +3,7 @@ use peerline_crypto::{ChunkAead, ClientHello, ClientKem, EncryptedChunk, ServerH
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
+pub(crate) const PROTOCOL_VERSION: u16 = 3;
 pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
 pub(crate) const SECURE_AAD: &[u8] = b"peerline:secure-frame:v1";
 pub(crate) const LIBP2P_TRANSFER_PROTOCOL: &str = "/peerline/transfer/1";
@@ -43,7 +43,7 @@ pub(crate) enum SecureFrame {
 
 pub(crate) async fn write_secure<W: AsyncWrite + Unpin>(
     writer: &mut W,
-    aead: &ChunkAead,
+    aead: &mut ChunkAead,
     sequence: &mut u64,
     frame: &SecureFrame,
 ) -> anyhow::Result<()> {
@@ -53,7 +53,7 @@ pub(crate) async fn write_secure<W: AsyncWrite + Unpin>(
 
 pub(crate) async fn read_secure<R: AsyncRead + Unpin>(
     reader: &mut R,
-    aead: &ChunkAead,
+    aead: &mut ChunkAead,
     expected_sequence: &mut u64,
 ) -> anyhow::Result<SecureFrame> {
     let encrypted = match read_wire(reader).await? {
@@ -64,7 +64,7 @@ pub(crate) async fn read_secure<R: AsyncRead + Unpin>(
 }
 
 pub(crate) fn encrypt_secure(
-    aead: &ChunkAead,
+    aead: &mut ChunkAead,
     sequence: &mut u64,
     frame: &SecureFrame,
 ) -> anyhow::Result<EncryptedChunk> {
@@ -75,7 +75,7 @@ pub(crate) fn encrypt_secure(
 }
 
 pub(crate) fn decrypt_secure(
-    aead: &ChunkAead,
+    aead: &mut ChunkAead,
     expected_sequence: &mut u64,
     encrypted: EncryptedChunk,
 ) -> anyhow::Result<SecureFrame> {
@@ -148,4 +148,49 @@ pub(crate) fn libp2p_transcript(
         .append("name", name.as_str().as_bytes())
         .append("lookup-key", lookup_key.bytes())
         .append("receiver-peer-id", receiver_peer_id.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use peerline_core::Compression;
+
+    #[test]
+    fn secure_frames_use_ratcheted_message_keys() {
+        let mut sender = ChunkAead::new([7u8; 32], *b"pl01");
+        let mut receiver = ChunkAead::new([7u8; 32], *b"pl01");
+        let mut sequence = 0;
+        let mut expected_sequence = 0;
+
+        let first = encrypt_secure(
+            &mut sender,
+            &mut sequence,
+            &SecureFrame::Header {
+                compression: Compression::None,
+            },
+        )
+        .unwrap();
+        let second = encrypt_secure(
+            &mut sender,
+            &mut sequence,
+            &SecureFrame::ArchiveChunk {
+                bytes: b"hello".to_vec(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            decrypt_secure(&mut receiver, &mut expected_sequence, first.clone()).unwrap(),
+            SecureFrame::Header {
+                compression: Compression::None
+            }
+        ));
+        assert!(matches!(
+            decrypt_secure(&mut receiver, &mut expected_sequence, second).unwrap(),
+            SecureFrame::ArchiveChunk { bytes } if bytes == b"hello"
+        ));
+
+        let mut replay_sequence = 0;
+        assert!(decrypt_secure(&mut receiver, &mut replay_sequence, first).is_err());
+    }
 }

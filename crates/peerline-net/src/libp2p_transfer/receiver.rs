@@ -593,7 +593,7 @@ fn handle_inbound_request(
                 .ok_or_else(|| anyhow::anyhow!("libp2p session not initialized"))?;
             let aead = session
                 .aead
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("secure channel not ready"))?;
             let frame = decrypt_secure(aead, &mut session.expected_sequence, encrypted)?;
             match frame {

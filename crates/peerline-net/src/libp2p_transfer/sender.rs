@@ -201,7 +201,7 @@ pub(crate) async fn send_prebuilt_libp2p(
         WireFrame::Error { message } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected libp2p finish response: {other:?}"),
     }
-    let aead = ChunkAead::new(session_keys.send_key, *b"pl01");
+    let mut aead = ChunkAead::new(session_keys.send_key, *b"pl01");
     emit_transfer_started(
         &options.events,
         transfer_id,
@@ -226,7 +226,7 @@ pub(crate) async fn send_prebuilt_libp2p(
     send_secure_request(
         &mut swarm,
         &options,
-        &aead,
+        &mut aead,
         &mut sequence,
         SecureFrame::Header {
             compression: archive.compression,
@@ -244,7 +244,7 @@ pub(crate) async fn send_prebuilt_libp2p(
         send_secure_request(
             &mut swarm,
             &options,
-            &aead,
+            &mut aead,
             &mut sequence,
             SecureFrame::ArchiveChunk {
                 bytes: buffer[..read].to_vec(),
@@ -262,7 +262,7 @@ pub(crate) async fn send_prebuilt_libp2p(
     send_secure_request(
         &mut swarm,
         &options,
-        &aead,
+        &mut aead,
         &mut sequence,
         SecureFrame::Done,
     )
@@ -279,7 +279,7 @@ pub(crate) async fn send_prebuilt_libp2p(
 async fn send_secure_request(
     swarm: &mut Swarm<TransferBehaviour>,
     options: &Libp2pSendOptions,
-    aead: &ChunkAead,
+    aead: &mut ChunkAead,
     sequence: &mut u64,
     frame: SecureFrame,
 ) -> anyhow::Result<()> {

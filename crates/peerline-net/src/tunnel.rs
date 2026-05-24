@@ -427,7 +427,7 @@ where
     )
     .await?;
 
-    let aead = ChunkAead::new(keys.send_key, *b"pl01");
+    let mut aead = ChunkAead::new(keys.send_key, *b"pl01");
     emit_transfer_started(
         &options.events,
         transfer_id,
@@ -451,7 +451,7 @@ where
         .await?;
     ws_write_secure(
         &mut session.stream,
-        &aead,
+        &mut aead,
         &mut sequence,
         &SecureFrame::Header {
             compression: archive.compression,
@@ -467,7 +467,7 @@ where
         bytes_sent += read as u64;
         ws_write_secure(
             &mut session.stream,
-            &aead,
+            &mut aead,
             &mut sequence,
             &SecureFrame::ArchiveChunk {
                 bytes: buffer[..read].to_vec(),
@@ -483,7 +483,7 @@ where
     }
     ws_write_secure(
         &mut session.stream,
-        &aead,
+        &mut aead,
         &mut sequence,
         &SecureFrame::Done,
     )
@@ -591,10 +591,10 @@ where
     };
     let opaque_key = opaque_server.finish(&finish.0)?;
     let keys = server_handshake.finish(&intro.3, &finish.1, &opaque_key, &transcript)?;
-    let aead = ChunkAead::new(keys.recv_key, *b"pl01");
+    let mut aead = ChunkAead::new(keys.recv_key, *b"pl01");
 
     let mut expected_sequence = 0u64;
-    let header = ws_read_secure(stream, &aead, &mut expected_sequence).await?;
+    let header = ws_read_secure(stream, &mut aead, &mut expected_sequence).await?;
     let compression = match header {
         SecureFrame::Header { compression } => compression,
         _ => anyhow::bail!("secure stream must start with header"),
@@ -609,7 +609,7 @@ where
 
     std::fs::create_dir_all(&options.destination)?;
     loop {
-        match ws_read_secure(stream, &aead, &mut expected_sequence).await? {
+        match ws_read_secure(stream, &mut aead, &mut expected_sequence).await? {
             SecureFrame::ArchiveChunk { bytes } => {
                 let bytes_received = resume::append_chunk(&mut resume_state, &intro.1, &bytes)?;
                 emit_event(
@@ -697,7 +697,7 @@ where
 
 async fn ws_write_secure<S>(
     stream: &mut WebSocketStream<S>,
-    aead: &ChunkAead,
+    aead: &mut ChunkAead,
     sequence: &mut u64,
     frame: &SecureFrame,
 ) -> anyhow::Result<()>
@@ -710,7 +710,7 @@ where
 
 async fn ws_read_secure<S>(
     stream: &mut WebSocketStream<S>,
-    aead: &ChunkAead,
+    aead: &mut ChunkAead,
     expected_sequence: &mut u64,
 ) -> anyhow::Result<SecureFrame>
 where
