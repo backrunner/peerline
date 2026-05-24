@@ -413,6 +413,10 @@ async fn run_registration_keepalive(
                 if changed.is_err() {
                     break;
                 }
+                let descriptor = descriptor_rx.borrow_and_update().clone();
+                if let Err(error) = publish_peer_descriptor(&name, &code, &descriptor, &config).await {
+                    tracing::warn!(%error, "rendezvous registration refresh failed");
+                }
             }
         }
     }
@@ -724,6 +728,11 @@ fn normalize_registration_keepalive(ttl: Duration, requested: Duration) -> Durat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::mpsc,
+    };
 
     #[test]
     fn default_rendezvous_endpoint_matches_release_channel() {
@@ -830,5 +839,166 @@ mod tests {
         let encoded = STANDARD.encode(pem);
 
         assert_eq!(pem_bundle_from_base64(&encoded), Some(pem.to_vec()));
+    }
+
+    fn header_value<'a>(headers: &'a str, expected_name: &str) -> Option<&'a str> {
+        headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case(expected_name)
+                    .then(|| value.trim())
+            })
+    }
+
+    fn decode_chunked_body(bytes: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut index = 0usize;
+        loop {
+            let Some(line_end) = bytes[index..]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .map(|position| index + position)
+            else {
+                break;
+            };
+            let line = String::from_utf8_lossy(&bytes[index..line_end]);
+            let size = usize::from_str_radix(line.trim(), 16).unwrap_or_default();
+            index = line_end + 2;
+            if size == 0 || index + size > bytes.len() {
+                break;
+            }
+            body.extend_from_slice(&bytes[index..index + size]);
+            index = index + size + 2;
+        }
+        body
+    }
+
+    #[tokio::test]
+    async fn registration_guard_publishes_descriptor_updates_immediately() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_tx = request_tx.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 1024];
+                    loop {
+                        let Ok(read) = socket.read(&mut buffer).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        let Some(header_end) = request
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .map(|position| position + 4)
+                        else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let body = if let Some(content_length) =
+                            header_value(&headers, "content-length")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        {
+                            let needed = header_end + content_length;
+                            while request.len() < needed {
+                                let Ok(read) = socket.read(&mut buffer).await else {
+                                    return;
+                                };
+                                if read == 0 {
+                                    return;
+                                }
+                                request.extend_from_slice(&buffer[..read]);
+                            }
+                            request[header_end..needed].to_vec()
+                        } else if header_value(&headers, "transfer-encoding")
+                            .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+                        {
+                            while !request[header_end..]
+                                .windows(5)
+                                .any(|window| window == b"0\r\n\r\n")
+                            {
+                                let Ok(read) = socket.read(&mut buffer).await else {
+                                    return;
+                                };
+                                if read == 0 {
+                                    return;
+                                }
+                                request.extend_from_slice(&buffer[..read]);
+                            }
+                            decode_chunked_body(&request[header_end..])
+                        } else {
+                            Vec::new()
+                        };
+                        let _ = request_tx.send(body);
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 201 Created\r\ncontent-length: 2\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}",
+                            )
+                            .await;
+                        return;
+                    }
+                });
+            }
+        });
+
+        let name = HumanName::parse("river-mango-42").unwrap();
+        let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+        let config = RendezvousConfig {
+            endpoints: vec![endpoint],
+            auth_token: None,
+            client_identity: None,
+            request_timeout: Duration::from_secs(2),
+            registration_ttl: Duration::from_secs(120),
+            registration_keepalive: Duration::from_secs(60),
+        };
+        let initial = PeerDescriptor {
+            protocol_version: peerline_rendezvous_model::RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
+            peer_id: "12D3KooWJ6cigH96Q8ngveZkSjcVcs4ehcrgK9tSbMgCtwuvmn7T".into(),
+            direct_endpoints: vec!["192.168.1.20:43117".into()],
+            libp2p_endpoints: Vec::new(),
+            public_endpoints: Vec::new(),
+            tor_endpoints: Vec::new(),
+            published_unix_ms: 1,
+        };
+        let updated = PeerDescriptor {
+            public_endpoints: vec![peerline_rendezvous_model::PublicTunnelEndpoint {
+                provider: "cloudflared".into(),
+                url: "https://example.com/transfer".into(),
+            }],
+            published_unix_ms: 2,
+            ..initial.clone()
+        };
+
+        let guard = RendezvousRegistrationGuard::new(name, code, initial.clone(), config);
+        let request = time::timeout(Duration::from_secs(2), request_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let published = serde_json::from_slice::<RendezvousRegisterRequest>(&request)
+            .unwrap()
+            .descriptor;
+        assert_eq!(published.direct_endpoints, initial.direct_endpoints);
+
+        guard.update_descriptor(updated.clone());
+        let request = time::timeout(Duration::from_secs(2), request_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let published = serde_json::from_slice::<RendezvousRegisterRequest>(&request)
+            .unwrap()
+            .descriptor;
+        assert_eq!(published.public_endpoints, updated.public_endpoints);
+
+        drop(guard);
+        server.abort();
     }
 }

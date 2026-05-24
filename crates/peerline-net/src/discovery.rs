@@ -31,6 +31,8 @@ use tokio::{task::JoinHandle, time};
 pub(crate) use endpoints::direct_endpoints_with_extra;
 pub use endpoints::rank_candidates;
 
+const FALLBACK_ROUTE_DISCOVERY_GRACE: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteKind {
     LanDirect,
@@ -398,10 +400,21 @@ async fn discover_peer_descriptors(
     let mut query_interval = time::interval(Duration::from_millis(750));
     let deadline = time::sleep(config.lookup_timeout);
     tokio::pin!(deadline);
+    let fallback_grace = time::sleep(FALLBACK_ROUTE_DISCOVERY_GRACE);
+    tokio::pin!(fallback_grace);
+    let mut fallback_grace_elapsed = false;
 
     loop {
         tokio::select! {
             _ = &mut deadline => break,
+            _ = &mut fallback_grace, if !fallback_grace_elapsed => {
+                fallback_grace_elapsed = true;
+                if snapshot.is_diverse_enough(config.min_candidate_diversity)
+                    && snapshot.has_usable_candidates(local_networks, &config)
+                {
+                    break;
+                }
+            }
             result = &mut rendezvous_lookup, if !rendezvous_done => {
                 rendezvous_done = true;
                 match result {
@@ -417,7 +430,12 @@ async fn discover_peer_descriptors(
                         for descriptor in descriptors {
                             snapshot.insert_descriptor(descriptor);
                         }
-                        if snapshot.is_diverse_enough(config.min_candidate_diversity)
+                        if !should_keep_discovering_for_route_diversity(
+                            &snapshot,
+                            local_networks,
+                            &config,
+                            fallback_grace_elapsed,
+                        ) && snapshot.is_diverse_enough(config.min_candidate_diversity)
                             && snapshot.has_usable_candidates(local_networks, &config)
                         {
                             break;
@@ -434,7 +452,13 @@ async fn discover_peer_descriptors(
             }
             event = swarm.select_next_some() => {
                 handle_discovery_swarm_event(&mut swarm, &mut snapshot, event);
-                if snapshot.is_diverse_enough(config.min_candidate_diversity)
+                if !should_keep_discovering_for_route_diversity(
+                    &snapshot,
+                    local_networks,
+                    &config,
+                    fallback_grace_elapsed,
+                )
+                    && snapshot.is_diverse_enough(config.min_candidate_diversity)
                     && snapshot.has_usable_candidates(local_networks, &config)
                 {
                     break;
@@ -449,6 +473,47 @@ async fn discover_peer_descriptors(
         Ok(Some(snapshot))
     } else {
         Ok(None)
+    }
+}
+
+fn should_keep_discovering_for_route_diversity(
+    snapshot: &DiscoverySnapshot,
+    local_networks: Option<&LocalDirectNetworks>,
+    config: &DiscoveryConfig,
+    grace_elapsed: bool,
+) -> bool {
+    if grace_elapsed {
+        return false;
+    }
+
+    let candidates = snapshot.candidates(local_networks, config);
+    if candidates.is_empty() {
+        return false;
+    }
+
+    !has_candidate_route_diversity(&candidates)
+}
+
+fn has_candidate_route_diversity(candidates: &[Candidate]) -> bool {
+    let Some(first) = candidates
+        .first()
+        .map(|candidate| route_family(&candidate.route))
+    else {
+        return false;
+    };
+    candidates
+        .iter()
+        .any(|candidate| route_family(&candidate.route) != first)
+}
+
+fn route_family(route: &RouteKind) -> u8 {
+    match route {
+        RouteKind::LanDirect | RouteKind::PublicDirect => 0,
+        RouteKind::Libp2pQuic | RouteKind::Libp2pDcutr => 1,
+        RouteKind::WebRtcDirect | RouteKind::WebRtcTurn => 2,
+        RouteKind::PublicTunnel => 3,
+        RouteKind::TorOnion => 4,
+        RouteKind::Libp2pRelay => 5,
     }
 }
 

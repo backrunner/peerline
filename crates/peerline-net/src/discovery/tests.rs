@@ -419,6 +419,46 @@ fn discovery_flags_gate_expected_routes() {
 }
 
 #[test]
+fn discovery_grace_waits_for_route_diversity_including_webrtc() {
+    let peer = PeerId::random();
+    let mut snapshot = DiscoverySnapshot::new();
+    let mut descriptor = PeerDescriptor {
+        protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
+        peer_id: peer.to_string(),
+        direct_endpoints: vec![],
+        libp2p_endpoints: vec!["/ip4/203.0.113.7/tcp/43118".into()],
+        public_endpoints: vec![],
+        tor_endpoints: vec![],
+        published_unix_ms: 1,
+    };
+    let mut config = DiscoveryConfig::default();
+    config.enable_public_tunnels = false;
+    config.enable_tor = false;
+
+    snapshot.insert_descriptor(descriptor.clone());
+
+    assert!(super::should_keep_discovering_for_route_diversity(
+        &snapshot, None, &config, false
+    ));
+    assert!(!super::should_keep_discovering_for_route_diversity(
+        &snapshot, None, &config, true
+    ));
+
+    descriptor.libp2p_endpoints.push(
+        "/ip4/203.0.113.7/udp/43119/webrtc-direct"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .to_string(),
+    );
+    descriptor.published_unix_ms = 2;
+    snapshot.insert_descriptor(descriptor);
+
+    assert!(!super::should_keep_discovering_for_route_diversity(
+        &snapshot, None, &config, false
+    ));
+}
+
+#[test]
 fn public_tunnel_descriptors_become_candidates() {
     let descriptor = PeerDescriptor {
         protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,

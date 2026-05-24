@@ -169,4 +169,20 @@ impl DiscoverySnapshot {
             )
         }))
     }
+
+    pub(super) fn candidates(
+        &self,
+        local_networks: Option<&LocalDirectNetworks>,
+        config: &DiscoveryConfig,
+    ) -> Vec<Candidate> {
+        rank_candidates(self.descriptors.values().flat_map(|descriptor| {
+            let allow_unverified_lan = self.local_peer_ids.contains(&descriptor.peer_id);
+            descriptor_candidates_for_discovery(
+                descriptor,
+                local_networks,
+                allow_unverified_lan,
+                config,
+            )
+        }))
+    }
 }

@@ -34,6 +34,8 @@ fn spawn_recv(cwd: &Path, port: u16, overwrite: bool, extra_env: &[(&str, &str)]
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_remove("RUST_LOG")
+        .env("PEERLINE_DISABLE_TOR", "1")
+        .env("PEERLINE_DISABLE_PUBLIC_TUNNELS", "1")
         .arg("recv")
         .arg("river-mango-42")
         .arg("rose-lime-iris-jade-1234")
@@ -55,6 +57,8 @@ fn spawn_send(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> std::pro
     let mut cmd = Command::new(bin());
     cmd.current_dir(cwd)
         .env_remove("RUST_LOG")
+        .env("PEERLINE_DISABLE_TOR", "1")
+        .env("PEERLINE_DISABLE_PUBLIC_TUNNELS", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (key, value) in extra_env {
@@ -335,6 +339,8 @@ fn named_send_uses_saved_name_and_can_route_locally() {
         .env("XDG_CONFIG_HOME", &config_home)
         .env("PEERLINE_ALLOW_LOOPBACK_DISCOVERY", "1")
         .env("PEERLINE_BOOTSTRAP", "")
+        .env("PEERLINE_DISABLE_TOR", "1")
+        .env("PEERLINE_DISABLE_PUBLIC_TUNNELS", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .arg("recv")
@@ -343,7 +349,7 @@ fn named_send_uses_saved_name_and_can_route_locally() {
         .arg("--port")
         .arg(port.to_string())
         .arg("--idle-timeout-minutes")
-        .arg("0.05");
+        .arg("0.3");
     let mut recv = recv.spawn().unwrap();
     wait_for_port(port, Duration::from_secs(5));
 
@@ -351,6 +357,8 @@ fn named_send_uses_saved_name_and_can_route_locally() {
         temp.path(),
         &[
             "send",
+            "--retry-attempts",
+            "1",
             "river-mango-42",
             "rose-lime-iris-jade-1234",
             src.join("hello.txt").to_str().unwrap(),
@@ -358,6 +366,8 @@ fn named_send_uses_saved_name_and_can_route_locally() {
         &[
             ("PEERLINE_ALLOW_LOOPBACK_DISCOVERY", "1"),
             ("PEERLINE_BOOTSTRAP", ""),
+            ("PEERLINE_DISABLE_TOR", "1"),
+            ("PEERLINE_DISABLE_PUBLIC_TUNNELS", "1"),
         ],
     );
 

@@ -84,8 +84,10 @@ struct RecvArgs {
     no_dcutr: bool,
     #[arg(long)]
     no_turn: bool,
-    #[arg(long)]
+    #[arg(long, hide = true, conflicts_with = "no_tor")]
     tor: bool,
+    #[arg(long)]
+    no_tor: bool,
     #[arg(long, value_enum)]
     tunnel: Option<TunnelProviderArg>,
     #[arg(
@@ -216,7 +218,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     println!("direct: {actual_bind}");
     println!(
         "waiting for transfers over {}...",
-        recv_route_status(&discovery, tunnel_provider, args.tor)
+        recv_route_status(&discovery, tunnel_provider, discovery.enable_tor)
     );
     match idle_timeout {
         Some(timeout) => println!(
@@ -236,7 +238,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
             name: name.clone(),
             code: code.clone(),
             bind: actual_bind.to_string(),
-            route_status: recv_route_status(&discovery, tunnel_provider, args.tor),
+            route_status: recv_route_status(&discovery, tunnel_provider, discovery.enable_tor),
             stage: peerline_core::TransferStage::Discovering,
             progress: None,
         };
@@ -278,12 +280,22 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
             tunnel.local_addr
         );
     }
-    let tor_onion = if args.tor {
-        match wait_with_quit(start_tor_onion(), &mut quit_rx).await? {
-            TaskOutcome::Completed(tor) => Some(tor),
-            TaskOutcome::Quit => {
+    let tor_onion = if discovery.enable_tor {
+        match wait_with_quit(start_tor_onion(), &mut quit_rx).await {
+            Ok(TaskOutcome::Completed(tor)) => Some(tor),
+            Ok(TaskOutcome::Quit) => {
                 finish_recv(network_events, events, event_fanout, tui_task).await;
                 return Ok(());
+            }
+            Err(error) if args.tor => {
+                finish_recv(network_events, events, event_fanout, tui_task).await;
+                return Err(error.context("could not start required Tor onion listener"));
+            }
+            Err(error) => {
+                let message = format!("Tor onion unavailable: {error}; continuing without Tor");
+                println!("{message}");
+                let _ = network_events.send(PeerlineEvent::Message(message));
+                None
             }
         }
     } else {
@@ -764,29 +776,33 @@ async fn named_send_attempt(
     transfer_id: TransferId,
     quit_rx: &mut Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<TaskOutcome<peerline_net::SentTransfer>> {
-    let candidates = loop {
-        tracing::info!(peer = %plan.name, "discovering routes through rendezvous, DHT, and mDNS");
-        let discovery_future = peerline_net::discovery::discover_peer_candidates(
-            &plan.name,
-            &plan.code,
-            plan.discovery.clone(),
-        );
-        match wait_with_quit(discovery_future, quit_rx).await {
-            Ok(TaskOutcome::Completed(candidates)) if !candidates.is_empty() => break candidates,
-            Ok(TaskOutcome::Completed(_)) => {
-                tracing::error!(
-                    peer = %plan.name,
-                    "could not discover a route yet; still searching"
-                );
-            }
-            Ok(TaskOutcome::Quit) => {
-                return Ok(TaskOutcome::Quit);
-            }
-            Err(error) => {
-                return Err(error);
-            }
+    tracing::info!(peer = %plan.name, "discovering routes through rendezvous, DHT, and mDNS");
+    let discovery_future = peerline_net::discovery::discover_peer_candidates(
+        &plan.name,
+        &plan.code,
+        plan.discovery.clone(),
+    );
+    let candidates = match wait_with_quit(discovery_future, quit_rx).await {
+        Ok(TaskOutcome::Completed(candidates)) if !candidates.is_empty() => candidates,
+        Ok(TaskOutcome::Completed(_)) => {
+            let message = format!("could not discover a route for {}", plan.name);
+            emit_send_message(&plan.events, message.clone());
+            anyhow::bail!("{message}");
+        }
+        Ok(TaskOutcome::Quit) => {
+            return Ok(TaskOutcome::Quit);
+        }
+        Err(error) => {
+            return Err(error);
         }
     };
+    emit_send_message(
+        &plan.events,
+        format!(
+            "discovered routes: {}",
+            format_candidate_routes(&candidates)
+        ),
+    );
 
     let delay_tor = candidates.iter().any(|candidate| {
         !matches!(candidate.route, RouteKind::TorOnion)
@@ -1053,6 +1069,20 @@ fn route_label(route: &RouteKind) -> &'static str {
     }
 }
 
+fn format_candidate_routes(candidates: &[Candidate]) -> String {
+    let mut routes = candidates
+        .iter()
+        .map(|candidate| route_label(&candidate.route))
+        .collect::<Vec<_>>();
+    routes.sort_unstable();
+    routes.dedup();
+    if routes.is_empty() {
+        "none".into()
+    } else {
+        routes.join(", ")
+    }
+}
+
 fn route_allowed(route: &RouteKind, discovery: &peerline_net::DiscoveryConfig) -> bool {
     discovery.route_enabled(route)
 }
@@ -1076,8 +1106,11 @@ fn recv_discovery_config(args: &RecvArgs) -> peerline_net::DiscoveryConfig {
         args.no_quic,
         args.no_dcutr,
         args.no_turn,
-        false,
+        args.no_tor,
     );
+    if args.tor {
+        discovery.enable_tor = true;
+    }
     discovery
 }
 
@@ -1788,6 +1821,34 @@ mod tests {
     }
 
     #[test]
+    fn recv_tor_is_enabled_by_default_and_can_be_disabled() {
+        let enabled = Cli::try_parse_from([
+            "peerline",
+            "recv",
+            "river-mango-42",
+            "rose-lime-iris-jade-1234",
+        ])
+        .unwrap();
+        let Command::Recv(args) = enabled.command else {
+            panic!("expected recv command");
+        };
+        assert!(recv_discovery_config(&args).enable_tor);
+
+        let disabled = Cli::try_parse_from([
+            "peerline",
+            "recv",
+            "river-mango-42",
+            "rose-lime-iris-jade-1234",
+            "--no-tor",
+        ])
+        .unwrap();
+        let Command::Recv(args) = disabled.command else {
+            panic!("expected recv command");
+        };
+        assert!(!recv_discovery_config(&args).enable_tor);
+    }
+
+    #[test]
     fn tunnel_flag_accepts_tunnelmole_alias() {
         let cli = Cli::try_parse_from([
             "peerline",
@@ -1822,6 +1883,32 @@ mod tests {
             ]);
             assert!(parsed.is_err(), "{flag} should no longer be accepted");
         }
+    }
+
+    #[test]
+    fn candidate_route_summary_lists_unique_routes() {
+        let candidates = vec![
+            Candidate {
+                peer_id: "peer".into(),
+                addresses: vec!["wss://example.com".into()],
+                route: RouteKind::PublicTunnel,
+            },
+            Candidate {
+                peer_id: "peer".into(),
+                addresses: vec!["ws://exampleabcdefghijklmnopqrstuvwx.onion".into()],
+                route: RouteKind::TorOnion,
+            },
+            Candidate {
+                peer_id: "peer".into(),
+                addresses: vec!["wss://example.com/2".into()],
+                route: RouteKind::PublicTunnel,
+            },
+        ];
+
+        assert_eq!(
+            format_candidate_routes(&candidates),
+            "public-tunnel, tor-onion"
+        );
     }
 
     #[test]
