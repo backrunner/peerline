@@ -54,6 +54,8 @@ the private default rendezvous deployment.
 
 If you are wiring Peerline to another rendezvous service that still expects a shared secret, set `PEERLINE_RENDEZVOUS_TOKEN` in the client environment instead.
 
+The Worker caps registration TTLs with `PEERLINE_RENDEZVOUS_MAX_TTL_SECS`; the checked-in deployment config sets it to `180`. The client default registration TTL is `120` seconds with a `60` second keepalive.
+
 ## Deploy
 
 ```bash

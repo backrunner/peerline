@@ -23,7 +23,7 @@ Peerline has two roles:
 
 For named transfers, the receiver publishes a short-lived descriptor keyed by the shared name and code. The sender derives the same lookup key, discovers candidate routes, and tries them in order. Peerline prefers direct LAN or public TCP endpoints first, then libp2p routes such as DCUtR and WebRTC direct. When direct and hole-punched routes are unavailable, Peerline falls back to libp2p relay transport by default while keeping file contents protected by Peerline's end-to-end encryption.
 
-Peerline also probes HTTP rendezvous first, with a default endpoint at `https://peerline.pwp.sh`, then falls back to DHT and mDNS. Official builds use a private mTLS-protected rendezvous endpoint; set `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH` or `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM` to a PEM bundle with the client certificate and private key, or set `PEERLINE_RENDEZVOUS_URLS` / `PEERLINE_RENDEZVOUS_URL` to point at another compatible rendezvous service. Use `PEERLINE_RENDEZVOUS_TOKEN` only when the rendezvous service expects a shared secret.
+Peerline also probes HTTP rendezvous first, then falls back to DHT and mDNS. The built-in official rendezvous endpoint follows the release channel: alpha builds use `https://alpha.rendezvous.peerline.pwp.sh`, beta builds use `https://beta.rendezvous.peerline.pwp.sh`, and stable builds use `https://rendezvous.peerline.pwp.sh`. Official endpoints are mTLS-protected; official release assets can embed the client identity, while source builds can set `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH` or `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM` to a PEM bundle with the client certificate and private key. Set `PEERLINE_RENDEZVOUS_URLS` / `PEERLINE_RENDEZVOUS_URL` to point at another compatible rendezvous service. Use `PEERLINE_RENDEZVOUS_TOKEN` only when the rendezvous service expects a shared secret.
 
 For direct transfers, the sender can skip discovery and dial an IP address or `host:port` directly. This is useful on the same network, over VPNs, or whenever the receiver already knows which address the sender should use. If you only provide an IP, Peerline probes the default direct window `43117-43121`.
 
@@ -36,13 +36,13 @@ The secure session combines the shared code with OPAQUE PAKE, X25519, ML-KEM, HK
 Use the npm package without installing it globally:
 
 ```sh
-npx peerline@alpha --help
+npx peerline@beta --help
 ```
 
 Install it globally through npm:
 
 ```sh
-npm install -g peerline@alpha
+npm install -g peerline@beta
 peerline --help
 ```
 
@@ -76,7 +76,7 @@ peerline recv
 name: frost-827
 code: fig-mint-rose-123456
 direct: 0.0.0.0:43117
-waiting for transfers over direct TCP or libp2p...
+waiting for transfers over direct TCP, Tor onion, libp2p TCP, libp2p QUIC, DCUtR, WebRTC/TURN, relay fallback...
 idle timeout: 10 min (change with --idle-timeout-minutes)
 ```
 
@@ -118,6 +118,11 @@ peerline recv [NAME_OR_CODE] [CODE] --port 43117
 peerline recv [NAME_OR_CODE] [CODE] --overwrite
 peerline recv [NAME_OR_CODE] [CODE] --no-tui
 peerline recv [NAME_OR_CODE] [CODE] --no-relay-fallback
+peerline recv [NAME_OR_CODE] [CODE] --no-upnp
+peerline recv [NAME_OR_CODE] [CODE] --no-nat-pmp-pcp
+peerline recv [NAME_OR_CODE] [CODE] --no-quic
+peerline recv [NAME_OR_CODE] [CODE] --no-dcutr
+peerline recv [NAME_OR_CODE] [CODE] --no-turn
 peerline recv [NAME_OR_CODE] [CODE] --no-tor
 peerline recv [NAME_OR_CODE] [CODE] --idle-timeout-minutes 30
 peerline recv [NAME_OR_CODE] [CODE] --tunnel cloudflared
@@ -129,7 +134,7 @@ peerline recv [NAME_OR_CODE] [CODE] --tunnel tunnelmole
 `--port` starts the 5-port direct window; Peerline will try that port and the next four.
 `--idle-timeout-minutes` defaults to `10`; set it to `0` to wait until you quit manually.
 Tor onion receive is attempted by default when the `tor` command is available; use `--no-tor` or `PEERLINE_DISABLE_TOR=1` to skip it.
-`--tunnel` starts a public tunnel on the receiver side. `cloudflared`, `localtunnel`, `tmole`, and `tunnelmole` are accepted values.
+`--tunnel` starts a public tunnel on the receiver side. `cloudflared`, `localtunnel`, and `tmole` are the public values; `tunnelmole` is accepted as an alias for `tmole`.
 
 Sender options:
 
@@ -139,32 +144,57 @@ peerline send <name> <code> <path...> --compression none
 peerline send <name> <code> <path...> --compression zstd
 peerline send <name> <code> <path...> --compression lzma
 peerline send <name> <code> <path...> --no-relay-fallback
+peerline send <name> <code> <path...> --no-upnp
+peerline send <name> <code> <path...> --no-nat-pmp-pcp
+peerline send <name> <code> <path...> --no-quic
+peerline send <name> <code> <path...> --no-dcutr
+peerline send <name> <code> <path...> --no-turn
+peerline send <name> <code> <path...> --no-tor
+peerline send <name> <code> <path...> --tor-socks-proxy 127.0.0.1:9050
+peerline send <name> <code> <path...> --retry-attempts 5
 peerline send --name <name> --code <code> <path...>
 ```
 
 Relay fallback is enabled by default. Direct and hole-punched routes are attempted before relay fallback; pass `--no-relay-fallback` on both sides when you want to require a direct or hole-punched path.
+Send retries default to `5` attempts before the send TUI asks whether to retry the whole send.
 In the send TUI, a failed attempt stays on screen and offers `r` to retry the same send or `q`/Esc to quit.
 
 Network environment variables:
 
 ```sh
+PEERLINE_RENDEZVOUS_URLS=https://rendezvous.example.net
+PEERLINE_RENDEZVOUS_TIMEOUT_MS=5000
+PEERLINE_RENDEZVOUS_TTL_SECS=120
+PEERLINE_RENDEZVOUS_KEEPALIVE_SECS=60
+PEERLINE_LIBP2P_RENDEZVOUS_PEERS=/dnsaddr/rzv.example.net/p2p/...
 PEERLINE_RELAY_PEERS=/ip4/203.0.113.10/tcp/4001/p2p/...
 PEERLINE_DISABLE_RELAY_FALLBACK=1
+PEERLINE_DISABLE_MDNS=1
 PEERLINE_DISABLE_UPNP=1
+PEERLINE_DISABLE_NATPMP_PCP=1
+PEERLINE_DISABLE_QUIC=1
+PEERLINE_DISABLE_DCUTR=1
+PEERLINE_DISABLE_TURN=1
+PEERLINE_DISABLE_PUBLIC_TUNNELS=1
+PEERLINE_DISABLE_TOR=1
+PEERLINE_ALLOW_LOOPBACK_DISCOVERY=1
 PEERLINE_BOOTSTRAP=/dnsaddr/bootstrap.libp2p.io/p2p/...
 PEERLINE_WEBRTC_ICE_SERVERS='[{"urls":["turn:turn.example.net:3478?transport=udp"],"username":"user","credential":"pass"}]'
 ```
 
+`PEERLINE_RENDEZVOUS_URLS` should contain comma-separated compatible HTTP rendezvous endpoints. The singular `PEERLINE_RENDEZVOUS_URL` is also supported.
+`PEERLINE_LIBP2P_RENDEZVOUS_PEERS` should contain comma-separated libp2p Rendezvous point multiaddrs. This optional backend is disabled unless at least one rendezvous point is configured; discovered registrations are used as libp2p route candidates.
 `PEERLINE_RELAY_PEERS` should contain comma-separated libp2p relay-capable peer multiaddrs. If it is not set, Peerline tries the bootstrap peers as relay candidates. UPnP is enabled by default for home-router TCP and libp2p external address discovery; set `PEERLINE_DISABLE_UPNP=1` to turn it off.
 WebRTC direct transport ships with default Open Relay Project TURN candidates for `staticauth.openrelay.metered.ca` on ports `80` and `443`, including UDP, TCP, and TLS-style `turns` URLs. Peerline generates short-lived static-auth credentials for those defaults. Set `PEERLINE_WEBRTC_ICE_SERVERS` to a JSON array of WebRTC ICE server objects to replace the defaults; set it to an empty string to disable configured ICE servers entirely.
+`PEERLINE_ALLOW_LOOPBACK_DISCOVERY=1` is mainly useful for local development and E2E tests where both peers run on the same machine.
 
 ## Current Status
 
 - Direct IP send and receive works.
-- Named discovery now uses HTTP rendezvous first, then Kademlia provider records, mDNS, UPnP-assisted direct endpoints, DCUtR, relay fallback, and libp2p-webrtc direct.
+- Named discovery now uses HTTP rendezvous first, then Kademlia provider records, optional libp2p Rendezvous points, mDNS, UPnP/NAT-PMP/PCP-assisted direct endpoints, public tunnel and Tor onion descriptors, QUIC, DCUtR, WebRTC direct/TURN, and relay fallback.
 - Files, multiple files, and folders are archived with safe relative paths, BLAKE3 integrity checks, and streaming zstd/lzma compression support.
 - Receivers stay open across multiple incoming transfers, with a configurable idle auto-exit.
-- Conflicts default to non-overwrite behavior, with TUI-driven handling in the receiver flow.
+- Conflicts default to non-overwrite suffixes, with `--overwrite` available when replacement is intended.
 - The receive side includes a modern terminal UI for identity, route state, and transfer progress.
 - The workspace test suite and E2E coverage are in place.
 - The repository also includes a private Cloudflare Worker rendezvous service in `services/peerline-rendezvous`.
