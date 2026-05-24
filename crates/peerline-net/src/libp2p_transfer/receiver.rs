@@ -8,13 +8,13 @@ use super::{
     session::ReceiverSession,
 };
 use crate::{
-    discovery::{descriptor_record_key, provider_record_key},
+    discovery::{descriptor_record_key, provider_record_key, rendezvous_protocol},
     protocol::{PROTOCOL_VERSION, SecureFrame, WireFrame, decrypt_secure, libp2p_transcript},
-    rendezvous, resume,
+    rendezvous as http_rendezvous, resume,
 };
 use futures::StreamExt;
 use libp2p::{
-    PeerId, Swarm, identify, kad, mdns, relay,
+    PeerId, Swarm, identify, kad, mdns, relay, rendezvous as libp2p_rendezvous,
     request_response::{self, Event as RequestResponseEvent, Message as RequestResponseMessage},
     swarm::SwarmEvent,
 };
@@ -41,6 +41,7 @@ pub(crate) async fn recv_libp2p(
         peerline_core::NameCode::new(options.name.clone(), options.code.clone()).lookup_key();
     let record_key = descriptor_record_key(&lookup_key);
     let provider_key = provider_record_key(&lookup_key);
+    let libp2p_rendezvous_namespace = rendezvous_protocol::receiver_namespace(&lookup_key)?;
 
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
     if options.discovery.enable_quic {
@@ -49,6 +50,10 @@ pub(crate) async fn recv_libp2p(
     let _ = swarm.listen_on("/ip4/0.0.0.0/udp/0/webrtc-direct".parse()?);
     apply_bootstrap(&mut swarm, &options.discovery);
     maybe_enable_relay_listeners(&mut swarm, &options.discovery);
+    rendezvous_protocol::dial_configured_rendezvous(
+        &mut swarm,
+        &options.discovery.libp2p_rendezvous_peers,
+    );
     let connecting_route = if options.discovery.enable_quic {
         ConnectionRoute::Libp2pQuic
     } else {
@@ -95,11 +100,16 @@ pub(crate) async fn recv_libp2p(
         &options,
         &mapped_direct_endpoints,
     )?;
-    let mut rendezvous_registration = rendezvous::RendezvousRegistrationGuard::new(
+    let mut rendezvous_registration = http_rendezvous::RendezvousRegistrationGuard::new(
         options.name.clone(),
         options.code.clone(),
         descriptor,
         options.discovery.rendezvous.clone(),
+    );
+    register_receiver_libp2p_rendezvous(
+        &mut swarm,
+        &libp2p_rendezvous_namespace,
+        &options.discovery,
     );
 
     loop {
@@ -129,6 +139,19 @@ pub(crate) async fn recv_libp2p(
             }
             event = swarm.select_next_some() => {
                 match event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. }
+                        if options
+                            .discovery
+                            .libp2p_rendezvous_peers
+                            .iter()
+                            .any(|peer| peer.peer_id == peer_id) =>
+                    {
+                        register_receiver_libp2p_rendezvous(
+                            &mut swarm,
+                            &libp2p_rendezvous_namespace,
+                            &options.discovery,
+                        );
+                    }
                     SwarmEvent::Behaviour(TransferBehaviourEvent::Transfer(event)) => {
                         let local_peer_id = *swarm.local_peer_id();
                         if let Some(done) = handle_transfer_event(
@@ -145,6 +168,11 @@ pub(crate) async fn recv_libp2p(
                                 PeerlineEvent::StageChanged(TransferStage::Complete),
                             );
                             rendezvous_registration.unregister().await;
+                            unregister_receiver_libp2p_rendezvous(
+                                &mut swarm,
+                                &libp2p_rendezvous_namespace,
+                                &options.discovery,
+                            );
                             return Ok(done);
                         }
                     }
@@ -183,6 +211,9 @@ pub(crate) async fn recv_libp2p(
                             );
                         }
                     }
+                    SwarmEvent::Behaviour(TransferBehaviourEvent::Rendezvous(event)) => {
+                        log_libp2p_rendezvous_event(&event);
+                    }
                     SwarmEvent::Behaviour(TransferBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. })) => {
                         log_dht_publish_result(&result);
                     }
@@ -199,6 +230,11 @@ pub(crate) async fn recv_libp2p(
                             &mapped_direct_endpoints,
                             &rendezvous_registration,
                         );
+                        register_receiver_libp2p_rendezvous(
+                            &mut swarm,
+                            &libp2p_rendezvous_namespace,
+                            &options.discovery,
+                        );
                     }
                     _ => {}
                 }
@@ -213,7 +249,7 @@ fn republish_receiver_descriptor(
     provider_key: kad::RecordKey,
     options: &Libp2pRecvOptions,
     extra_direct_endpoints: &[SocketAddr],
-    rendezvous_registration: &rendezvous::RendezvousRegistrationGuard,
+    rendezvous_registration: &http_rendezvous::RendezvousRegistrationGuard,
 ) {
     if let Ok(descriptor) = publish_receiver_descriptor(
         swarm,
@@ -223,6 +259,82 @@ fn republish_receiver_descriptor(
         extra_direct_endpoints,
     ) {
         rendezvous_registration.update_descriptor(descriptor);
+    }
+}
+
+fn register_receiver_libp2p_rendezvous(
+    swarm: &mut Swarm<TransferBehaviour>,
+    namespace: &libp2p_rendezvous::Namespace,
+    discovery: &crate::discovery::DiscoveryConfig,
+) {
+    if discovery.libp2p_rendezvous_peers.is_empty() {
+        return;
+    }
+    rendezvous_protocol::refresh_external_addresses_for_rendezvous(
+        swarm,
+        discovery.allow_loopback_endpoints,
+    );
+    for peer in &discovery.libp2p_rendezvous_peers {
+        match swarm
+            .behaviour_mut()
+            .rendezvous
+            .register(namespace.clone(), peer.peer_id, None)
+        {
+            Ok(()) => {
+                tracing::debug!(peer = %peer.peer_id, namespace = %namespace, "libp2p rendezvous registration requested");
+            }
+            Err(libp2p_rendezvous::client::RegisterError::NoExternalAddresses) => {
+                tracing::debug!(peer = %peer.peer_id, "libp2p rendezvous registration waiting for external addresses");
+            }
+            Err(error) => {
+                tracing::warn!(peer = %peer.peer_id, %error, "libp2p rendezvous registration failed to start");
+            }
+        }
+    }
+}
+
+fn unregister_receiver_libp2p_rendezvous(
+    swarm: &mut Swarm<TransferBehaviour>,
+    namespace: &libp2p_rendezvous::Namespace,
+    discovery: &crate::discovery::DiscoveryConfig,
+) {
+    for peer in &discovery.libp2p_rendezvous_peers {
+        swarm
+            .behaviour_mut()
+            .rendezvous
+            .unregister(namespace.clone(), peer.peer_id);
+    }
+}
+
+fn log_libp2p_rendezvous_event(event: &libp2p_rendezvous::client::Event) {
+    match event {
+        libp2p_rendezvous::client::Event::Registered {
+            rendezvous_node,
+            ttl,
+            namespace,
+        } => {
+            tracing::debug!(
+                peer = %rendezvous_node,
+                ttl,
+                namespace = %namespace,
+                "libp2p rendezvous registration accepted"
+            );
+        }
+        libp2p_rendezvous::client::Event::RegisterFailed {
+            rendezvous_node,
+            error,
+            namespace,
+        } => {
+            tracing::warn!(
+                peer = %rendezvous_node,
+                ?error,
+                namespace = %namespace,
+                "libp2p rendezvous registration rejected"
+            );
+        }
+        libp2p_rendezvous::client::Event::Discovered { .. }
+        | libp2p_rendezvous::client::Event::DiscoverFailed { .. }
+        | libp2p_rendezvous::client::Event::Expired { .. } => {}
     }
 }
 

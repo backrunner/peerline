@@ -1,9 +1,9 @@
 use super::{
     DiscoveryConfig, endpoints::direct_endpoints_with_extra, make_peer_descriptor,
-    snapshot::DiscoverySnapshot,
+    rendezvous_protocol, snapshot::DiscoverySnapshot,
 };
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder, identify, kad, mdns, noise, ping,
+    Multiaddr, PeerId, Swarm, SwarmBuilder, identify, kad, mdns, noise, ping, rendezvous,
     swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle},
     upnp, yamux,
 };
@@ -16,6 +16,7 @@ pub(super) struct DiscoveryBehaviour {
     pub(super) kad: kad::Behaviour<kad::store::MemoryStore>,
     pub(super) mdns: Toggle<mdns::tokio::Behaviour>,
     pub(super) upnp: Toggle<upnp::tokio::Behaviour>,
+    pub(super) rendezvous: rendezvous::client::Behaviour,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
 }
@@ -59,6 +60,7 @@ pub(super) fn build_discovery_swarm(
                     None
                 }
                 .into(),
+                rendezvous: rendezvous::client::Behaviour::new(key.clone()),
                 identify: identify::Behaviour::new(identify::Config::new(
                     "/peerline/0.1.0".into(),
                     key.public(),
@@ -115,6 +117,7 @@ pub(super) fn handle_discovery_swarm_event(
     swarm: &mut Swarm<DiscoveryBehaviour>,
     snapshot: &mut DiscoverySnapshot,
     event: SwarmEvent<DiscoveryBehaviourEvent>,
+    allow_loopback: bool,
 ) {
     match event {
         SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Kad(
@@ -122,10 +125,56 @@ pub(super) fn handle_discovery_swarm_event(
         )) => {
             handle_discovery_query_result(snapshot, result);
         }
+        SwarmEvent::Behaviour(DiscoveryBehaviourEvent::Rendezvous(event)) => {
+            handle_rendezvous_discovery_event(snapshot, event, allow_loopback);
+        }
         SwarmEvent::Behaviour(event) => {
             let _ = handle_discovery_event_with_snapshot(swarm, event, Some(snapshot));
         }
         _ => {}
+    }
+}
+
+fn handle_rendezvous_discovery_event(
+    snapshot: &mut DiscoverySnapshot,
+    event: rendezvous::client::Event,
+    allow_loopback: bool,
+) {
+    match event {
+        rendezvous::client::Event::Discovered {
+            rendezvous_node,
+            registrations,
+            ..
+        } => {
+            tracing::debug!(
+                peer = %rendezvous_node,
+                count = registrations.len(),
+                "libp2p rendezvous discovery returned registrations"
+            );
+            for registration in registrations {
+                if let Some(descriptor) =
+                    rendezvous_protocol::descriptor_from_registration(&registration, allow_loopback)
+                {
+                    snapshot.insert_descriptor(descriptor);
+                }
+            }
+        }
+        rendezvous::client::Event::DiscoverFailed {
+            rendezvous_node,
+            error,
+            ..
+        } => {
+            tracing::debug!(
+                peer = %rendezvous_node,
+                ?error,
+                "libp2p rendezvous discovery failed"
+            );
+        }
+        rendezvous::client::Event::Expired { peer } => {
+            tracing::debug!(%peer, "libp2p rendezvous registration expired");
+        }
+        rendezvous::client::Event::Registered { .. }
+        | rendezvous::client::Event::RegisterFailed { .. } => {}
     }
 }
 

@@ -1,4 +1,5 @@
 mod endpoints;
+pub(crate) mod rendezvous_protocol;
 mod snapshot;
 mod swarm;
 
@@ -30,6 +31,7 @@ use tokio::{task::JoinHandle, time};
 
 pub(crate) use endpoints::direct_endpoints_with_extra;
 pub use endpoints::rank_candidates;
+pub use rendezvous_protocol::Libp2pRendezvousPeer;
 
 const FALLBACK_ROUTE_DISCOVERY_GRACE: Duration = Duration::from_secs(2);
 
@@ -95,6 +97,7 @@ pub struct DiscoveryConfig {
     pub allow_relay_data_fallback: bool,
     pub bootstrap_peers: Vec<String>,
     pub relay_peers: Vec<String>,
+    pub libp2p_rendezvous_peers: Vec<Libp2pRendezvousPeer>,
     pub webrtc_ice_servers: Vec<WebRtcIceServer>,
     pub rendezvous: RendezvousConfig,
 }
@@ -109,6 +112,8 @@ impl Default for DiscoveryConfig {
         });
         let relay_peers =
             peers_from_env("PEERLINE_RELAY_PEERS").unwrap_or_else(|| bootstrap_peers.clone());
+        let libp2p_rendezvous_peers =
+            rendezvous_protocol::libp2p_rendezvous_peers_from_env().unwrap_or_default();
         let mut webrtc_ice_servers =
             webrtc_ice_servers_from_env().unwrap_or_else(default_webrtc_ice_servers);
         let enable_turn = env_flag("PEERLINE_DISABLE_TURN").is_none();
@@ -132,6 +137,7 @@ impl Default for DiscoveryConfig {
             allow_relay_data_fallback: env_flag("PEERLINE_DISABLE_RELAY_FALLBACK").is_none(),
             bootstrap_peers,
             relay_peers,
+            libp2p_rendezvous_peers,
             webrtc_ice_servers,
             rendezvous: RendezvousConfig::default(),
         }
@@ -378,6 +384,7 @@ async fn discover_peer_descriptors(
     let lookup_key = name_code.lookup_key();
     let descriptor_key = descriptor_record_key(&lookup_key);
     let provider_key = provider_record_key(&lookup_key);
+    let rendezvous_namespace = rendezvous_protocol::receiver_namespace(&lookup_key)?;
     let mut snapshot = DiscoverySnapshot::new();
     let rendezvous_name = name.clone();
     let rendezvous_code = code.clone();
@@ -395,9 +402,11 @@ async fn discover_peer_descriptors(
 
     let mut swarm = build_discovery_swarm(false, config.enable_mdns, config.enable_upnp)?;
     apply_bootstrap(&mut swarm, &config);
+    rendezvous_protocol::dial_configured_rendezvous(&mut swarm, &config.libp2p_rendezvous_peers);
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
     let mut query_interval = time::interval(Duration::from_millis(750));
+    let mut rendezvous_query_interval = time::interval(Duration::from_secs(2));
     let deadline = time::sleep(config.lookup_timeout);
     tokio::pin!(deadline);
     let fallback_grace = time::sleep(FALLBACK_ROUTE_DISCOVERY_GRACE);
@@ -450,8 +459,32 @@ async fn discover_peer_descriptors(
                 let _ = swarm.behaviour_mut().kad.get_providers(provider_key.clone());
                 let _ = swarm.behaviour_mut().kad.get_record(descriptor_key.clone());
             }
+            _ = rendezvous_query_interval.tick(), if !config.libp2p_rendezvous_peers.is_empty() => {
+                discover_configured_libp2p_rendezvous(
+                    &mut swarm,
+                    &config.libp2p_rendezvous_peers,
+                    rendezvous_namespace.clone(),
+                );
+            }
             event = swarm.select_next_some() => {
-                handle_discovery_swarm_event(&mut swarm, &mut snapshot, event);
+                if let libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, .. } = &event
+                    && config
+                        .libp2p_rendezvous_peers
+                        .iter()
+                        .any(|peer| peer.peer_id == *peer_id)
+                {
+                    discover_configured_libp2p_rendezvous(
+                        &mut swarm,
+                        &config.libp2p_rendezvous_peers,
+                        rendezvous_namespace.clone(),
+                    );
+                }
+                handle_discovery_swarm_event(
+                    &mut swarm,
+                    &mut snapshot,
+                    event,
+                    config.allow_loopback_endpoints,
+                );
                 if !should_keep_discovering_for_route_diversity(
                     &snapshot,
                     local_networks,
@@ -514,6 +547,21 @@ fn route_family(route: &RouteKind) -> u8 {
         RouteKind::PublicTunnel => 3,
         RouteKind::TorOnion => 4,
         RouteKind::Libp2pRelay => 5,
+    }
+}
+
+fn discover_configured_libp2p_rendezvous(
+    swarm: &mut libp2p::Swarm<swarm::DiscoveryBehaviour>,
+    peers: &[Libp2pRendezvousPeer],
+    namespace: libp2p::rendezvous::Namespace,
+) {
+    for peer in peers {
+        swarm.behaviour_mut().rendezvous.discover(
+            Some(namespace.clone()),
+            None,
+            Some(16),
+            peer.peer_id,
+        );
     }
 }
 

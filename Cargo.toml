@@ -49,6 +49,7 @@ libp2p = { version = "0.56.0", default-features = false, features = [
     "ping",
     "quic",
     "relay",
+    "rendezvous",
     "request-response",
     "tcp",
     "tokio",

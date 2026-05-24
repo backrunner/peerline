@@ -6,6 +6,7 @@ use super::{
         discovered_direct_endpoint_candidates,
     },
     now_unix_ms, parse_webrtc_ice_servers_config, provider_record_key, rank_candidates,
+    rendezvous_protocol::{parse_libp2p_rendezvous_peers, receiver_namespace},
     snapshot::DiscoverySnapshot,
     swarm::build_discovery_swarm,
     turn_static_auth_credential,
@@ -76,6 +77,33 @@ fn dht_publish_and_discovery_keys_use_the_same_lookup_key() {
     assert_eq!(
         String::from_utf8(provider_record_key(&lookup_key).to_vec()).unwrap(),
         format!("/peerline/v1/{}", lookup_key.hex())
+    );
+}
+
+#[test]
+fn libp2p_rendezvous_peers_parse_from_multiaddrs() {
+    let peer_id = PeerId::random();
+    let raw = format!("/ip4/203.0.113.7/tcp/62649/p2p/{peer_id}");
+
+    let peers = parse_libp2p_rendezvous_peers(&raw);
+
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].peer_id, peer_id);
+    assert_eq!(peers[0].address.to_string(), "/ip4/203.0.113.7/tcp/62649");
+    assert_eq!(peers[0].dial_addr().to_string(), raw);
+}
+
+#[test]
+fn libp2p_rendezvous_namespace_is_role_scoped() {
+    let name = HumanName::parse("river-mango-42").unwrap();
+    let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+    let lookup_key = NameCode::new(name, code).lookup_key();
+
+    let namespace = receiver_namespace(&lookup_key).unwrap();
+
+    assert_eq!(
+        namespace.to_string(),
+        format!("peerline/receiver/v1/{}", lookup_key.hex())
     );
 }
 

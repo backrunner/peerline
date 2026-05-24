@@ -1185,6 +1185,9 @@ fn recv_route_status(
         routes.push("Tor onion".into());
     }
     routes.push("libp2p TCP".into());
+    if !discovery.libp2p_rendezvous_peers.is_empty() {
+        routes.push("libp2p rendezvous".into());
+    }
     if discovery.enable_quic {
         routes.push("libp2p QUIC".into());
     }
@@ -1204,6 +1207,9 @@ fn recv_route_status(
 
 fn send_route_status(discovery: &peerline_net::DiscoveryConfig) -> String {
     let mut routes = vec!["rendezvous".to_string(), "DHT".into(), "mDNS".into()];
+    if !discovery.libp2p_rendezvous_peers.is_empty() {
+        routes.push("libp2p rendezvous".into());
+    }
     if discovery.enable_public_tunnels {
         routes.push("public tunnel".into());
     }

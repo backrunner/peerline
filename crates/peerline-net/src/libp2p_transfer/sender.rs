@@ -349,6 +349,9 @@ async fn request_round_trip(
                 SwarmEvent::Behaviour(TransferBehaviourEvent::Relay(event)) => {
                     tracing::debug!(?event, "relay event while waiting for response");
                 }
+                SwarmEvent::Behaviour(TransferBehaviourEvent::Rendezvous(event)) => {
+                    tracing::debug!(?event, "rendezvous event while waiting for response");
+                }
                 _ => {}
             }
         }

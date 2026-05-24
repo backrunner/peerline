@@ -5,7 +5,7 @@ use crate::{
 };
 use libp2p::{
     PeerId, StreamProtocol, Swarm, SwarmBuilder, autonat, dcutr, identify, kad, mdns, noise, ping,
-    relay,
+    relay, rendezvous,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, behaviour::toggle::Toggle},
     upnp, yamux,
@@ -21,6 +21,7 @@ pub(crate) struct TransferBehaviour {
     pub(crate) upnp: Toggle<upnp::tokio::Behaviour>,
     pub(crate) identify: identify::Behaviour,
     pub(crate) ping: ping::Behaviour,
+    pub(crate) rendezvous: rendezvous::client::Behaviour,
     pub(crate) relay: relay::client::Behaviour,
     pub(crate) dcutr: dcutr::Behaviour,
     pub(crate) autonat: autonat::v1::Behaviour,
@@ -115,6 +116,7 @@ async fn build_swarm(
                     key.public(),
                 )),
                 ping: ping::Behaviour::default(),
+                rendezvous: rendezvous::client::Behaviour::new(key.clone()),
                 relay,
                 dcutr: dcutr::Behaviour::new(local_peer_id),
                 autonat: autonat::v1::Behaviour::new(local_peer_id, autonat::v1::Config::default()),

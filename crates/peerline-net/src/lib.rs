@@ -12,7 +12,8 @@ pub use direct::{
     send_prebuilt_direct, send_prebuilt_direct_probe,
 };
 pub use discovery::{
-    Candidate, DiscoveryConfig, RouteKind, WebRtcIceServer, without_turn_ice_servers,
+    Candidate, DiscoveryConfig, Libp2pRendezvousPeer, RouteKind, WebRtcIceServer,
+    without_turn_ice_servers,
 };
 pub use libp2p_transfer::{
     Libp2pRecvOptions, Libp2pSendOptions, recv_libp2p, send_libp2p, send_prebuilt_libp2p,
