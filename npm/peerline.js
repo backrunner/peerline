@@ -7,6 +7,12 @@ const https = require("node:https");
 const os = require("node:os");
 const path = require("node:path");
 
+const DOWNLOAD_PROGRESS_MESSAGE = "Downloading peerline binary (first run only)...";
+const DOWNLOAD_PROGRESS_BAR_WIDTH = 20;
+const DOWNLOAD_PROGRESS_DELAY_MS = 3_000;
+const DOWNLOAD_PROGRESS_REFRESH_MS = 125;
+const DOWNLOAD_PROGRESS_ANIMATION_INTERVAL_MS = 250;
+
 function detectLibc(reportGetter = () => process.report?.getReport?.()) {
   if (process.platform !== "linux") {
     return "";
@@ -62,6 +68,171 @@ function releaseAssetUrl(version = packageVersion(), env = process.env) {
 
 function cachedBinaryPath(version = packageVersion(), env = process.env, osImpl = os) {
   return path.join(cacheRoot(env, osImpl), version, releaseAssetName());
+}
+
+function formatByteSize(bytes) {
+  const safeBytes = Number.isFinite(bytes) && bytes > 0 ? bytes : 0;
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let value = safeBytes;
+  let unit = 0;
+
+  while (value >= 1024 && unit + 1 < units.length) {
+    value /= 1024;
+    unit += 1;
+  }
+
+  if (unit === 0) {
+    return `${Math.round(value)} ${units[unit]}`;
+  }
+
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
+
+function formatDownloadProgressBar(ratio, width = DOWNLOAD_PROGRESS_BAR_WIDTH) {
+  const clamped = Math.max(0, Math.min(1, ratio));
+  const filled = clamped >= 1 ? width : Math.floor(clamped * width);
+  return `[${"#".repeat(filled)}${".".repeat(width - filled)}]`;
+}
+
+function formatIndeterminateProgressBar(frame, width = DOWNLOAD_PROGRESS_BAR_WIDTH) {
+  const segmentWidth = Math.min(width, Math.max(4, Math.floor(width / 3)));
+  const maxOffset = Math.max(0, width - segmentWidth);
+  const offset = maxOffset === 0 ? 0 : frame % (maxOffset + 1);
+  return `[${".".repeat(offset)}${"#".repeat(segmentWidth)}${".".repeat(width - segmentWidth - offset)}]`;
+}
+
+function formatDownloadStatusLine({
+  downloadedBytes,
+  totalBytes = null,
+  elapsedMs,
+  message = DOWNLOAD_PROGRESS_MESSAGE,
+  progressBarWidth = DOWNLOAD_PROGRESS_BAR_WIDTH,
+  nowMs = 0,
+}) {
+  const safeDownloadedBytes = Number.isFinite(downloadedBytes) && downloadedBytes > 0 ? downloadedBytes : 0;
+  const safeElapsedMs = Number.isFinite(elapsedMs) && elapsedMs > 0 ? elapsedMs : 0;
+  const speedBytesPerSecond = safeElapsedMs > 0 ? safeDownloadedBytes / (safeElapsedMs / 1000) : 0;
+  const hasKnownTotal = Number.isFinite(totalBytes) && totalBytes > 0;
+  const bar = hasKnownTotal
+    ? formatDownloadProgressBar(safeDownloadedBytes / totalBytes, progressBarWidth)
+    : formatIndeterminateProgressBar(Math.floor(nowMs / DOWNLOAD_PROGRESS_ANIMATION_INTERVAL_MS), progressBarWidth);
+
+  if (hasKnownTotal) {
+    const ratio = Math.max(0, Math.min(1, safeDownloadedBytes / totalBytes));
+    return [
+      message,
+      bar,
+      `${Math.round(ratio * 100)}%`,
+      `${formatByteSize(safeDownloadedBytes)} / ${formatByteSize(totalBytes)}`,
+      `${formatByteSize(speedBytesPerSecond)}/s`,
+    ].join(" ");
+  }
+
+  return [
+    message,
+    bar,
+    `${formatByteSize(safeDownloadedBytes)} downloaded`,
+    `${formatByteSize(speedBytesPerSecond)}/s`,
+  ].join(" ");
+}
+
+function createDownloadProgressReporter(deps = {}) {
+  const stderr = deps.stderr ?? process.stderr;
+  const nowImpl = deps.now ?? Date.now;
+  const setTimeoutImpl = deps.setTimeout ?? setTimeout;
+  const clearTimeoutImpl = deps.clearTimeout ?? clearTimeout;
+  const activationDelayMs = deps.activationDelayMs ?? DOWNLOAD_PROGRESS_DELAY_MS;
+  const refreshIntervalMs = deps.refreshIntervalMs ?? DOWNLOAD_PROGRESS_REFRESH_MS;
+  const progressBarWidth = deps.progressBarWidth ?? DOWNLOAD_PROGRESS_BAR_WIDTH;
+  const message = deps.message ?? DOWNLOAD_PROGRESS_MESSAGE;
+  const isInteractive = Boolean(stderr?.isTTY);
+  let activated = false;
+  let downloadedBytes = 0;
+  let finished = false;
+  let lastLineWidth = 0;
+  let lastRenderAt = Number.NEGATIVE_INFINITY;
+  let plainMessageShown = false;
+  let timer = null;
+  let totalBytes = null;
+  const startMs = nowImpl();
+
+  const render = (force = false) => {
+    if (!activated || finished) {
+      return;
+    }
+
+    const nowMs = nowImpl();
+    if (!force && nowMs - lastRenderAt < refreshIntervalMs) {
+      return;
+    }
+    lastRenderAt = nowMs;
+
+    if (!isInteractive) {
+      if (!plainMessageShown) {
+        stderr.write(`${message}\n`);
+        plainMessageShown = true;
+      }
+      return;
+    }
+
+    const line = formatDownloadStatusLine({
+      downloadedBytes,
+      totalBytes,
+      elapsedMs: nowMs - startMs,
+      message,
+      progressBarWidth,
+      nowMs,
+    });
+    const width = Math.max(lastLineWidth, line.length);
+    stderr.write(`\r${line.padEnd(width, " ")}`);
+    lastLineWidth = width;
+  };
+
+  const activate = () => {
+    if (activated || finished) {
+      return;
+    }
+    activated = true;
+    render(true);
+  };
+
+  timer = setTimeoutImpl(activate, activationDelayMs);
+  if (typeof timer?.unref === "function") {
+    timer.unref();
+  }
+
+  return {
+    onStart(nextTotalBytes) {
+      totalBytes = Number.isFinite(nextTotalBytes) && nextTotalBytes >= 0 ? nextTotalBytes : null;
+      if (!activated && nowImpl() - startMs >= activationDelayMs) {
+        activate();
+        return;
+      }
+      if (activated) {
+        render(true);
+      }
+    },
+    onProgress(nextDownloadedBytes) {
+      downloadedBytes = Number.isFinite(nextDownloadedBytes) && nextDownloadedBytes >= 0 ? nextDownloadedBytes : downloadedBytes;
+      if (!activated && nowImpl() - startMs >= activationDelayMs) {
+        activate();
+        return;
+      }
+      render();
+    },
+    finish() {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      if (timer) {
+        clearTimeoutImpl(timer);
+      }
+      if (activated && isInteractive && lastLineWidth > 0) {
+        stderr.write(`\r${" ".repeat(lastLineWidth)}\r`);
+      }
+    },
+  };
 }
 
 function pruneStaleCachedVersions(version = packageVersion(), env = process.env, osImpl = os, fsImpl = fs) {
@@ -195,9 +366,17 @@ function downloadToFile(url, destination, deps = {}, redirects = 0) {
           return;
         }
 
+        const totalBytesHeader = Number(response.headers["content-length"]);
+        const totalBytes = Number.isFinite(totalBytesHeader) && totalBytesHeader >= 0 ? totalBytesHeader : null;
+        deps.onDownloadStart?.(totalBytes);
+        let downloadedBytes = 0;
         const output = fsImpl.createWriteStream(destination, { mode: 0o755 });
         output.on("error", reject);
         response.on("error", reject);
+        response.on("data", (chunk) => {
+          downloadedBytes += chunk.length;
+          deps.onDownloadProgress?.(downloadedBytes);
+        });
         output.on("finish", () => output.close(resolve));
         response.pipe(output);
       }
@@ -234,9 +413,26 @@ async function downloadReleaseBinary(deps = {}) {
   fsImpl.mkdirSync(dir, { recursive: true });
   const tempPath = path.join(dir, `.download-${process.pid}-${Date.now()}`);
   const url = releaseAssetUrl(version, env);
+  const downloadProgress = createDownloadProgressReporter({
+    stderr: deps.stderr,
+    now: deps.now,
+    setTimeout: deps.setTimeout,
+    clearTimeout: deps.clearTimeout,
+  });
+  const downloadDeps = {
+    ...deps,
+    onDownloadStart(totalBytes) {
+      deps.onDownloadStart?.(totalBytes);
+      downloadProgress.onStart(totalBytes);
+    },
+    onDownloadProgress(downloadedBytes) {
+      deps.onDownloadProgress?.(downloadedBytes);
+      downloadProgress.onProgress(downloadedBytes);
+    },
+  };
 
   try {
-    await downloadImpl(url, tempPath, deps);
+    await downloadImpl(url, tempPath, downloadDeps);
     if (process.platform !== "win32") {
       fsImpl.chmodSync(tempPath, 0o755);
     }
@@ -257,6 +453,8 @@ async function downloadReleaseBinary(deps = {}) {
         "Install from source with cargo, or retry when the GitHub release asset is available.",
       ].join(" ")
     );
+  } finally {
+    downloadProgress.finish();
   }
 }
 
@@ -347,15 +545,20 @@ if (require.main === module) {
 }
 
 module.exports = {
+  DOWNLOAD_PROGRESS_MESSAGE,
   binaryName,
   cachedBinaryPath,
   cacheRoot,
+  createDownloadProgressReporter,
   detectLibc,
+  downloadToFile,
   downloadReleaseBinary,
   ensureExecutable,
   executeBinary,
   exitCodeForResult,
   copyBinaryToTemporaryLocation,
+  formatByteSize,
+  formatDownloadStatusLine,
   formatExecutionFallbackError,
   isRetryableExecutionError,
   main,

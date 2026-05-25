@@ -48,7 +48,7 @@ npm install -g peerline@beta
 peerline --help
 ```
 
-The npm package is a small launcher. It runs a local `target/debug/peerline` or `target/release/peerline` during development; installed packages download the matching macOS, Linux, or Windows binary from the corresponding GitHub Release on first use, cache the current version locally, and prune older cached versions.
+The npm package is a small launcher. It runs a local `target/debug/peerline` or `target/release/peerline` during development; installed packages download the matching macOS, Linux, or Windows binary from the corresponding GitHub Release on first use, cache the current version locally, and prune older cached versions. If that first download takes longer than three seconds, the launcher shows a lightweight terminal progress line with download status and speed.
 
 Run from source:
 
