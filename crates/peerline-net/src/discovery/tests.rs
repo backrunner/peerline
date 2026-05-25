@@ -11,12 +11,22 @@ use super::{
     swarm::build_discovery_swarm,
     turn_static_auth_credential,
 };
+use crate::{
+    RendezvousConfig,
+    pkarr::{Publisher, set_test_bootstrap},
+};
 use libp2p::{Multiaddr, PeerId};
 use peerline_core::{HumanCode, HumanName, NameCode};
 use peerline_rendezvous_model::{
     PeerDescriptor, PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION, TorOnionEndpoint,
 };
-use std::net::{IpAddr, Ipv4Addr};
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    sync::{LazyLock, Mutex},
+    time::Duration,
+};
+
+static PKARR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[test]
 fn ranks_lan_before_relay_and_keeps_distinct_routes() {
@@ -78,6 +88,77 @@ fn dht_publish_and_discovery_keys_use_the_same_lookup_key() {
         String::from_utf8(provider_record_key(&lookup_key).to_vec()).unwrap(),
         format!("/peerline/v1/{}", lookup_key.hex())
     );
+}
+
+#[test]
+fn discover_peer_candidates_includes_pkarr_mainline_results() {
+    let _guard = PKARR_TEST_LOCK.lock().unwrap();
+    let testnet = ::pkarr::mainline::Testnet::builder(3).build().unwrap();
+    let _bootstrap = set_test_bootstrap(testnet.bootstrap.clone());
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let name = HumanName::parse("river-mango-42").unwrap();
+        let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+        let lookup_key = NameCode::new(name.clone(), code.clone()).lookup_key();
+        let peer_id = PeerId::random();
+        let descriptor = PeerDescriptor {
+            protocol_version: RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
+            peer_id: peer_id.to_string(),
+            direct_endpoints: vec!["203.0.113.7:43117".into()],
+            libp2p_endpoints: vec![],
+            public_endpoints: vec![],
+            tor_endpoints: vec![],
+            published_unix_ms: 1,
+        };
+        let mut publisher = Publisher::new(&lookup_key, Duration::from_secs(3)).unwrap();
+        publisher
+            .publish_descriptor(&descriptor, true)
+            .await
+            .unwrap();
+        let mut resolved = None;
+        for _ in 0..20 {
+            resolved = crate::pkarr::resolve_peer_descriptor(&lookup_key, Duration::from_secs(1))
+                .await
+                .unwrap();
+            if resolved.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let resolved = resolved.expect("pkarr descriptor should become resolvable");
+        assert_eq!(resolved.peer_id, descriptor.peer_id);
+        assert_eq!(resolved.direct_endpoints, descriptor.direct_endpoints);
+
+        let candidates = super::discover_peer_candidates(
+            &name,
+            &code,
+            DiscoveryConfig {
+                min_candidate_diversity: 1,
+                lookup_timeout: Duration::from_secs(4),
+                enable_mdns: false,
+                enable_upnp: false,
+                enable_natpmp_pcp: false,
+                enable_quic: false,
+                enable_dcutr: false,
+                enable_turn: false,
+                enable_public_tunnels: false,
+                enable_tor: false,
+                allow_relay_data_fallback: false,
+                bootstrap_peers: vec![],
+                relay_peers: vec![],
+                libp2p_rendezvous_peers: vec![],
+                rendezvous: RendezvousConfig::disabled(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].peer_id, descriptor.peer_id);
+        assert_eq!(candidates[0].addresses, vec!["203.0.113.7:43117"]);
+        assert!(matches!(candidates[0].route, RouteKind::PublicDirect));
+    });
 }
 
 #[test]
