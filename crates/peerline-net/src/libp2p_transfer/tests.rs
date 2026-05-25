@@ -17,6 +17,10 @@ use std::{
 };
 use tokio::time;
 
+fn test_identity() -> (HumanName, HumanCode) {
+    (HumanName::generate(), HumanCode::generate())
+}
+
 async fn spawn_bootstrap_peer() -> (String, tokio::task::JoinHandle<()>) {
     let mut swarm = super::behaviour::build_receiver_swarm(false, false, &[])
         .await
@@ -105,8 +109,7 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
     std::fs::create_dir(&dst_dir).unwrap();
     std::fs::write(src_dir.join("hello.txt"), "hello libp2p").unwrap();
 
-    let name = HumanName::parse("river-mango-42").unwrap();
-    let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+    let (name, code) = test_identity();
     let source_id = peerline_core::NodeId::random();
     let (bootstrap_peer, bootstrap_handle) = spawn_bootstrap_peer().await;
     let discovery = DiscoveryConfig {
@@ -206,8 +209,7 @@ async fn libp2p_roundtrip_can_discover_through_configured_rendezvous_peer() {
     std::fs::create_dir(&dst_dir).unwrap();
     std::fs::write(src_dir.join("hello.txt"), "hello rendezvous").unwrap();
 
-    let name = HumanName::parse("river-mango-42").unwrap();
-    let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+    let (name, code) = test_identity();
     let source_id = peerline_core::NodeId::random();
     let (rendezvous_peer, rendezvous_handle) = spawn_rendezvous_peer().await;
     let discovery = DiscoveryConfig {
@@ -303,8 +305,7 @@ async fn libp2p_resumes_after_sender_disconnects_mid_transfer() {
     std::fs::create_dir(&dst_dir).unwrap();
     std::fs::write(src_dir.join("large.bin"), vec![7u8; 2 * 1024 * 1024]).unwrap();
 
-    let name = HumanName::parse("river-mango-42").unwrap();
-    let code = HumanCode::parse("rose-lime-iris-jade-1234").unwrap();
+    let (name, code) = test_identity();
     let source_id = NodeId::random();
     let archive_one = create_archive(
         std::slice::from_ref(&src_dir.join("large.bin")),
