@@ -120,7 +120,10 @@ pub(crate) async fn recv_libp2p(
         &libp2p_rendezvous_namespace,
         &options.discovery,
     );
-    publish_pkarr_receiver_descriptor(pkarr_publisher.as_ref(), &descriptor, true);
+    publish_pkarr_receiver_descriptor(
+        pkarr_publisher.as_ref().map(|publisher| (publisher, true)),
+        &descriptor,
+    );
 
     loop {
         tokio::select! {
@@ -132,8 +135,7 @@ pub(crate) async fn recv_libp2p(
                     &options,
                     &mapped_direct_endpoints,
                     &rendezvous_registration,
-                    pkarr_publisher.as_ref(),
-                    true,
+                    pkarr_publisher.as_ref().map(|publisher| (publisher, true)),
                 );
             }
             endpoints = wait_for_direct_mapping_change(&mut direct_mapping_rx) => {
@@ -146,8 +148,7 @@ pub(crate) async fn recv_libp2p(
                         &options,
                         &mapped_direct_endpoints,
                         &rendezvous_registration,
-                        pkarr_publisher.as_ref(),
-                        false,
+                        pkarr_publisher.as_ref().map(|publisher| (publisher, false)),
                     );
                 }
             }
@@ -201,8 +202,7 @@ pub(crate) async fn recv_libp2p(
                             &options,
                             &mapped_direct_endpoints,
                             &rendezvous_registration,
-                            pkarr_publisher.as_ref(),
-                            false,
+                            pkarr_publisher.as_ref().map(|publisher| (publisher, false)),
                         );
                     }
                     SwarmEvent::Behaviour(TransferBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
@@ -224,8 +224,7 @@ pub(crate) async fn recv_libp2p(
                                 &options,
                                 &mapped_direct_endpoints,
                                 &rendezvous_registration,
-                                pkarr_publisher.as_ref(),
-                                false,
+                                pkarr_publisher.as_ref().map(|publisher| (publisher, false)),
                             );
                         }
                     }
@@ -247,8 +246,7 @@ pub(crate) async fn recv_libp2p(
                             &options,
                             &mapped_direct_endpoints,
                             &rendezvous_registration,
-                            pkarr_publisher.as_ref(),
-                            false,
+                            pkarr_publisher.as_ref().map(|publisher| (publisher, false)),
                         );
                         register_receiver_libp2p_rendezvous(
                             &mut swarm,
@@ -270,8 +268,7 @@ fn republish_receiver_descriptor(
     options: &Libp2pRecvOptions,
     extra_direct_endpoints: &[SocketAddr],
     rendezvous_registration: &http_rendezvous::RendezvousRegistrationGuard,
-    pkarr_publisher: Option<&pkarr::PublishWorker>,
-    force_pkarr: bool,
+    pkarr_publish: Option<(&pkarr::PublishWorker, bool)>,
 ) {
     if let Ok(descriptor) = publish_receiver_descriptor(
         swarm,
@@ -281,16 +278,15 @@ fn republish_receiver_descriptor(
         extra_direct_endpoints,
     ) {
         rendezvous_registration.update_descriptor(descriptor.clone());
-        publish_pkarr_receiver_descriptor(pkarr_publisher, &descriptor, force_pkarr);
+        publish_pkarr_receiver_descriptor(pkarr_publish, &descriptor);
     }
 }
 
 fn publish_pkarr_receiver_descriptor(
-    publisher: Option<&pkarr::PublishWorker>,
+    publisher: Option<(&pkarr::PublishWorker, bool)>,
     descriptor: &peerline_rendezvous_model::PeerDescriptor,
-    force: bool,
 ) {
-    let Some(publisher) = publisher else {
+    let Some((publisher, force)) = publisher else {
         return;
     };
     publisher.publish_descriptor(descriptor, force);
