@@ -8,12 +8,14 @@ const path = require("node:path");
 const test = require("node:test");
 
 const {
+  downloadReleaseBinary,
   cachedBinaryPath,
   detectLibc,
   ensureExecutable,
   executeBinary,
   exitCodeForResult,
   packageName,
+  packageVersion,
   releaseAssetName,
   releaseAssetUrl,
 } = require("./peerline.js");
@@ -47,6 +49,58 @@ test("release assets are named for direct GitHub downloads", () => {
 test("cachedBinaryPath honors PEERLINE_BINARY_CACHE", () => {
   const cachePath = cachedBinaryPath("0.1.0-alpha.6", { PEERLINE_BINARY_CACHE: "/tmp/peerline-cache" }, os);
   assert.equal(cachePath, path.join("/tmp/peerline-cache", "0.1.0-alpha.6", releaseAssetName()));
+});
+
+test("downloadReleaseBinary prunes stale cached versions when current binary already exists", async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "peerline-npm-"));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+
+  const env = { PEERLINE_BINARY_CACHE: tempDir };
+  const version = packageVersion();
+  const currentBinary = cachedBinaryPath(version, env, os);
+  const staleBinary = cachedBinaryPath("0.0.0-stale", env, os);
+
+  fs.mkdirSync(path.dirname(currentBinary), { recursive: true });
+  fs.writeFileSync(currentBinary, "current", { mode: 0o755 });
+  fs.mkdirSync(path.dirname(staleBinary), { recursive: true });
+  fs.writeFileSync(staleBinary, "stale", { mode: 0o755 });
+
+  const resolved = await downloadReleaseBinary({ env, fs, os });
+
+  assert.equal(resolved, currentBinary);
+  assert.deepEqual(fs.readdirSync(tempDir), [version]);
+  assert.equal(fs.existsSync(currentBinary), true);
+});
+
+test("downloadReleaseBinary prunes stale cached versions after downloading the current binary", async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "peerline-npm-"));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+
+  const env = { PEERLINE_BINARY_CACHE: tempDir };
+  const version = packageVersion();
+  const currentBinary = cachedBinaryPath(version, env, os);
+  const staleBinary = cachedBinaryPath("0.0.0-stale", env, os);
+
+  fs.mkdirSync(path.dirname(staleBinary), { recursive: true });
+  fs.writeFileSync(staleBinary, "stale", { mode: 0o755 });
+
+  const resolved = await downloadReleaseBinary({
+    env,
+    fs,
+    os,
+    async downloadToFile(url, destination) {
+      assert.equal(url, releaseAssetUrl(version, env));
+      fs.writeFileSync(destination, "downloaded");
+    },
+  });
+
+  assert.equal(resolved, currentBinary);
+  assert.deepEqual(fs.readdirSync(tempDir), [version]);
+  assert.equal(fs.existsSync(currentBinary), true);
+
+  if (process.platform !== "win32") {
+    assert.notEqual(fs.statSync(currentBinary).mode & 0o111, 0);
+  }
 });
 
 test(

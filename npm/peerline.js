@@ -64,6 +64,27 @@ function cachedBinaryPath(version = packageVersion(), env = process.env, osImpl 
   return path.join(cacheRoot(env, osImpl), version, releaseAssetName());
 }
 
+function pruneStaleCachedVersions(version = packageVersion(), env = process.env, osImpl = os, fsImpl = fs) {
+  const root = cacheRoot(env, osImpl);
+  let entries;
+
+  try {
+    entries = fsImpl.readdirSync(root, { withFileTypes: true });
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+
+  for (const entry of entries) {
+    if (typeof entry.isDirectory !== "function" || !entry.isDirectory() || entry.name === version) {
+      continue;
+    }
+    fsImpl.rmSync(path.join(root, entry.name), { recursive: true, force: true });
+  }
+}
+
 function ensureExecutable(binaryPath, fsImpl = fs) {
   if (process.platform === "win32") {
     return;
@@ -192,11 +213,20 @@ async function downloadReleaseBinary(deps = {}) {
   const fsImpl = deps.fs ?? fs;
   const osImpl = deps.os ?? os;
   const env = deps.env ?? process.env;
+  const downloadImpl = deps.downloadToFile ?? downloadToFile;
   const version = packageVersion(fsImpl);
   const binaryPath = cachedBinaryPath(version, env, osImpl);
+  const pruneCache = () => {
+    try {
+      pruneStaleCachedVersions(version, env, osImpl, fsImpl);
+    } catch {
+      // Ignore cache cleanup failures; callers care more about having a runnable binary.
+    }
+  };
 
   if (fsImpl.existsSync(binaryPath)) {
     ensureExecutable(binaryPath, fsImpl);
+    pruneCache();
     return binaryPath;
   }
 
@@ -206,12 +236,13 @@ async function downloadReleaseBinary(deps = {}) {
   const url = releaseAssetUrl(version, env);
 
   try {
-    await downloadToFile(url, tempPath, deps);
+    await downloadImpl(url, tempPath, deps);
     if (process.platform !== "win32") {
       fsImpl.chmodSync(tempPath, 0o755);
     }
     fsImpl.renameSync(tempPath, binaryPath);
     ensureExecutable(binaryPath, fsImpl);
+    pruneCache();
     return binaryPath;
   } catch (error) {
     try {
