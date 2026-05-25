@@ -6,7 +6,10 @@ mod swarm;
 #[cfg(test)]
 mod tests;
 
-use crate::rendezvous::{self, RendezvousConfig};
+use crate::{
+    pkarr,
+    rendezvous::{self, RendezvousConfig},
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use endpoints::LocalDirectNetworks;
 use futures::StreamExt;
@@ -34,6 +37,7 @@ pub use endpoints::rank_candidates;
 pub use rendezvous_protocol::Libp2pRendezvousPeer;
 
 const FALLBACK_ROUTE_DISCOVERY_GRACE: Duration = Duration::from_secs(2);
+const INITIAL_PKARR_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteKind {
@@ -385,7 +389,22 @@ async fn discover_peer_descriptors(
     let descriptor_key = descriptor_record_key(&lookup_key);
     let provider_key = provider_record_key(&lookup_key);
     let rendezvous_namespace = rendezvous_protocol::receiver_namespace(&lookup_key)?;
+    let pkarr_lookup_key = lookup_key.clone();
+    let pkarr_timeout = config.lookup_timeout;
     let mut snapshot = DiscoverySnapshot::new();
+    let initial_pkarr_timeout = config.lookup_timeout.min(INITIAL_PKARR_PROBE_TIMEOUT);
+    match pkarr::resolve_peer_descriptor(&lookup_key, initial_pkarr_timeout).await {
+        Ok(Some(descriptor)) => {
+            tracing::info!("initial pkarr probe returned descriptor");
+            snapshot.insert_descriptor(descriptor);
+        }
+        Ok(None) => {
+            tracing::debug!("initial pkarr probe returned no descriptor");
+        }
+        Err(error) => {
+            tracing::debug!(%error, "initial pkarr probe failed");
+        }
+    }
     let rendezvous_name = name.clone();
     let rendezvous_code = code.clone();
     let rendezvous_config = config.rendezvous.clone();
@@ -397,8 +416,12 @@ async fn discover_peer_descriptors(
         )
         .await
     };
+    let mut pkarr_lookup = tokio::spawn(async move {
+        pkarr::resolve_peer_descriptor(&pkarr_lookup_key, pkarr_timeout).await
+    });
     tokio::pin!(rendezvous_lookup);
     let mut rendezvous_done = false;
+    let mut pkarr_done = false;
 
     let mut swarm = build_discovery_swarm(false, config.enable_mdns, config.enable_upnp)?;
     apply_bootstrap(&mut swarm, &config);
@@ -455,6 +478,34 @@ async fn discover_peer_descriptors(
                     }
                 }
             }
+            result = &mut pkarr_lookup, if !pkarr_done => {
+                pkarr_done = true;
+                match result {
+                    Ok(Ok(Some(descriptor))) => {
+                        tracing::info!("pkarr discovery returned descriptor");
+                        snapshot.insert_descriptor(descriptor);
+                        if !should_keep_discovering_for_route_diversity(
+                            &snapshot,
+                            local_networks,
+                            &config,
+                            fallback_grace_elapsed,
+                        ) && snapshot.is_diverse_enough(config.min_candidate_diversity)
+                            && snapshot.has_usable_candidates(local_networks, &config)
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Ok(None)) => {
+                        tracing::debug!("pkarr discovery returned no descriptor");
+                    }
+                    Ok(Err(error)) => {
+                        tracing::debug!(%error, "pkarr discovery failed");
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "pkarr discovery task failed");
+                    }
+                }
+            }
             _ = query_interval.tick() => {
                 let _ = swarm.behaviour_mut().kad.get_providers(provider_key.clone());
                 let _ = swarm.behaviour_mut().kad.get_record(descriptor_key.clone());
@@ -498,6 +549,10 @@ async fn discover_peer_descriptors(
                 }
             }
         }
+    }
+
+    if !pkarr_done {
+        pkarr_lookup.abort();
     }
 
     if snapshot.is_diverse_enough(config.min_candidate_diversity)
@@ -579,9 +634,17 @@ async fn run_descriptor_publisher(
     }
 
     let name_code = NameCode::new(name, code);
-    let record_key = descriptor_record_key(&name_code.lookup_key());
-    let provider_key = provider_record_key(&name_code.lookup_key());
+    let lookup_key = name_code.lookup_key();
+    let record_key = descriptor_record_key(&lookup_key);
+    let provider_key = provider_record_key(&lookup_key);
     let allow_loopback = config.allow_loopback_endpoints;
+    let mut pkarr_publisher = match pkarr::Publisher::new(&lookup_key, config.lookup_timeout) {
+        Ok(publisher) => Some(publisher),
+        Err(error) => {
+            tracing::warn!(%error, "pkarr publisher unavailable");
+            None
+        }
+    };
     let publish_interval = Duration::from_secs(60);
     let mut interval = time::interval_at(time::Instant::now() + publish_interval, publish_interval);
     let direct_mapping = config.port_mapping_enabled().then(|| {
@@ -612,9 +675,10 @@ async fn run_descriptor_publisher(
     let _rendezvous_registration = rendezvous::RendezvousRegistrationGuard::new(
         name_code.name.clone(),
         name_code.code.clone(),
-        descriptor,
+        descriptor.clone(),
         config.rendezvous.clone(),
     );
+    publish_pkarr_descriptor(pkarr_publisher.as_mut(), &descriptor, true).await;
 
     loop {
         tokio::select! {
@@ -627,7 +691,8 @@ async fn run_descriptor_publisher(
                     &mapped_direct_endpoints,
                     allow_loopback,
                 )?;
-                _rendezvous_registration.update_descriptor(descriptor);
+                _rendezvous_registration.update_descriptor(descriptor.clone());
+                publish_pkarr_descriptor(pkarr_publisher.as_mut(), &descriptor, true).await;
             }
             event = swarm.select_next_some() => {
                 if handle_publish_swarm_event(&mut swarm, event)
@@ -640,7 +705,8 @@ async fn run_descriptor_publisher(
                         allow_loopback,
                     )
                 {
-                    _rendezvous_registration.update_descriptor(descriptor);
+                    _rendezvous_registration.update_descriptor(descriptor.clone());
+                    publish_pkarr_descriptor(pkarr_publisher.as_mut(), &descriptor, false).await;
                 }
             }
             endpoints = wait_for_direct_mapping_change(&mut direct_mapping_rx) => {
@@ -654,7 +720,8 @@ async fn run_descriptor_publisher(
                         &mapped_direct_endpoints,
                         allow_loopback,
                     ) {
-                        _rendezvous_registration.update_descriptor(descriptor);
+                        _rendezvous_registration.update_descriptor(descriptor.clone());
+                        publish_pkarr_descriptor(pkarr_publisher.as_mut(), &descriptor, false).await;
                     }
                 }
             }
@@ -671,6 +738,19 @@ async fn wait_for_direct_mapping_change(
     };
     receiver.changed().await.ok()?;
     Some(receiver.borrow().clone())
+}
+
+async fn publish_pkarr_descriptor(
+    publisher: Option<&mut pkarr::Publisher>,
+    descriptor: &PeerDescriptor,
+    force: bool,
+) {
+    let Some(publisher) = publisher else {
+        return;
+    };
+    if let Err(error) = publisher.publish_descriptor(descriptor, force).await {
+        tracing::warn!(%error, peer_id = %descriptor.peer_id, "pkarr publish failed");
+    }
 }
 
 fn peers_from_env(name: &str) -> Option<Vec<String>> {

@@ -776,7 +776,10 @@ async fn named_send_attempt(
     transfer_id: TransferId,
     quit_rx: &mut Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<TaskOutcome<peerline_net::SentTransfer>> {
-    tracing::info!(peer = %plan.name, "discovering routes through rendezvous, DHT, and mDNS");
+    tracing::info!(
+        peer = %plan.name,
+        "discovering routes through pkarr/mainline, rendezvous, DHT, and mDNS"
+    );
     let discovery_future = peerline_net::discovery::discover_peer_candidates(
         &plan.name,
         &plan.code,

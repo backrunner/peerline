@@ -24,6 +24,7 @@ peerline-core = { path = "../peerline-core" }
 peerline-crypto = { path = "../peerline-crypto" }
 peerline-rendezvous-model = { path = "../peerline-rendezvous-model" }
 peerline-transfer = { path = "../peerline-transfer" }
+pkarr.workspace = true
 postcard.workspace = true
 reqwest.workspace = true
 serde.workspace = true

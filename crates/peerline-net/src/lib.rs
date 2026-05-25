@@ -1,6 +1,7 @@
 pub mod direct;
 pub mod discovery;
 pub mod libp2p_transfer;
+pub(crate) mod pkarr;
 pub(crate) mod protocol;
 pub mod rendezvous;
 pub(crate) mod resume;
