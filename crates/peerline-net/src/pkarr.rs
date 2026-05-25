@@ -17,6 +17,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
+use tokio::{sync::mpsc, task::JoinHandle};
 
 const FORMAT_VERSION: u8 = 1;
 const RECORD_DIRECT_V4: u8 = 1;
@@ -36,6 +37,16 @@ pub(crate) struct Publisher {
     client: Client,
     keypair: Keypair,
     last_payload: Option<Vec<u8>>,
+}
+
+struct PublishRequest {
+    descriptor: PeerDescriptor,
+    force: bool,
+}
+
+pub(crate) struct PublishWorker {
+    sender: mpsc::UnboundedSender<PublishRequest>,
+    join: JoinHandle<()>,
 }
 
 impl Publisher {
@@ -66,6 +77,43 @@ impl Publisher {
         self.last_payload = Some(payload);
 
         Ok(())
+    }
+}
+
+impl PublishWorker {
+    pub(crate) fn new(lookup_key: &LookupKey, timeout: Duration) -> anyhow::Result<Self> {
+        let publisher = Publisher::new(lookup_key, timeout)?;
+        let (sender, mut receiver) = mpsc::unbounded_channel::<PublishRequest>();
+        let join = tokio::spawn(async move {
+            let mut publisher = publisher;
+            while let Some(request) = receiver.recv().await {
+                if let Err(error) = publisher
+                    .publish_descriptor(&request.descriptor, request.force)
+                    .await
+                {
+                    tracing::warn!(
+                        %error,
+                        peer_id = %request.descriptor.peer_id,
+                        "pkarr publish failed"
+                    );
+                }
+            }
+        });
+
+        Ok(Self { sender, join })
+    }
+
+    pub(crate) fn publish_descriptor(&self, descriptor: &PeerDescriptor, force: bool) {
+        let _ = self.sender.send(PublishRequest {
+            descriptor: descriptor.clone(),
+            force,
+        });
+    }
+}
+
+impl Drop for PublishWorker {
+    fn drop(&mut self) {
+        self.join.abort();
     }
 }
 

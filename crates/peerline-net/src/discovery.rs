@@ -638,7 +638,7 @@ async fn run_descriptor_publisher(
     let record_key = descriptor_record_key(&lookup_key);
     let provider_key = provider_record_key(&lookup_key);
     let allow_loopback = config.allow_loopback_endpoints;
-    let mut pkarr_publisher = match pkarr::Publisher::new(&lookup_key, config.lookup_timeout) {
+    let pkarr_publisher = match pkarr::PublishWorker::new(&lookup_key, config.lookup_timeout) {
         Ok(publisher) => Some(publisher),
         Err(error) => {
             tracing::warn!(%error, "pkarr publisher unavailable");
@@ -678,7 +678,7 @@ async fn run_descriptor_publisher(
         descriptor.clone(),
         config.rendezvous.clone(),
     );
-    publish_pkarr_descriptor(pkarr_publisher.as_mut(), &descriptor, true).await;
+    publish_pkarr_descriptor(pkarr_publisher.as_ref(), &descriptor, true);
 
     loop {
         tokio::select! {
@@ -692,7 +692,7 @@ async fn run_descriptor_publisher(
                     allow_loopback,
                 )?;
                 _rendezvous_registration.update_descriptor(descriptor.clone());
-                publish_pkarr_descriptor(pkarr_publisher.as_mut(), &descriptor, true).await;
+                publish_pkarr_descriptor(pkarr_publisher.as_ref(), &descriptor, true);
             }
             event = swarm.select_next_some() => {
                 if handle_publish_swarm_event(&mut swarm, event)
@@ -706,7 +706,7 @@ async fn run_descriptor_publisher(
                     )
                 {
                     _rendezvous_registration.update_descriptor(descriptor.clone());
-                    publish_pkarr_descriptor(pkarr_publisher.as_mut(), &descriptor, false).await;
+                    publish_pkarr_descriptor(pkarr_publisher.as_ref(), &descriptor, false);
                 }
             }
             endpoints = wait_for_direct_mapping_change(&mut direct_mapping_rx) => {
@@ -721,7 +721,7 @@ async fn run_descriptor_publisher(
                         allow_loopback,
                     ) {
                         _rendezvous_registration.update_descriptor(descriptor.clone());
-                        publish_pkarr_descriptor(pkarr_publisher.as_mut(), &descriptor, false).await;
+                        publish_pkarr_descriptor(pkarr_publisher.as_ref(), &descriptor, false);
                     }
                 }
             }
@@ -740,17 +740,15 @@ async fn wait_for_direct_mapping_change(
     Some(receiver.borrow().clone())
 }
 
-async fn publish_pkarr_descriptor(
-    publisher: Option<&mut pkarr::Publisher>,
+fn publish_pkarr_descriptor(
+    publisher: Option<&pkarr::PublishWorker>,
     descriptor: &PeerDescriptor,
     force: bool,
 ) {
     let Some(publisher) = publisher else {
         return;
     };
-    if let Err(error) = publisher.publish_descriptor(descriptor, force).await {
-        tracing::warn!(%error, peer_id = %descriptor.peer_id, "pkarr publish failed");
-    }
+    publisher.publish_descriptor(descriptor, force);
 }
 
 fn peers_from_env(name: &str) -> Option<Vec<String>> {
