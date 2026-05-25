@@ -10,7 +10,7 @@ Peerline is not a sync service and it does not keep a permanent hosted copy of y
 
 - Direct handoff: transfer files and folders from one machine to another without using shared storage as the normal path.
 - Human-friendly pairing: use readable names and codes instead of asking people to exchange long keys or machine identifiers.
-- Flexible networking: prefer direct TCP, discover peers through libp2p, and use fallback routes when direct paths are unavailable.
+- Flexible networking: publish compact discovery records to pkarr/mainline, discover peers through rendezvous and libp2p, and use fallback routes only when better paths are unavailable.
 - Encrypted by default: authenticate the transfer with the shared code and encrypt file contents at the application layer.
 - Safe file handling: archive multiple inputs with safe relative paths, BLAKE3 integrity checks, and non-overwriting output by default.
 
@@ -21,15 +21,17 @@ Peerline has two roles:
 - Receiver: runs `peerline recv`, keeps listening for incoming transfers until you quit or the idle timeout expires, and prints a `name`, `code`, and direct endpoint.
 - Sender: runs `peerline send`, points at the receiver by name/code or IP/code, and provides the files or folders to send.
 
-For named transfers, the receiver publishes a short-lived descriptor keyed by the shared name and code. The sender derives the same lookup key, discovers candidate routes, and tries them in order. Peerline prefers direct LAN or public TCP endpoints first, then libp2p routes such as DCUtR and WebRTC direct. When direct and hole-punched routes are unavailable, Peerline falls back to libp2p relay transport by default while keeping file contents protected by Peerline's end-to-end encryption.
+For named transfers, the receiver publishes a short-lived descriptor keyed by the shared name and code. Peerline publishes that descriptor to multiple backends at once: a compact raw-binary pkarr announcement on the mainline DHT, the HTTP rendezvous service, and libp2p discovery records. The pkarr payload is budgeted to keep the signed DNS packet under 1000 bytes and retains the highest-value endpoints first when space is tight.
 
-Peerline also probes HTTP rendezvous first, then falls back to DHT and mDNS. The built-in official rendezvous endpoint follows the release channel: alpha builds use `https://alpha.rendezvous.peerline.pwp.sh`, beta builds use `https://beta.rendezvous.peerline.pwp.sh`, and stable builds use `https://rendezvous.peerline.pwp.sh`. Official endpoints are mTLS-protected; official release assets can embed the client identity, while source builds can set `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH` or `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM` to a PEM bundle with the client certificate and private key. Set `PEERLINE_RENDEZVOUS_URLS` / `PEERLINE_RENDEZVOUS_URL` to point at another compatible rendezvous service. Use `PEERLINE_RENDEZVOUS_TOKEN` only when the rendezvous service expects a shared secret.
+On send, Peerline does a fast pkarr/mainline probe, queries HTTP rendezvous in parallel, and keeps gathering descriptors from Kademlia, optional libp2p Rendezvous peers, and mDNS for a short grace window when that can improve route diversity. Direct TCP and other non-relay routes are preferred ahead of relay fallback, and Tor candidates are delayed when another usable route already exists.
+
+The built-in official rendezvous endpoint follows the release channel: alpha builds use `https://alpha.rendezvous.peerline.pwp.sh`, beta builds use `https://beta.rendezvous.peerline.pwp.sh`, and stable builds use `https://rendezvous.peerline.pwp.sh`. Official endpoints are mTLS-protected; official release assets can embed the client identity, while source builds can set `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH` or `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM` to a PEM bundle with the client certificate and private key. Set `PEERLINE_RENDEZVOUS_URLS` / `PEERLINE_RENDEZVOUS_URL` to point at another compatible rendezvous service. Use `PEERLINE_RENDEZVOUS_TOKEN` only when the rendezvous service expects a shared secret.
 
 For direct transfers, the sender can skip discovery and dial an IP address or `host:port` directly. This is useful on the same network, over VPNs, or whenever the receiver already knows which address the sender should use. If you only provide an IP, Peerline probes the default direct window `43117-43121`.
 
 During a transfer, Peerline scans the requested paths into a manifest, preserves directories with safe relative paths, compresses when useful, and streams the archive to the receiver. The receiver verifies file sizes and BLAKE3 hashes before writing files into the current directory. Existing files are kept by default; conflicting names receive a non-overwriting suffix unless `--overwrite` is used.
 
-The secure session combines the shared code with OPAQUE PAKE, X25519, ML-KEM, HKDF, and ChaCha20-Poly1305. Discovery and transport routes can vary, but file contents stay encrypted by Peerline itself.
+The secure session combines the shared code with OPAQUE PAKE, X25519, ML-KEM, HKDF, ratcheted message keys, and ChaCha20-Poly1305. Discovery and transport routes can vary, but file contents stay encrypted by Peerline itself.
 
 ## Install And Run
 
@@ -167,6 +169,7 @@ PEERLINE_RENDEZVOUS_TIMEOUT_MS=5000
 PEERLINE_RENDEZVOUS_TTL_SECS=120
 PEERLINE_RENDEZVOUS_KEEPALIVE_SECS=60
 PEERLINE_LIBP2P_RENDEZVOUS_PEERS=/dnsaddr/rzv.example.net/p2p/...
+PEERLINE_PKARR_BOOTSTRAP=router1.example.net:6881,router2.example.net:6881
 PEERLINE_RELAY_PEERS=/ip4/203.0.113.10/tcp/4001/p2p/...
 PEERLINE_DISABLE_RELAY_FALLBACK=1
 PEERLINE_DISABLE_MDNS=1
@@ -183,6 +186,7 @@ PEERLINE_WEBRTC_ICE_SERVERS='[{"urls":["turn:turn.example.net:3478?transport=udp
 ```
 
 `PEERLINE_RENDEZVOUS_URLS` should contain comma-separated compatible HTTP rendezvous endpoints. The singular `PEERLINE_RENDEZVOUS_URL` is also supported.
+`PEERLINE_PKARR_BOOTSTRAP` should contain comma-separated `host:port` mainline DHT bootstrap nodes for pkarr. Leave it unset to use pkarr's default bootstrap network; setting it is mainly useful for tests, private deployments, or isolated bootstrap pools.
 `PEERLINE_LIBP2P_RENDEZVOUS_PEERS` should contain comma-separated libp2p Rendezvous point multiaddrs. This optional backend is disabled unless at least one rendezvous point is configured; discovered registrations are used as libp2p route candidates.
 `PEERLINE_RELAY_PEERS` should contain comma-separated libp2p relay-capable peer multiaddrs. If it is not set, Peerline tries the bootstrap peers as relay candidates. UPnP is enabled by default for home-router TCP and libp2p external address discovery; set `PEERLINE_DISABLE_UPNP=1` to turn it off.
 WebRTC direct transport ships with default Open Relay Project TURN candidates for `staticauth.openrelay.metered.ca` on ports `80` and `443`, including UDP, TCP, and TLS-style `turns` URLs. Peerline generates short-lived static-auth credentials for those defaults. Set `PEERLINE_WEBRTC_ICE_SERVERS` to a JSON array of WebRTC ICE server objects to replace the defaults; set it to an empty string to disable configured ICE servers entirely.
@@ -191,7 +195,9 @@ WebRTC direct transport ships with default Open Relay Project TURN candidates fo
 ## Current Status
 
 - Direct IP send and receive works.
-- Named discovery now uses HTTP rendezvous first, then Kademlia provider records, optional libp2p Rendezvous points, mDNS, UPnP/NAT-PMP/PCP-assisted direct endpoints, public tunnel and Tor onion descriptors, QUIC, DCUtR, WebRTC direct/TURN, and relay fallback.
+- Named discovery now publishes and resolves descriptors through pkarr/mainline, HTTP rendezvous, Kademlia records/providers, optional libp2p Rendezvous points, and mDNS.
+- Receiver descriptors are packed into a compact binary pkarr announcement that keeps the signed DNS packet within the 1000-byte budget while prioritizing the most useful endpoints first.
+- Route candidates include direct TCP, public tunnels, Tor onion, libp2p TCP/QUIC/DCUtR, WebRTC direct/TURN, and relay fallback.
 - Files, multiple files, and folders are archived with safe relative paths, BLAKE3 integrity checks, and streaming zstd/lzma compression support.
 - Receivers stay open across multiple incoming transfers, with a configurable idle auto-exit.
 - Conflicts default to non-overwrite suffixes, with `--overwrite` available when replacement is intended.
