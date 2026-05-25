@@ -1,19 +1,44 @@
+use peerline_core::{HumanCode, HumanName, NameCode};
 use std::{
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::{Mutex, MutexGuard, OnceLock},
     thread,
     time::{Duration, Instant},
 };
 
 static NETWORK_E2E_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const TEST_NAME: &str = "river-mango-42";
+const TEST_CODE: &str = "rose-lime-iris-jade-1234";
+const PKARR_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+const RENDEZVOUS_BLACKHOLE_URL: &str = "http://127.0.0.1:9";
+
+struct LocalPkarrTestnet {
+    _testnet: pkarr::mainline::Testnet,
+    bootstrap: String,
+}
 
 fn network_e2e_guard() -> MutexGuard<'static, ()> {
     NETWORK_E2E_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl LocalPkarrTestnet {
+    fn new() -> Self {
+        let testnet = pkarr::mainline::Testnet::builder(3).build().unwrap();
+        let bootstrap = testnet.bootstrap.join(",");
+        Self {
+            _testnet: testnet,
+            bootstrap,
+        }
+    }
+
+    fn bootstrap(&self) -> &str {
+        &self.bootstrap
+    }
 }
 
 fn bin() -> PathBuf {
@@ -81,6 +106,173 @@ fn wait_for_port(port: u16, timeout: Duration) {
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn configure_pkarr_only_env(cmd: &mut Command, bootstrap: &str) {
+    cmd.env("PEERLINE_BOOTSTRAP", "")
+        .env("PEERLINE_DISABLE_MDNS", "1")
+        .env("PEERLINE_DISABLE_TOR", "1")
+        .env("PEERLINE_DISABLE_PUBLIC_TUNNELS", "1")
+        .env("PEERLINE_PKARR_BOOTSTRAP", bootstrap)
+        .env("PEERLINE_RENDEZVOUS_URLS", RENDEZVOUS_BLACKHOLE_URL);
+}
+
+fn describe_output(output: &Output) -> String {
+    format!(
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+fn pkarr_public_key(name: &str, code: &str) -> pkarr::PublicKey {
+    let lookup_key = NameCode::new(
+        HumanName::parse(name).unwrap(),
+        HumanCode::parse(code).unwrap(),
+    )
+    .lookup_key();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"peerline:pkarr:v1");
+    hasher.update(&lookup_key.bytes());
+    pkarr::Keypair::from_secret_key(hasher.finalize().as_bytes()).public_key()
+}
+
+fn wait_for_pkarr_publish(name: &str, code: &str, bootstrap: &str, timeout: Duration) {
+    let bootstrap = bootstrap
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let mut builder = pkarr::Client::builder();
+    builder
+        .no_default_network()
+        .bootstrap(&bootstrap)
+        .no_relays()
+        .request_timeout(Duration::from_secs(1));
+    if !bootstrap.is_empty()
+        && bootstrap
+            .iter()
+            .all(|value| value.starts_with("127.0.0.1:") || value.starts_with("localhost:"))
+    {
+        builder.dht(|dht| dht.bind_address(std::net::Ipv4Addr::LOCALHOST));
+    }
+    let client = builder.build().unwrap();
+    let public_key = pkarr_public_key(name, code);
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let start = Instant::now();
+            loop {
+                if client.resolve_most_recent(&public_key).await.is_some() {
+                    return;
+                }
+                assert!(
+                    start.elapsed() <= timeout,
+                    "timed out waiting for pkarr record for {name}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+}
+
+fn spawn_named_pkarr_recv(
+    cwd: &Path,
+    port: u16,
+    bootstrap: &str,
+    identity_args: &[&str],
+    config_home: Option<&Path>,
+    debug: bool,
+) -> Child {
+    let mut cmd = Command::new(bin());
+    cmd.current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove("RUST_LOG");
+    if let Some(config_home) = config_home {
+        cmd.env("XDG_CONFIG_HOME", config_home);
+    }
+    configure_pkarr_only_env(&mut cmd, bootstrap);
+    if debug {
+        cmd.arg("--debug");
+    }
+    cmd.arg("recv");
+    for arg in identity_args {
+        cmd.arg(arg);
+    }
+    cmd.arg("--no-tui")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--idle-timeout-minutes")
+        .arg("1")
+        .arg("--no-quic")
+        .arg("--no-dcutr")
+        .arg("--no-turn")
+        .arg("--no-relay-fallback");
+    cmd.spawn().unwrap()
+}
+
+fn spawn_named_pkarr_send(
+    cwd: &Path,
+    bootstrap: &str,
+    identity_args: &[&str],
+    path: &Path,
+    debug: bool,
+) -> Output {
+    let mut cmd = Command::new(bin());
+    cmd.current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove("RUST_LOG");
+    configure_pkarr_only_env(&mut cmd, bootstrap);
+    if debug {
+        cmd.arg("--debug");
+    }
+    cmd.arg("send")
+        .arg("--retry-attempts")
+        .arg("1")
+        .arg("--no-quic")
+        .arg("--no-dcutr")
+        .arg("--no-turn")
+        .arg("--no-relay-fallback");
+    for arg in identity_args {
+        cmd.arg(arg);
+    }
+    cmd.arg(path);
+    cmd.output().unwrap()
+}
+
+fn wait_for_named_pkarr_receiver(port: u16, bootstrap: &str) {
+    wait_for_port(port, Duration::from_secs(5));
+    wait_for_pkarr_publish(TEST_NAME, TEST_CODE, bootstrap, PKARR_WAIT_TIMEOUT);
+}
+
+fn kill_and_collect(mut child: Child) -> Output {
+    let _ = child.kill();
+    child.wait_with_output().unwrap()
+}
+
+fn assert_named_send_succeeded(send: &Output, recv: &mut Option<Child>) {
+    if send.status.success() {
+        return;
+    }
+
+    let recv_output = kill_and_collect(recv.take().unwrap());
+    panic!(
+        "send failed\nsend:\n{}\nrecv:\n{}",
+        describe_output(send),
+        describe_output(&recv_output),
+    );
+}
+
+fn assert_recv_completed(recv_output: &Output) {
+    assert!(
+        String::from_utf8_lossy(&recv_output.stdout).contains("received 1 file(s), "),
+        "recv output did not show a completed transfer\n{}",
+        describe_output(recv_output)
+    );
 }
 
 #[test]
@@ -317,6 +509,7 @@ fn direct_tcp_receiver_accepts_multiple_sends_before_idle_exit() {
 #[test]
 fn named_send_uses_saved_name_and_can_route_locally() {
     let _guard = network_e2e_guard();
+    let testnet = LocalPkarrTestnet::new();
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("src");
     let dst = temp.path().join("dst");
@@ -331,54 +524,80 @@ fn named_send_uses_saved_name_and_can_route_locally() {
         .env("XDG_CONFIG_HOME", &config_home)
         .arg("set")
         .arg("name")
-        .arg("river-mango-42");
+        .arg(TEST_NAME);
     assert!(set_name.output().unwrap().status.success());
 
-    let mut recv = Command::new(bin());
-    recv.current_dir(&dst)
-        .env("XDG_CONFIG_HOME", &config_home)
-        .env("PEERLINE_ALLOW_LOOPBACK_DISCOVERY", "1")
-        .env("PEERLINE_BOOTSTRAP", "")
-        .env("PEERLINE_DISABLE_TOR", "1")
-        .env("PEERLINE_DISABLE_PUBLIC_TUNNELS", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .arg("recv")
-        .arg("rose-lime-iris-jade-1234")
-        .arg("--no-tui")
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--idle-timeout-minutes")
-        .arg("0.3");
-    let mut recv = recv.spawn().unwrap();
-    wait_for_port(port, Duration::from_secs(5));
+    let mut recv = Some(spawn_named_pkarr_recv(
+        &dst,
+        port,
+        testnet.bootstrap(),
+        &[TEST_CODE],
+        Some(&config_home),
+        true,
+    ));
+    wait_for_named_pkarr_receiver(port, testnet.bootstrap());
 
-    let send = spawn_send(
+    let send = spawn_named_pkarr_send(
         temp.path(),
-        &[
-            "send",
-            "--retry-attempts",
-            "1",
-            "river-mango-42",
-            "rose-lime-iris-jade-1234",
-            src.join("hello.txt").to_str().unwrap(),
-        ],
-        &[
-            ("PEERLINE_ALLOW_LOOPBACK_DISCOVERY", "1"),
-            ("PEERLINE_BOOTSTRAP", ""),
-            ("PEERLINE_DISABLE_TOR", "1"),
-            ("PEERLINE_DISABLE_PUBLIC_TUNNELS", "1"),
-        ],
+        testnet.bootstrap(),
+        &[TEST_NAME, TEST_CODE],
+        &src.join("hello.txt"),
+        true,
     );
 
-    assert!(
-        send.status.success(),
-        "send stderr: {}",
-        String::from_utf8_lossy(&send.stderr)
-    );
-    assert!(recv.wait().unwrap().success());
+    assert_named_send_succeeded(&send, &mut recv);
+    let recv_output = kill_and_collect(recv.take().unwrap());
+    assert_recv_completed(&recv_output);
     assert_eq!(
         std::fs::read_to_string(dst.join("hello.txt")).unwrap(),
         "hello named cli"
     );
+}
+
+#[test]
+fn named_send_discovers_receiver_through_pkarr_mainline() {
+    let _guard = network_e2e_guard();
+    let testnet = LocalPkarrTestnet::new();
+
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::create_dir(&dst).unwrap();
+    std::fs::write(src.join("hello.txt"), "hello pkarr cli").unwrap();
+
+    let port = free_port();
+    let mut recv = Some(spawn_named_pkarr_recv(
+        &dst,
+        port,
+        testnet.bootstrap(),
+        &[TEST_NAME, TEST_CODE],
+        None,
+        false,
+    ));
+    wait_for_named_pkarr_receiver(port, testnet.bootstrap());
+
+    let send = spawn_named_pkarr_send(
+        temp.path(),
+        testnet.bootstrap(),
+        &[TEST_NAME, TEST_CODE],
+        &src.join("hello.txt"),
+        true,
+    );
+
+    assert_named_send_succeeded(&send, &mut recv);
+    let recv_output = kill_and_collect(recv.take().unwrap());
+
+    let send_stderr = String::from_utf8_lossy(&send.stderr);
+    assert!(
+        send_stderr.contains("initial pkarr probe returned descriptor")
+            || send_stderr.contains("pkarr discovery returned descriptor"),
+        "send output did not show pkarr discovery\n{}",
+        describe_output(&send)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dst.join("hello.txt")).unwrap(),
+        "hello pkarr cli"
+    );
+    assert_recv_completed(&recv_output);
 }

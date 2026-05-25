@@ -27,4 +27,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
+blake3.workspace = true
+pkarr.workspace = true
 tempfile.workspace = true
