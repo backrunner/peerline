@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 futures.workspace = true
 rand.workspace = true
 peerline-core = { path = "../peerline-core" }
@@ -19,7 +20,10 @@ peerline-net = { path = "../peerline-net" }
 peerline-tui = { path = "../peerline-tui" }
 peerline-transfer = { path = "../peerline-transfer" }
 libp2p.workspace = true
+ratatui.workspace = true
 rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

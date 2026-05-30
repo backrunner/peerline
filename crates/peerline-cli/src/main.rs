@@ -1,3 +1,7 @@
+#[path = "main/doctor/mod.rs"]
+mod doctor;
+#[path = "main/setup/mod.rs"]
+mod setup;
 #[path = "main/terminal.rs"]
 mod terminal;
 #[path = "main/wait.rs"]
@@ -53,9 +57,16 @@ const TOR_FALLBACK_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Check Peerline configuration and platform dependencies.
+    Doctor(doctor::DoctorArgs),
+    /// Receive files and folders from a paired peer.
     Recv(RecvArgs),
+    /// Send files and folders to a paired peer.
     Send(SendArgs),
+    /// Save local Peerline preferences.
     Set(SetArgs),
+    /// Guide dependency installation with an interactive terminal UI.
+    Setup(setup::SetupArgs),
 }
 
 #[derive(Debug, Args)]
@@ -193,9 +204,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.debug);
     match cli.command {
+        Command::Doctor(args) => doctor::run(args).await,
         Command::Recv(args) => recv(args).await,
         Command::Send(args) => send(args).await,
         Command::Set(args) => set(args),
+        Command::Setup(args) => setup::run(args).await,
     }
 }
 
