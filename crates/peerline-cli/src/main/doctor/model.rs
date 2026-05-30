@@ -85,6 +85,7 @@ pub(crate) enum PackageManager {
     Yum,
     Pacman,
     Zypper,
+    Apk,
     Choco,
 }
 
@@ -97,6 +98,7 @@ impl PackageManager {
             Self::Yum => "yum",
             Self::Pacman => "pacman",
             Self::Zypper => "zypper",
+            Self::Apk => "apk",
             Self::Choco => "choco",
         }
     }
@@ -109,7 +111,20 @@ impl PackageManager {
             Self::Yum => "yum",
             Self::Pacman => "pacman",
             Self::Zypper => "zypper",
+            Self::Apk => "apk",
             Self::Choco => "Chocolatey",
+        }
+    }
+
+    pub(crate) fn linux_family_hint(self) -> Option<&'static str> {
+        match self {
+            Self::AptGet => Some("Debian/Ubuntu/Raspberry Pi OS"),
+            Self::Dnf => Some("Fedora/RHEL/CentOS"),
+            Self::Yum => Some("older RHEL/CentOS"),
+            Self::Pacman => Some("Arch/Manjaro"),
+            Self::Zypper => Some("openSUSE/SLES"),
+            Self::Apk => Some("Alpine"),
+            Self::Brew | Self::Choco => None,
         }
     }
 }

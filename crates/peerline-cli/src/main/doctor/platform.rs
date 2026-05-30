@@ -26,6 +26,7 @@ fn package_manager_candidates(platform: Platform) -> Vec<PackageManager> {
             PackageManager::Yum,
             PackageManager::Pacman,
             PackageManager::Zypper,
+            PackageManager::Apk,
             PackageManager::Brew,
         ],
         Platform::Other => vec![PackageManager::Brew],

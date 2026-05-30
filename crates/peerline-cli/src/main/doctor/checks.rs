@@ -179,6 +179,9 @@ fn tor_install_plan(
         PackageManager::Zypper => {
             vec![privileged_command("zypper", ["install", "-y", "tor"])]
         }
+        PackageManager::Apk => {
+            vec![privileged_command("apk", ["add", "tor"])]
+        }
         PackageManager::Choco => {
             vec![InstallCommand::executable(
                 "choco",
@@ -195,11 +198,18 @@ fn tor_install_plan(
             | PackageManager::Yum
             | PackageManager::Pacman
             | PackageManager::Zypper
+            | PackageManager::Apk
     ) && command_path("sudo").is_none()
     {
         notes.push(
             "Run from a root shell if the package manager reports a permission error.".into(),
         );
+    }
+    if let Some(family) = manager.kind.linux_family_hint() {
+        notes.push(format!(
+            "{} is the expected package manager for the {family} family.",
+            manager.command
+        ));
     }
     if manager.kind == PackageManager::Choco {
         notes
@@ -230,9 +240,15 @@ fn manual_tor_install_plan(platform: Platform) -> InstallPlan {
             commands: vec![
                 InstallCommand::manual("sudo apt-get update && sudo apt-get install -y tor"),
                 InstallCommand::manual("sudo dnf install -y tor"),
+                InstallCommand::manual("sudo yum install -y tor"),
                 InstallCommand::manual("sudo pacman -S --needed tor"),
+                InstallCommand::manual("sudo zypper install -y tor"),
+                InstallCommand::manual("sudo apk add tor"),
             ],
-            notes: vec!["Rerun `peerline setup` after installing Tor.".into()],
+            notes: vec![
+                "Choose the command for your distro: apt-get for Debian/Ubuntu/Raspberry Pi OS, dnf/yum for Fedora/RHEL/CentOS, pacman for Arch/Manjaro, zypper for openSUSE/SLES, apk for Alpine.".into(),
+                "Rerun `peerline setup` after installing Tor.".into(),
+            ],
         },
         Platform::Other => InstallPlan {
             summary: "install Tor with your OS package manager".into(),
@@ -343,6 +359,52 @@ mod tests {
             display
                 .iter()
                 .any(|command| command.ends_with("apt-get install -y tor"))
+        );
+    }
+
+    #[test]
+    fn tor_install_plan_supports_alpine_apk() {
+        let plan = plan_for(PackageManager::Apk);
+
+        assert!(plan.commands[0].display.ends_with("apk add tor"));
+        assert!(plan.notes.iter().any(|note| note.contains("Alpine family")));
+    }
+
+    #[test]
+    fn linux_manual_plan_names_common_distro_package_managers() {
+        let plan = manual_tor_install_plan(Platform::Linux);
+        let commands = plan
+            .commands
+            .iter()
+            .map(|command| command.display.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("apt-get install"))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("dnf install"))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("yum install"))
+        );
+        assert!(commands.iter().any(|command| command.contains("pacman -S")));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("zypper install"))
+        );
+        assert!(commands.iter().any(|command| command.contains("apk add")));
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("Debian/Ubuntu") && note.contains("Alpine"))
         );
     }
 
