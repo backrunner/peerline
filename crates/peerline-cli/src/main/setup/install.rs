@@ -19,22 +19,31 @@ pub(super) fn run_install_plan_in_normal_terminal(
     for command in &plan.commands {
         println!();
         println!("$ {}", command.display);
-        match run_install_command(command)? {
-            InstallCommandOutcome::Ran(status) => {
+        match run_install_command(command) {
+            Ok(InstallCommandOutcome::Ran(status)) => {
                 ran_any = true;
                 if !status.success() {
-                    println!("command exited with {status}");
+                    println!(
+                        "install step failed: `{}` exited with {status}",
+                        command.display
+                    );
+                    print_failure_hint(command);
                     return Ok(format!(
-                        "{} install command failed with {status}",
-                        dependency.label
+                        "{} install command failed: `{}` exited with {status}",
+                        dependency.label, command.display
                     ));
                 }
             }
-            InstallCommandOutcome::ManualOnly => {
+            Ok(InstallCommandOutcome::ManualOnly) => {
                 println!("manual command; run it in your shell, then rerun `peerline setup`");
             }
-            InstallCommandOutcome::Skipped => {
+            Ok(InstallCommandOutcome::Skipped) => {
                 println!("skipped");
+            }
+            Err(error) => {
+                println!("install step failed: {error}");
+                print_failure_hint(command);
+                return Err(error);
             }
         }
     }
@@ -64,7 +73,8 @@ fn run_install_command(command: &InstallCommand) -> anyhow::Result<InstallComman
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()?;
+        .status()
+        .map_err(|error| anyhow::anyhow!("could not launch `{}`: {error}", command.display))?;
     Ok(InstallCommandOutcome::Ran(status))
 }
 
@@ -74,4 +84,23 @@ fn confirm_command(command: &InstallCommand) -> anyhow::Result<bool> {
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
+}
+
+fn print_failure_hint(command: &InstallCommand) {
+    let hint = if command.display.contains("choco ") {
+        "Open an elevated PowerShell or Command Prompt, verify Chocolatey works with `choco -v`, then rerun `peerline setup`."
+    } else if command.display.contains("brew ") {
+        "Check Homebrew with `brew doctor`, make sure the network/repositories are reachable, then rerun `peerline setup`."
+    } else if command.display.contains("apt-get ")
+        || command.display.contains("dnf ")
+        || command.display.contains("yum ")
+        || command.display.contains("pacman ")
+        || command.display.contains("zypper ")
+        || command.display.contains("apk ")
+    {
+        "Check the package-manager output above for permissions, repository, lock, or network errors. Use the command for your Linux distro, then rerun `peerline setup`."
+    } else {
+        "Review the command output above, install Tor manually if needed, then rerun `peerline setup`."
+    };
+    println!("hint: {hint}");
 }

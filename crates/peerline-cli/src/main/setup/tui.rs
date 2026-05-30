@@ -1,7 +1,6 @@
 use self::app::SetupApp;
 use super::install::run_install_plan_in_normal_terminal;
 use crate::doctor::{self, DependencyReport, DoctorReport, InstallPlan};
-use anyhow::Context;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -81,9 +80,16 @@ async fn install_selected(
 
     terminal.draw(|frame| app.draw(frame))?;
     app.push_log(format!("opening install step for {}", dependency.label));
-    let outcome = run_install_plan_in_shell(&dependency, &plan)
-        .with_context(|| format!("failed to run setup action for {}", dependency.label))?;
-    app.push_log(outcome);
+    match run_install_plan_in_shell(&dependency, &plan) {
+        Ok(outcome) => app.push_log(outcome),
+        Err(error) => {
+            app.push_log(format!(
+                "{} setup did not complete: {error:#}",
+                dependency.label
+            ));
+            app.push_log("review the terminal output, then retry or install manually");
+        }
+    }
     app.refresh_report(doctor::collect_report().await);
     terminal.clear()?;
     Ok(())
