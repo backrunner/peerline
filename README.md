@@ -63,6 +63,19 @@ cargo build --release -p peerline-cli
 ./target/release/peerline --help
 ```
 
+Before the first transfer, check your local networking helpers:
+
+```sh
+peerline doctor
+peerline setup
+```
+
+`peerline doctor` prints the current platform, Peerline config path, package manager detection, and dependency status. Use `peerline doctor --json` for machine-readable output.
+
+`peerline setup` opens an interactive terminal checklist for missing dependencies, with install actions for macOS Homebrew, common Linux package managers, and Windows Chocolatey. Run `peerline setup --no-tui` to print the same plan without the interactive UI.
+
+Tor is optional, but installing the `tor` command gives Peerline onion routes when direct and relay paths are blocked. pkarr/mainline discovery is built into Peerline; there is no separate `bt` or `mainline` binary to install.
+
 ## Basic Usage
 
 Start a receiver:
