@@ -1,6 +1,7 @@
 target/
 npm/bin/
 dist/
+marketing/
 node_modules/
 .tgz
 .DS_Store
