@@ -23,7 +23,7 @@ Peerline has two roles:
 
 For named transfers, the receiver publishes a short-lived descriptor keyed by the shared name and code. Peerline publishes that descriptor to multiple backends at once: a compact raw-binary pkarr announcement on the mainline DHT, the HTTP rendezvous service, and libp2p discovery records. The pkarr payload is budgeted to keep the signed DNS packet under 1000 bytes and retains the highest-value endpoints first when space is tight.
 
-On send, Peerline does a fast pkarr/mainline probe, queries HTTP rendezvous in parallel, and keeps gathering descriptors from Kademlia, optional libp2p Rendezvous peers, and mDNS for a short grace window when that can improve route diversity. Direct TCP and other non-relay routes are preferred ahead of relay fallback, and Tor candidates are delayed when another usable route already exists.
+On send, Peerline does a fast pkarr/mainline probe, queries HTTP rendezvous in parallel, and keeps gathering descriptors from Kademlia, optional libp2p Rendezvous peers, and mDNS for a short grace window when that can improve route diversity. Direct TCP and other non-relay routes are preferred ahead of relay fallback, and Tor/I2P candidates are delayed when another usable route already exists.
 
 The built-in official rendezvous endpoint follows the release channel: alpha builds use `https://alpha.rendezvous.peerline.pwp.sh`, beta builds use `https://beta.rendezvous.peerline.pwp.sh`, and stable builds use `https://rendezvous.peerline.pwp.sh`. Official endpoints are mTLS-protected; official release assets can embed the client identity, while source builds can set `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PATH` or `PEERLINE_RENDEZVOUS_CLIENT_IDENTITY_PEM` to a PEM bundle with the client certificate and private key. Set `PEERLINE_RENDEZVOUS_URLS` / `PEERLINE_RENDEZVOUS_URL` to point at another compatible rendezvous service. Use `PEERLINE_RENDEZVOUS_TOKEN` only when the rendezvous service expects a shared secret.
 
@@ -74,7 +74,7 @@ peerline setup
 
 `peerline setup` opens an interactive terminal checklist for missing dependencies, with install actions for macOS Homebrew, common Linux package managers, and Windows Chocolatey. Run `peerline setup --no-tui` to print the same plan without the interactive UI.
 
-Tor is optional, but installing the `tor` command gives Peerline onion routes when direct and relay paths are blocked. pkarr/mainline discovery is built into Peerline; there is no separate `bt` or `mainline` binary to install.
+Tor is optional, but installing the `tor` command gives Peerline onion routes when direct and relay paths are blocked. I2P is also optional: Peerline reuses an existing SAM bridge at `127.0.0.1:7656` when available, or may start an installed `i2pd`/`i2prouter` command for a receive session, but it does not edit or manage I2P router configuration. pkarr/mainline discovery is built into Peerline; there is no separate `bt` or `mainline` binary to install.
 
 ## Basic Usage
 
@@ -91,7 +91,7 @@ peerline recv
 name: frost-827
 code: fig-mint-rose-123456
 direct: 0.0.0.0:43117
-waiting for transfers over direct TCP, Tor onion, libp2p TCP, libp2p QUIC, DCUtR, WebRTC/TURN, relay fallback...
+waiting for transfers over direct TCP, Tor onion, I2P, libp2p TCP, libp2p QUIC, DCUtR, WebRTC/TURN, relay fallback...
 idle timeout: 10 min (change with --idle-timeout-minutes)
 ```
 
@@ -139,6 +139,8 @@ peerline recv [NAME_OR_CODE] [CODE] --no-quic
 peerline recv [NAME_OR_CODE] [CODE] --no-dcutr
 peerline recv [NAME_OR_CODE] [CODE] --no-turn
 peerline recv [NAME_OR_CODE] [CODE] --no-tor
+peerline recv [NAME_OR_CODE] [CODE] --no-i2p
+peerline recv [NAME_OR_CODE] [CODE] --i2p-sam 127.0.0.1:7656
 peerline recv [NAME_OR_CODE] [CODE] --idle-timeout-minutes 30
 peerline recv [NAME_OR_CODE] [CODE] --tunnel cloudflared
 peerline recv [NAME_OR_CODE] [CODE] --tunnel localtunnel
@@ -149,6 +151,7 @@ peerline recv [NAME_OR_CODE] [CODE] --tunnel tunnelmole
 `--port` starts the 5-port direct window; Peerline will try that port and the next four.
 `--idle-timeout-minutes` defaults to `10`; set it to `0` to wait until you quit manually.
 Tor onion receive is attempted by default when the `tor` command is available; use `--no-tor` or `PEERLINE_DISABLE_TOR=1` to skip it.
+I2P receive is attempted by default through SAM at `127.0.0.1:7656`; use `--no-i2p` or `PEERLINE_DISABLE_I2P=1` to skip it, and use `--i2p-sam` or `PEERLINE_I2P_SAM` when your SAM bridge listens elsewhere. Java I2P may require enabling SAM manually, while `i2pd` commonly exposes SAM through its own configuration.
 `--tunnel` starts a public tunnel on the receiver side. `cloudflared`, `localtunnel`, and `tmole` are the public values; `tunnelmole` is accepted as an alias for `tmole`.
 
 Sender options:
@@ -165,6 +168,8 @@ peerline send <name> <code> <path...> --no-quic
 peerline send <name> <code> <path...> --no-dcutr
 peerline send <name> <code> <path...> --no-turn
 peerline send <name> <code> <path...> --no-tor
+peerline send <name> <code> <path...> --no-i2p
+peerline send <name> <code> <path...> --i2p-sam 127.0.0.1:7656
 peerline send <name> <code> <path...> --tor-socks-proxy 127.0.0.1:9050
 peerline send <name> <code> <path...> --retry-attempts 5
 peerline send --name <name> --code <code> <path...>
@@ -193,6 +198,8 @@ PEERLINE_DISABLE_DCUTR=1
 PEERLINE_DISABLE_TURN=1
 PEERLINE_DISABLE_PUBLIC_TUNNELS=1
 PEERLINE_DISABLE_TOR=1
+PEERLINE_DISABLE_I2P=1
+PEERLINE_I2P_SAM=127.0.0.1:7656
 PEERLINE_ALLOW_LOOPBACK_DISCOVERY=1
 PEERLINE_BOOTSTRAP=/dnsaddr/bootstrap.libp2p.io/p2p/...
 PEERLINE_WEBRTC_ICE_SERVERS='[{"urls":["turn:turn.example.net:3478?transport=udp"],"username":"user","credential":"pass"}]'
@@ -202,6 +209,7 @@ PEERLINE_WEBRTC_ICE_SERVERS='[{"urls":["turn:turn.example.net:3478?transport=udp
 `PEERLINE_PKARR_BOOTSTRAP` should contain comma-separated `host:port` mainline DHT bootstrap nodes for pkarr. Leave it unset to use pkarr's default bootstrap network; setting it is mainly useful for tests, private deployments, or isolated bootstrap pools.
 `PEERLINE_LIBP2P_RENDEZVOUS_PEERS` should contain comma-separated libp2p Rendezvous point multiaddrs. This optional backend is disabled unless at least one rendezvous point is configured; discovered registrations are used as libp2p route candidates.
 `PEERLINE_RELAY_PEERS` should contain comma-separated libp2p relay-capable peer multiaddrs. If it is not set, Peerline tries the bootstrap peers as relay candidates. UPnP is enabled by default for home-router TCP and libp2p external address discovery; set `PEERLINE_DISABLE_UPNP=1` to turn it off.
+`PEERLINE_I2P_SAM` points at the local SAM bridge used for I2P receive and send paths. Peerline publishes `.b32.i2p` WebSocket endpoints through the normal descriptor backends, preferring pkarr/mainline when the compact DHT record has room and falling back to HTTP rendezvous alongside other descriptor routes.
 WebRTC direct transport ships with default Open Relay Project TURN candidates for `staticauth.openrelay.metered.ca` on ports `80` and `443`, including UDP, TCP, and TLS-style `turns` URLs. Peerline generates short-lived static-auth credentials for those defaults. Set `PEERLINE_WEBRTC_ICE_SERVERS` to a JSON array of WebRTC ICE server objects to replace the defaults; set it to an empty string to disable configured ICE servers entirely.
 `PEERLINE_ALLOW_LOOPBACK_DISCOVERY=1` is mainly useful for local development and E2E tests where both peers run on the same machine.
 
@@ -210,7 +218,7 @@ WebRTC direct transport ships with default Open Relay Project TURN candidates fo
 - Direct IP send and receive works.
 - Named discovery now publishes and resolves descriptors through pkarr/mainline, HTTP rendezvous, Kademlia records/providers, optional libp2p Rendezvous points, and mDNS.
 - Receiver descriptors are packed into a compact binary pkarr announcement that keeps the signed DNS packet within the 1000-byte budget while prioritizing the most useful endpoints first.
-- Route candidates include direct TCP, public tunnels, Tor onion, libp2p TCP/QUIC/DCUtR, WebRTC direct/TURN, and relay fallback.
+- Route candidates include direct TCP, public tunnels, Tor onion, I2P, libp2p TCP/QUIC/DCUtR, WebRTC direct/TURN, and relay fallback.
 - Files, multiple files, and folders are archived with safe relative paths, BLAKE3 integrity checks, and streaming zstd/lzma compression support.
 - Receivers stay open across multiple incoming transfers, with a configurable idle auto-exit.
 - Conflicts default to non-overwrite suffixes, with `--overwrite` available when replacement is intended.
