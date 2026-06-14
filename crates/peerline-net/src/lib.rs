@@ -19,10 +19,12 @@ pub use discovery::{
 pub use libp2p_transfer::{
     Libp2pRecvOptions, Libp2pSendOptions, recv_libp2p, send_libp2p, send_prebuilt_libp2p,
 };
-pub use peerline_rendezvous_model::{PublicTunnelEndpoint, TorOnionEndpoint};
+pub use peerline_rendezvous_model::{I2pEndpoint, PublicTunnelEndpoint, TorOnionEndpoint};
 pub use rendezvous::RendezvousConfig;
 pub use tunnel::{
-    PublicTunnelProvider, bind_public_tunnel_listener, bind_tor_onion_listener,
-    normalize_public_tunnel_url, normalize_tor_onion_url, recv_public_tunnel_bound,
-    recv_tor_onion_bound, send_prebuilt_public_tunnel, send_prebuilt_tor_onion, send_public_tunnel,
+    I2pForward, I2pSession, PublicTunnelProvider, bind_i2p_listener, bind_public_tunnel_listener,
+    bind_tor_onion_listener, create_i2p_stream_session, forward_i2p_to_listener, i2p_sam_available,
+    normalize_i2p_url, normalize_public_tunnel_url, normalize_tor_onion_url, recv_i2p_bound,
+    recv_public_tunnel_bound, recv_tor_onion_bound, send_prebuilt_i2p, send_prebuilt_public_tunnel,
+    send_prebuilt_tor_onion, send_public_tunnel,
 };

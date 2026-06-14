@@ -1,5 +1,7 @@
 #[path = "main/doctor/mod.rs"]
 mod doctor;
+#[path = "main/i2p.rs"]
+mod i2p;
 #[path = "main/setup/mod.rs"]
 mod setup;
 #[path = "main/terminal.rs"]
@@ -54,6 +56,7 @@ struct Cli {
 const DEFAULT_RECV_IDLE_TIMEOUT_MINUTES: f64 = 10.0;
 const DEFAULT_RETRY_ATTEMPTS: usize = 5;
 const TOR_FALLBACK_DELAY: Duration = Duration::from_secs(3);
+const I2P_FALLBACK_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -99,6 +102,10 @@ struct RecvArgs {
     tor: bool,
     #[arg(long)]
     no_tor: bool,
+    #[arg(long)]
+    no_i2p: bool,
+    #[arg(long, default_value_t = SocketAddr::from(([127, 0, 0, 1], 7656)))]
+    i2p_sam: SocketAddr,
     #[arg(long, value_enum)]
     tunnel: Option<TunnelProviderArg>,
     #[arg(
@@ -135,6 +142,10 @@ struct SendArgs {
     no_turn: bool,
     #[arg(long)]
     no_tor: bool,
+    #[arg(long)]
+    no_i2p: bool,
+    #[arg(long, default_value_t = SocketAddr::from(([127, 0, 0, 1], 7656)))]
+    i2p_sam: SocketAddr,
     #[arg(long, default_value_t = SocketAddr::from(([127, 0, 0, 1], 9050)))]
     tor_socks_proxy: SocketAddr,
     #[arg(long, default_value_t = DEFAULT_RETRY_ATTEMPTS, value_parser = parse_retry_attempts)]
@@ -231,7 +242,12 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     println!("direct: {actual_bind}");
     println!(
         "waiting for transfers over {}...",
-        recv_route_status(&discovery, tunnel_provider, discovery.enable_tor)
+        recv_route_status(
+            &discovery,
+            tunnel_provider,
+            discovery.enable_tor,
+            discovery.enable_i2p,
+        )
     );
     match idle_timeout {
         Some(timeout) => println!(
@@ -251,7 +267,12 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
             name: name.clone(),
             code: code.clone(),
             bind: actual_bind.to_string(),
-            route_status: recv_route_status(&discovery, tunnel_provider, discovery.enable_tor),
+            route_status: recv_route_status(
+                &discovery,
+                tunnel_provider,
+                discovery.enable_tor,
+                discovery.enable_i2p,
+            ),
             stage: peerline_core::TransferStage::Discovering,
             progress: None,
         };
@@ -321,6 +342,33 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     if let Some(tor) = tor_onion.as_ref() {
         println!("tor onion: {} (local {})", tor.endpoint.url, tor.local_addr);
     }
+    let i2p = if discovery.enable_i2p {
+        match wait_with_quit(i2p::start_i2p(discovery.i2p_sam), &mut quit_rx).await {
+            Ok(TaskOutcome::Completed(i2p)) => Some(i2p),
+            Ok(TaskOutcome::Quit) => {
+                finish_recv(network_events, events, event_fanout, tui_task).await;
+                return Ok(());
+            }
+            Err(error) => {
+                let message = format!("I2P unavailable: {error}; continuing without I2P");
+                println!("{message}");
+                let _ = network_events.send(PeerlineEvent::Message(message));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let i2p_endpoints = i2p
+        .as_ref()
+        .map(|i2p| vec![i2p.endpoint.clone()])
+        .unwrap_or_default();
+    if let Some(i2p) = i2p.as_ref() {
+        println!(
+            "i2p: {} via SAM {} (local {})",
+            i2p.endpoint.url, discovery.i2p_sam, i2p.local_addr
+        );
+    }
 
     let mut transfers = 0usize;
     let mut files = 0usize;
@@ -356,6 +404,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
                     discovery: discovery.clone(),
                     public_tunnel_endpoints: public_tunnel_endpoints.clone(),
                     tor_onion_endpoints: tor_onion_endpoints.clone(),
+                    i2p_endpoints: i2p_endpoints.clone(),
                     events: events.clone(),
                 }),
             ),
@@ -374,6 +423,23 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
                         events: events.clone(),
                     },
                     tunnel.endpoint.url.clone(),
+                ),
+            ));
+        }
+        if let Some(i2p) = i2p.as_ref() {
+            receiver_paths.push(ReceiverPath::new(
+                "i2p",
+                peerline_net::recv_i2p_bound(
+                    &i2p.listener,
+                    RecvOptions {
+                        name: name.clone(),
+                        code: code.clone(),
+                        bind: actual_bind,
+                        destination: destination.clone(),
+                        overwrite: args.overwrite,
+                        events: events.clone(),
+                    },
+                    i2p.endpoint.url.clone(),
                 ),
             ));
         }
@@ -820,8 +886,8 @@ async fn named_send_attempt(
         ),
     );
 
-    let delay_tor = candidates.iter().any(|candidate| {
-        !matches!(candidate.route, RouteKind::TorOnion)
+    let delay_anonymous_fallback = candidates.iter().any(|candidate| {
+        !matches!(candidate.route, RouteKind::TorOnion | RouteKind::I2p)
             && route_allowed(&candidate.route, &plan.discovery)
     });
     let mut attempts = FuturesUnordered::new();
@@ -841,10 +907,15 @@ async fn named_send_attempt(
 
         let candidate_plan = plan.clone();
         let candidate_archive = clone_archive(&archive)?;
-        let candidate_delay = delay_tor && matches!(candidate.route, RouteKind::TorOnion);
+        let candidate_delay = delay_anonymous_fallback
+            && matches!(candidate.route, RouteKind::TorOnion | RouteKind::I2p);
         attempts.push(async move {
             if candidate_delay {
-                tokio::time::sleep(TOR_FALLBACK_DELAY).await;
+                let delay = match candidate.route {
+                    RouteKind::I2p => I2P_FALLBACK_DELAY,
+                    _ => TOR_FALLBACK_DELAY,
+                };
+                tokio::time::sleep(delay).await;
             }
             let candidate_route = candidate.route.clone();
             let result =
@@ -977,6 +1048,29 @@ async fn send_candidate(
             )
             .await
         }
+        RouteKind::I2p => {
+            let endpoint = candidate
+                .addresses
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("I2P candidate missing URL"))?;
+            peerline_net::send_prebuilt_i2p(
+                SendOptions {
+                    endpoint: "127.0.0.1:0".parse().expect("static endpoint"),
+                    name: Some(plan.name.clone()),
+                    code: plan.code.clone(),
+                    source_id: plan.source_id,
+                    paths: plan.paths.clone(),
+                    compression: plan.compression,
+                    events: plan.events.clone(),
+                },
+                archive,
+                transfer_id,
+                endpoint,
+                plan.discovery.i2p_sam,
+            )
+            .await
+        }
         RouteKind::Libp2pQuic
         | RouteKind::Libp2pDcutr
         | RouteKind::WebRtcDirect
@@ -1077,6 +1171,7 @@ fn route_label(route: &RouteKind) -> &'static str {
         RouteKind::PublicDirect => "public-direct",
         RouteKind::PublicTunnel => "public-tunnel",
         RouteKind::TorOnion => "tor-onion",
+        RouteKind::I2p => "i2p",
         RouteKind::Libp2pQuic => "libp2p-quic",
         RouteKind::Libp2pDcutr => "libp2p-dcutr",
         RouteKind::WebRtcDirect => "webrtc-direct",
@@ -1115,15 +1210,8 @@ fn recv_discovery_config(args: &RecvArgs) -> peerline_net::DiscoveryConfig {
         ),
         ..Default::default()
     };
-    apply_discovery_flags(
-        &mut discovery,
-        args.no_upnp,
-        args.no_nat_pmp_pcp,
-        args.no_quic,
-        args.no_dcutr,
-        args.no_turn,
-        args.no_tor,
-    );
+    apply_discovery_flags(&mut discovery, DiscoveryDisableFlags::from_recv(args));
+    discovery.i2p_sam = args.i2p_sam;
     if args.tor {
         discovery.enable_tor = true;
     }
@@ -1139,44 +1227,72 @@ fn send_discovery_config(args: &SendArgs) -> peerline_net::DiscoveryConfig {
         tor_socks_proxy: args.tor_socks_proxy,
         ..Default::default()
     };
-    apply_discovery_flags(
-        &mut discovery,
-        args.no_upnp,
-        args.no_nat_pmp_pcp,
-        args.no_quic,
-        args.no_dcutr,
-        args.no_turn,
-        args.no_tor,
-    );
+    apply_discovery_flags(&mut discovery, DiscoveryDisableFlags::from_send(args));
+    discovery.i2p_sam = args.i2p_sam;
     discovery
 }
 
-fn apply_discovery_flags(
-    discovery: &mut peerline_net::DiscoveryConfig,
+#[derive(Clone, Copy)]
+struct DiscoveryDisableFlags {
     no_upnp: bool,
     no_nat_pmp_pcp: bool,
     no_quic: bool,
     no_dcutr: bool,
     no_turn: bool,
     no_tor: bool,
+    no_i2p: bool,
+}
+
+impl DiscoveryDisableFlags {
+    fn from_recv(args: &RecvArgs) -> Self {
+        Self {
+            no_upnp: args.no_upnp,
+            no_nat_pmp_pcp: args.no_nat_pmp_pcp,
+            no_quic: args.no_quic,
+            no_dcutr: args.no_dcutr,
+            no_turn: args.no_turn,
+            no_tor: args.no_tor,
+            no_i2p: args.no_i2p,
+        }
+    }
+
+    fn from_send(args: &SendArgs) -> Self {
+        Self {
+            no_upnp: args.no_upnp,
+            no_nat_pmp_pcp: args.no_nat_pmp_pcp,
+            no_quic: args.no_quic,
+            no_dcutr: args.no_dcutr,
+            no_turn: args.no_turn,
+            no_tor: args.no_tor,
+            no_i2p: args.no_i2p,
+        }
+    }
+}
+
+fn apply_discovery_flags(
+    discovery: &mut peerline_net::DiscoveryConfig,
+    flags: DiscoveryDisableFlags,
 ) {
-    if no_upnp {
+    if flags.no_upnp {
         discovery.enable_upnp = false;
     }
-    if no_nat_pmp_pcp {
+    if flags.no_nat_pmp_pcp {
         discovery.enable_natpmp_pcp = false;
     }
-    if no_quic {
+    if flags.no_quic {
         discovery.enable_quic = false;
     }
-    if no_dcutr {
+    if flags.no_dcutr {
         discovery.enable_dcutr = false;
     }
-    if no_turn {
+    if flags.no_turn {
         discovery.enable_turn = false;
     }
-    if no_tor {
+    if flags.no_tor {
         discovery.enable_tor = false;
+    }
+    if flags.no_i2p {
+        discovery.enable_i2p = false;
     }
     if !discovery.enable_turn {
         discovery.webrtc_ice_servers =
@@ -1192,6 +1308,7 @@ fn recv_route_status(
     discovery: &peerline_net::DiscoveryConfig,
     tunnel_provider: Option<PublicTunnelProvider>,
     tor_onion: bool,
+    i2p: bool,
 ) -> String {
     let mut routes = vec!["direct TCP".to_string()];
     if let Some(provider) = tunnel_provider {
@@ -1199,6 +1316,9 @@ fn recv_route_status(
     }
     if tor_onion {
         routes.push("Tor onion".into());
+    }
+    if i2p {
+        routes.push("I2P".into());
     }
     routes.push("libp2p TCP".into());
     if !discovery.libp2p_rendezvous_peers.is_empty() {
@@ -1231,6 +1351,9 @@ fn send_route_status(discovery: &peerline_net::DiscoveryConfig) -> String {
     }
     if discovery.enable_tor {
         routes.push("Tor onion".into());
+    }
+    if discovery.enable_i2p {
+        routes.push("I2P".into());
     }
     routes.push("direct TCP".into());
     if discovery.enable_quic {
@@ -1559,7 +1682,7 @@ where
     })
 }
 
-fn spawn_process_output_reader<R>(
+pub(crate) fn spawn_process_output_reader<R>(
     process_name: &'static str,
     stream_name: &'static str,
     reader: R,
@@ -1736,6 +1859,8 @@ mod tests {
             no_dcutr: false,
             no_turn: false,
             no_tor: false,
+            no_i2p: false,
+            i2p_sam: SocketAddr::from(([127, 0, 0, 1], 7656)),
             tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
@@ -1760,6 +1885,8 @@ mod tests {
             no_dcutr: false,
             no_turn: false,
             no_tor: false,
+            no_i2p: false,
+            i2p_sam: SocketAddr::from(([127, 0, 0, 1], 7656)),
             tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
@@ -1781,6 +1908,8 @@ mod tests {
             no_dcutr: false,
             no_turn: false,
             no_tor: false,
+            no_i2p: false,
+            i2p_sam: SocketAddr::from(([127, 0, 0, 1], 7656)),
             tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
@@ -1805,6 +1934,8 @@ mod tests {
             no_dcutr: false,
             no_turn: false,
             no_tor: false,
+            no_i2p: false,
+            i2p_sam: SocketAddr::from(([127, 0, 0, 1], 7656)),
             tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };
@@ -1823,6 +1954,8 @@ mod tests {
             no_dcutr: false,
             no_turn: false,
             no_tor: false,
+            no_i2p: false,
+            i2p_sam: SocketAddr::from(([127, 0, 0, 1], 7656)),
             tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
         };

@@ -88,6 +88,7 @@ fn route_label(route: &ConnectionRoute) -> &'static str {
         ConnectionRoute::PublicDirect => "public-direct",
         ConnectionRoute::PublicTunnel => "public-tunnel",
         ConnectionRoute::TorOnion => "tor-onion",
+        ConnectionRoute::I2p => "i2p",
         ConnectionRoute::Libp2pQuic => "libp2p-quic",
         ConnectionRoute::Libp2pDcutr => "libp2p-dcutr",
         ConnectionRoute::Libp2pRelay => "libp2p-relay",

@@ -1,7 +1,7 @@
 use super::make_peer_descriptor;
 use libp2p::{Multiaddr, PeerId, Swarm, multiaddr::Protocol, rendezvous, swarm::NetworkBehaviour};
 use peerline_core::LookupKey;
-use peerline_rendezvous_model::{PublicTunnelEndpoint, TorOnionEndpoint};
+use peerline_rendezvous_model::{I2pEndpoint, PublicTunnelEndpoint, TorOnionEndpoint};
 
 const RECEIVER_NAMESPACE_PREFIX: &str = "peerline/receiver/v1";
 
@@ -98,6 +98,7 @@ pub(crate) fn descriptor_from_registration(
         endpoints,
         Vec::<PublicTunnelEndpoint>::new(),
         Vec::<TorOnionEndpoint>::new(),
+        Vec::<I2pEndpoint>::new(),
     ))
 }
 

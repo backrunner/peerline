@@ -964,6 +964,7 @@ mod tests {
             libp2p_endpoints: Vec::new(),
             public_endpoints: Vec::new(),
             tor_endpoints: Vec::new(),
+            i2p_endpoints: Vec::new(),
             published_unix_ms: 1,
         };
         let updated = PeerDescriptor {

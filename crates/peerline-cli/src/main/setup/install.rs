@@ -100,7 +100,7 @@ fn print_failure_hint(command: &InstallCommand) {
     {
         "Check the package-manager output above for permissions, repository, lock, or network errors. Use the command for your Linux distro, then rerun `peerline setup`."
     } else {
-        "Review the command output above, install Tor manually if needed, then rerun `peerline setup`."
+        "Review the command output above, install the dependency manually if needed, then rerun `peerline setup`."
     };
     println!("hint: {hint}");
 }

@@ -7,7 +7,9 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle},
     upnp, yamux,
 };
-use peerline_rendezvous_model::{PeerDescriptor, PublicTunnelEndpoint, TorOnionEndpoint};
+use peerline_rendezvous_model::{
+    I2pEndpoint, PeerDescriptor, PublicTunnelEndpoint, TorOnionEndpoint,
+};
 use std::net::SocketAddr;
 
 #[derive(NetworkBehaviour)]
@@ -92,6 +94,7 @@ pub(super) fn publish_descriptor(
             .collect(),
         Vec::<PublicTunnelEndpoint>::new(),
         Vec::<TorOnionEndpoint>::new(),
+        Vec::<I2pEndpoint>::new(),
     );
     tracing::debug!(
         peer_id = %descriptor.peer_id,

@@ -7,6 +7,7 @@ pub enum ConnectionRoute {
     PublicDirect,
     PublicTunnel,
     TorOnion,
+    I2p,
     Libp2pQuic,
     Libp2pDcutr,
     Libp2pRelay,

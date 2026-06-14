@@ -28,9 +28,18 @@ use tokio_tungstenite::{
     },
 };
 
+mod i2p;
+
+pub use i2p::{
+    I2pForward, I2pSession, bind_i2p_listener, create_i2p_stream_session, forward_i2p_to_listener,
+    i2p_sam_available, normalize_i2p_url,
+};
+
 const PUBLIC_TUNNEL_ROUTE_LABEL: &str = "public-tunnel";
 const TOR_ONION_ROUTE_LABEL: &str = "tor-onion";
+const I2P_ROUTE_LABEL: &str = "i2p";
 const PUBLIC_TUNNEL_SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const I2P_SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(75);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublicTunnelProvider {
@@ -138,6 +147,22 @@ pub async fn recv_tor_onion_bound(
         ConnectionRoute::TorOnion,
         TOR_ONION_ROUTE_LABEL,
         "Tor onion",
+    )
+    .await
+}
+
+pub async fn recv_i2p_bound(
+    listener: &TcpListener,
+    options: RecvOptions,
+    endpoint_label: String,
+) -> anyhow::Result<crate::direct::ReceivedTransfer> {
+    recv_ws_bound(
+        listener,
+        options,
+        endpoint_label,
+        ConnectionRoute::I2p,
+        I2P_ROUTE_LABEL,
+        "I2P",
     )
     .await
 }
@@ -281,9 +306,50 @@ pub async fn send_prebuilt_tor_onion(
     complete_public_tunnel_transfer(session, &archive, &options, transfer_id, descriptor).await
 }
 
+pub async fn send_prebuilt_i2p(
+    options: SendOptions,
+    archive: Archive,
+    transfer_id: TransferId,
+    endpoint: String,
+    sam_addr: SocketAddr,
+) -> anyhow::Result<SentTransfer> {
+    let endpoint = normalize_i2p_url(&endpoint)?;
+    let descriptor = crate::direct::descriptor_for_archive(&options, &archive);
+    emit_stage(
+        &options.events,
+        TransferStage::Connecting(ConnectionRoute::I2p),
+    );
+    emit_message(
+        &options.events,
+        format!("dialing {} via I2P SAM {}", endpoint, sam_addr),
+    );
+
+    let session = match time::timeout(
+        I2P_SESSION_OPEN_TIMEOUT,
+        i2p::open_i2p_session(
+            endpoint.clone(),
+            sam_addr,
+            options.name.as_ref(),
+            &options.code,
+            descriptor.clone(),
+        ),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => anyhow::bail!(
+            "timed out connecting to {} after {} seconds",
+            endpoint,
+            I2P_SESSION_OPEN_TIMEOUT.as_secs()
+        ),
+    };
+    complete_public_tunnel_transfer(session, &archive, &options, transfer_id, descriptor).await
+}
+
 struct PublicTunnelSession<S> {
     endpoint: String,
     stream: WebSocketStream<S>,
+    transport_control: Option<tokio::net::TcpStream>,
     opaque_client: OpaqueClientStart,
     server_response: Vec<u8>,
     client_handshake: ClientHandshake,
@@ -384,6 +450,7 @@ where
     Ok(PublicTunnelSession {
         endpoint,
         stream,
+        transport_control: None,
         opaque_client,
         resume_offset: server_intro.0,
         server_response: server_intro.1,

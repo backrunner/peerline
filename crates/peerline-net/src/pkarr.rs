@@ -9,7 +9,8 @@ use anyhow::{Context, anyhow};
 use libp2p::Multiaddr;
 use peerline_core::LookupKey;
 use peerline_rendezvous_model::{
-    PeerDescriptor, PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION, TorOnionEndpoint,
+    I2pEndpoint, PeerDescriptor, PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
+    TorOnionEndpoint,
 };
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
@@ -25,6 +26,7 @@ const RECORD_DIRECT_V6: u8 = 2;
 const RECORD_LIBP2P: u8 = 3;
 const RECORD_TOR: u8 = 4;
 const RECORD_PUBLIC_TUNNEL: u8 = 5;
+const RECORD_I2P: u8 = 6;
 const PKARR_TTL_SECS: u32 = 60;
 const PUBLIC_TUNNEL_PROVIDER_LABEL: &str = "pkarr";
 
@@ -203,6 +205,11 @@ impl PkarrAnnouncementV1 {
                 .map(AnnouncementRecord::Tor),
         );
         records.extend(
+            collect_i2p_endpoints(&descriptor.i2p_endpoints)
+                .into_iter()
+                .map(AnnouncementRecord::I2p),
+        );
+        records.extend(
             collect_libp2p_endpoints(&descriptor.libp2p_endpoints)
                 .into_iter()
                 .map(AnnouncementRecord::Libp2p),
@@ -321,12 +328,14 @@ impl PkarrAnnouncementV1 {
         let mut libp2p_endpoints = Vec::new();
         let mut public_endpoints = Vec::new();
         let mut tor_endpoints = Vec::new();
+        let mut i2p_endpoints = Vec::new();
 
         for record in self.records {
             match record {
                 AnnouncementRecord::Direct(endpoint) => direct_endpoints.push(endpoint.to_string()),
                 AnnouncementRecord::Libp2p(addr) => libp2p_endpoints.push(addr.to_string()),
                 AnnouncementRecord::Tor(url) => tor_endpoints.push(TorOnionEndpoint { url }),
+                AnnouncementRecord::I2p(url) => i2p_endpoints.push(I2pEndpoint { url }),
                 AnnouncementRecord::PublicTunnel(url) => {
                     public_endpoints.push(PublicTunnelEndpoint {
                         provider: PUBLIC_TUNNEL_PROVIDER_LABEL.into(),
@@ -343,6 +352,7 @@ impl PkarrAnnouncementV1 {
             libp2p_endpoints,
             public_endpoints,
             tor_endpoints,
+            i2p_endpoints,
             published_unix_ms,
         }
     }
@@ -353,6 +363,7 @@ enum AnnouncementRecord {
     Direct(SocketAddr),
     Libp2p(Multiaddr),
     Tor(String),
+    I2p(String),
     PublicTunnel(String),
 }
 
@@ -387,6 +398,12 @@ impl AnnouncementRecord {
                 Ok(Self::Tor(
                     crate::tunnel::normalize_tor_onion_url(&url)
                         .context("invalid Tor endpoint URL")?,
+                ))
+            }
+            RECORD_I2P => {
+                let url = String::from_utf8(data.to_vec()).context("I2P endpoint is not UTF-8")?;
+                Ok(Self::I2p(
+                    crate::tunnel::normalize_i2p_url(&url).context("invalid I2P endpoint URL")?,
                 ))
             }
             RECORD_PUBLIC_TUNNEL => {
@@ -439,6 +456,11 @@ impl PackedRecord {
             },
             AnnouncementRecord::Tor(url) => Self {
                 kind: RECORD_TOR,
+                priority: 3,
+                data: url.as_bytes().to_vec(),
+            },
+            AnnouncementRecord::I2p(url) => Self {
+                kind: RECORD_I2P,
                 priority: 2,
                 data: url.as_bytes().to_vec(),
             },
@@ -487,6 +509,16 @@ fn collect_tor_endpoints(raw: &[TorOnionEndpoint]) -> Vec<String> {
     let mut endpoints = raw
         .iter()
         .filter_map(|endpoint| crate::tunnel::normalize_tor_onion_url(&endpoint.url).ok())
+        .collect::<Vec<_>>();
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints
+}
+
+fn collect_i2p_endpoints(raw: &[I2pEndpoint]) -> Vec<String> {
+    let mut endpoints = raw
+        .iter()
+        .filter_map(|endpoint| crate::tunnel::normalize_i2p_url(&endpoint.url).ok())
         .collect::<Vec<_>>();
     endpoints.sort();
     endpoints.dedup();
@@ -603,7 +635,7 @@ mod tests {
     use libp2p::PeerId;
     use peerline_core::{HumanCode, HumanName, NameCode};
     use peerline_rendezvous_model::{
-        PeerDescriptor, PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
+        I2pEndpoint, PeerDescriptor, PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
         TorOnionEndpoint,
     };
 
@@ -657,6 +689,27 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(decoded.tor_endpoints, descriptor.tor_endpoints);
+    }
+
+    #[test]
+    fn pkarr_announcement_roundtrips_i2p_endpoints() {
+        let mut descriptor = sample_descriptor();
+        descriptor.i2p_endpoints = vec![I2pEndpoint {
+            url: crate::tunnel::normalize_i2p_url(
+                "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz.b32.i2p",
+            )
+            .unwrap(),
+        }];
+        let announcement = PkarrAnnouncementV1::from_descriptor(&descriptor).unwrap();
+        let payload = announcement
+            .encode_with_budget(MAX_RAW_PAYLOAD_BYTES)
+            .unwrap();
+
+        let decoded = PkarrAnnouncementV1::decode(&payload)
+            .unwrap()
+            .into_descriptor(0);
+
+        assert_eq!(decoded.i2p_endpoints, descriptor.i2p_endpoints);
     }
 
     #[test]
@@ -736,6 +789,7 @@ mod tests {
                 )
                 .unwrap(),
             }],
+            i2p_endpoints: vec![],
             published_unix_ms: 0,
         }
     }
@@ -778,6 +832,7 @@ mod tests {
                 )
                 .unwrap(),
             }],
+            i2p_endpoints: vec![],
             published_unix_ms: 0,
         }
     }

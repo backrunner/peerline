@@ -7,8 +7,13 @@ use super::{
     platform::{command_path, detect_package_manager},
 };
 use peerline_core::ConfigStore;
-use std::{env, path::Path, process::Stdio, time::Duration};
-use tokio::{process::Command as TokioCommand, time};
+use std::{env, net::SocketAddr, path::Path, process::Stdio, time::Duration};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
+    process::Command as TokioCommand,
+    time,
+};
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -17,6 +22,7 @@ pub(crate) async fn collect_report() -> DoctorReport {
     let package_manager = detect_package_manager(platform.os);
     let config = config_report();
     let tor = tor_report(platform.os, package_manager.as_ref()).await;
+    let i2p = i2p_report(platform.os, package_manager.as_ref()).await;
     let mainline = pkarr_mainline_report();
     let notes = setup_notes(platform.os, package_manager.as_ref());
 
@@ -24,7 +30,7 @@ pub(crate) async fn collect_report() -> DoctorReport {
         platform,
         package_manager,
         config,
-        dependencies: vec![tor, mainline],
+        dependencies: vec![tor, i2p, mainline],
         notes,
     }
 }
@@ -68,6 +74,68 @@ async fn tor_report(
                 "tor command is missing; Tor routes are disabled by PEERLINE_DISABLE_TOR".into()
             } else {
                 "tor command is missing; Peerline will skip onion routes".into()
+            },
+            command_path: None,
+            version: None,
+            install,
+        },
+    }
+}
+
+async fn i2p_report(
+    platform: Platform,
+    package_manager: Option<&PackageManagerReport>,
+) -> DependencyReport {
+    let sam_addr = i2p_sam_addr_from_env();
+    let i2p_disabled = env_flag("PEERLINE_DISABLE_I2P");
+    let sam_available = probe_i2p_sam(sam_addr).await;
+    let router_path = command_path("i2pd").or_else(|| command_path("i2prouter"));
+    let install = i2p_install_plan(platform, package_manager);
+
+    match (sam_available, router_path) {
+        (true, path) => DependencyReport {
+            key: "i2p".into(),
+            label: "I2P SAM routing".into(),
+            status: DependencyStatus::Ok,
+            detail: if i2p_disabled {
+                format!("SAM bridge is reachable at {sam_addr}, but PEERLINE_DISABLE_I2P is set")
+            } else {
+                format!("SAM bridge is reachable at {sam_addr}; Peerline will reuse it")
+            },
+            command_path: path.map(|path| path.display().to_string()),
+            version: None,
+            install: None,
+        },
+        (false, Some(path)) => {
+            let version = command_version(&path).await.ok();
+            DependencyReport {
+                key: "i2p".into(),
+                label: "I2P SAM routing".into(),
+                status: DependencyStatus::Broken,
+                detail: if i2p_disabled {
+                    format!(
+                        "I2P router command is installed, but SAM {sam_addr} is unavailable and PEERLINE_DISABLE_I2P is set"
+                    )
+                } else {
+                    format!(
+                        "I2P router command is installed, but SAM {sam_addr} is not reachable; start/configure SAM or pass --i2p-sam"
+                    )
+                },
+                command_path: Some(path.display().to_string()),
+                version,
+                install,
+            }
+        }
+        (false, None) => DependencyReport {
+            key: "i2p".into(),
+            label: "I2P SAM routing".into(),
+            status: DependencyStatus::Missing,
+            detail: if i2p_disabled {
+                format!(
+                    "I2P router command is missing and SAM {sam_addr} is unavailable; I2P routes are disabled by PEERLINE_DISABLE_I2P"
+                )
+            } else {
+                format!("SAM {sam_addr} is unavailable and no i2pd/i2prouter command was found")
             },
             command_path: None,
             version: None,
@@ -142,6 +210,8 @@ fn setup_notes(platform: Platform, package_manager: Option<&PackageManagerReport
     let mut notes = vec![
         "Tor is optional but strongly improves routing when direct and relay paths are blocked."
             .to_string(),
+        "I2P is optional; Peerline reuses an existing SAM bridge when available and otherwise only starts an installed router command for this receive session.".to_string(),
+        "Peerline does not manage I2P router configuration; enable SAM in your router and use --i2p-sam or PEERLINE_I2P_SAM for non-default bridges.".to_string(),
         "pkarr/mainline discovery ships inside peerline, so setup only verifies it is configured."
             .to_string(),
     ];
@@ -223,6 +293,99 @@ fn tor_install_plan(
     })
 }
 
+fn i2p_install_plan(
+    platform: Platform,
+    package_manager: Option<&PackageManagerReport>,
+) -> Option<InstallPlan> {
+    let Some(manager) = package_manager else {
+        return Some(manual_i2p_install_plan(platform));
+    };
+
+    let mut commands = match manager.kind {
+        PackageManager::Brew => vec![InstallCommand::manual("brew install i2pd")],
+        PackageManager::AptGet => vec![
+            InstallCommand::manual("sudo apt-get update"),
+            InstallCommand::manual("sudo apt-get install -y i2pd"),
+        ],
+        PackageManager::Dnf => vec![InstallCommand::manual("sudo dnf install -y i2pd")],
+        PackageManager::Yum => vec![InstallCommand::manual("sudo yum install -y i2pd")],
+        PackageManager::Pacman => vec![InstallCommand::manual("sudo pacman -S --needed i2pd")],
+        PackageManager::Zypper => vec![InstallCommand::manual("sudo zypper install -y i2pd")],
+        PackageManager::Apk => vec![InstallCommand::manual("sudo apk add i2pd")],
+        PackageManager::Choco => vec![InstallCommand::manual("choco install i2pd -y")],
+    };
+    if manager.kind == PackageManager::Brew {
+        commands.push(InstallCommand::manual("brew services start i2pd"));
+    }
+
+    let mut notes = vec![
+        "I2P setup is not fully automatic: install/start i2pd or Java I2P, then make sure SAM listens on 127.0.0.1:7656.".into(),
+        "Java I2P does not enable SAM by default; enable it in the router console or clients.config before using Peerline I2P routes.".into(),
+        "Rerun `peerline doctor` after starting the SAM bridge.".into(),
+    ];
+    if let Some(family) = manager.kind.linux_family_hint() {
+        notes.push(format!(
+            "{} is the expected package manager for the {family} family.",
+            manager.command
+        ));
+    }
+
+    Some(InstallPlan {
+        summary: "install/start I2P manually and enable SAM".into(),
+        commands,
+        notes,
+    })
+}
+
+fn manual_i2p_install_plan(platform: Platform) -> InstallPlan {
+    match platform {
+        Platform::Macos => InstallPlan {
+            summary: "install/start i2pd and enable SAM".into(),
+            commands: vec![
+                InstallCommand::manual("brew install i2pd"),
+                InstallCommand::manual("brew services start i2pd"),
+            ],
+            notes: vec![
+                "Homebrew is optional; any I2P/i2pd install is fine if SAM is available.".into(),
+                "Rerun `peerline doctor` after SAM is reachable on 127.0.0.1:7656.".into(),
+            ],
+        },
+        Platform::Linux => InstallPlan {
+            summary: "install/start i2pd with your distro tools and enable SAM".into(),
+            commands: vec![
+                InstallCommand::manual("sudo apt-get update && sudo apt-get install -y i2pd"),
+                InstallCommand::manual("sudo dnf install -y i2pd"),
+                InstallCommand::manual("sudo yum install -y i2pd"),
+                InstallCommand::manual("sudo pacman -S --needed i2pd"),
+                InstallCommand::manual("sudo zypper install -y i2pd"),
+                InstallCommand::manual("sudo apk add i2pd"),
+            ],
+            notes: vec![
+                "Package names and service defaults vary by distro; start the router with your service manager if the package does not start it.".into(),
+                "Make sure SAM listens on 127.0.0.1:7656, then rerun `peerline doctor`.".into(),
+            ],
+        },
+        Platform::Windows => InstallPlan {
+            summary: "install/start I2P or i2pd and enable SAM".into(),
+            commands: vec![
+                InstallCommand::manual("choco install i2pd -y"),
+                InstallCommand::manual("install Java I2P from https://geti2p.net if preferred"),
+            ],
+            notes: vec![
+                "SAM availability depends on the router configuration; Peerline will not edit it.".into(),
+                "Use --i2p-sam if your SAM bridge is not 127.0.0.1:7656.".into(),
+            ],
+        },
+        Platform::Other => InstallPlan {
+            summary: "install/start an I2P router and enable SAM".into(),
+            commands: vec![InstallCommand::manual(
+                "install i2pd or Java I2P, start it, and enable SAM on 127.0.0.1:7656",
+            )],
+            notes: vec!["Rerun `peerline doctor` after the SAM bridge is reachable.".into()],
+        },
+    }
+}
+
 fn manual_tor_install_plan(platform: Platform) -> InstallPlan {
     match platform {
         Platform::Windows => InstallPlan {
@@ -258,6 +421,36 @@ fn manual_tor_install_plan(platform: Platform) -> InstallPlan {
             notes: vec!["Rerun `peerline setup` after the `tor` command is on PATH.".into()],
         },
     }
+}
+
+fn i2p_sam_addr_from_env() -> SocketAddr {
+    env::var("PEERLINE_I2P_SAM")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 7656)))
+}
+
+async fn probe_i2p_sam(addr: SocketAddr) -> bool {
+    matches!(
+        time::timeout(Duration::from_secs(2), async move {
+            let stream = TcpStream::connect(addr).await?;
+            let mut stream = BufReader::new(stream);
+            stream
+                .get_mut()
+                .write_all(b"HELLO VERSION MIN=3.1 MAX=3.1\n")
+                .await?;
+            stream.get_mut().flush().await?;
+            let mut line = String::new();
+            stream.read_line(&mut line).await?;
+            anyhow::ensure!(
+                line.starts_with("HELLO REPLY") && line.contains("RESULT=OK"),
+                "unexpected SAM hello response"
+            );
+            Ok::<_, anyhow::Error>(())
+        })
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 fn privileged_command(

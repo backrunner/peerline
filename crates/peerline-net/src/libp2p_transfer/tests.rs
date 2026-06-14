@@ -123,6 +123,8 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
         enable_turn: true,
         enable_public_tunnels: true,
         enable_tor: true,
+        enable_i2p: false,
+        i2p_sam: SocketAddr::from(([127, 0, 0, 1], 7656)),
         tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
         allow_loopback_endpoints: false,
         allow_relay_data_fallback: false,
@@ -142,6 +144,7 @@ async fn libp2p_roundtrip_works_without_direct_endpoints() {
         discovery: discovery.clone(),
         public_tunnel_endpoints: vec![],
         tor_onion_endpoints: vec![],
+        i2p_endpoints: vec![],
         events: None,
     }));
 
@@ -223,6 +226,8 @@ async fn libp2p_roundtrip_can_discover_through_configured_rendezvous_peer() {
         enable_turn: true,
         enable_public_tunnels: false,
         enable_tor: false,
+        enable_i2p: false,
+        i2p_sam: SocketAddr::from(([127, 0, 0, 1], 7656)),
         tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
         allow_loopback_endpoints: true,
         allow_relay_data_fallback: false,
@@ -242,6 +247,7 @@ async fn libp2p_roundtrip_can_discover_through_configured_rendezvous_peer() {
         discovery: discovery.clone(),
         public_tunnel_endpoints: vec![],
         tor_onion_endpoints: vec![],
+        i2p_endpoints: vec![],
         events: None,
     }));
 
@@ -330,6 +336,8 @@ async fn libp2p_resumes_after_sender_disconnects_mid_transfer() {
         enable_turn: true,
         enable_public_tunnels: true,
         enable_tor: true,
+        enable_i2p: false,
+        i2p_sam: SocketAddr::from(([127, 0, 0, 1], 7656)),
         tor_socks_proxy: SocketAddr::from(([127, 0, 0, 1], 9050)),
         allow_loopback_endpoints: false,
         allow_relay_data_fallback: false,
@@ -350,6 +358,7 @@ async fn libp2p_resumes_after_sender_disconnects_mid_transfer() {
         discovery: discovery.clone(),
         public_tunnel_endpoints: vec![],
         tor_onion_endpoints: vec![],
+        i2p_endpoints: vec![],
         events: Some(events),
     }));
 

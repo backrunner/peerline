@@ -26,6 +26,8 @@ pub struct PeerDescriptor {
     pub public_endpoints: Vec<PublicTunnelEndpoint>,
     #[serde(default)]
     pub tor_endpoints: Vec<TorOnionEndpoint>,
+    #[serde(default)]
+    pub i2p_endpoints: Vec<I2pEndpoint>,
     pub published_unix_ms: u64,
 }
 
@@ -37,6 +39,11 @@ pub struct PublicTunnelEndpoint {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TorOnionEndpoint {
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct I2pEndpoint {
     pub url: String,
 }
 

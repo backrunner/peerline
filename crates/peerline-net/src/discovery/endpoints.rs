@@ -1,6 +1,8 @@
 use super::{Candidate, DiscoveryConfig, RouteKind};
 use libp2p::Multiaddr;
-use peerline_rendezvous_model::{PeerDescriptor, PublicTunnelEndpoint, TorOnionEndpoint};
+use peerline_rendezvous_model::{
+    I2pEndpoint, PeerDescriptor, PublicTunnelEndpoint, TorOnionEndpoint,
+};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 pub(super) fn discovered_direct_endpoint_candidates(
@@ -81,6 +83,15 @@ pub(super) fn descriptor_candidates_for_discovery(
         });
     candidates.extend(tor_onions);
 
+    let i2p = i2p_endpoint_candidates(descriptor)
+        .into_iter()
+        .map(|endpoint| Candidate {
+            peer_id: peer_id.clone(),
+            addresses: vec![endpoint.url],
+            route: RouteKind::I2p,
+        });
+    candidates.extend(i2p);
+
     let libp2p = libp2p_endpoint_candidates(descriptor)
         .into_iter()
         .map(|addr| Candidate {
@@ -122,6 +133,20 @@ pub(crate) fn tor_onion_endpoint_candidates(descriptor: &PeerDescriptor) -> Vec<
         .filter_map(|endpoint| {
             let url = crate::tunnel::normalize_tor_onion_url(&endpoint.url).ok()?;
             Some(TorOnionEndpoint { url })
+        })
+        .collect::<Vec<_>>();
+    endpoints.sort_by(|left, right| left.url.cmp(&right.url));
+    endpoints.dedup_by(|left, right| left.url == right.url);
+    endpoints
+}
+
+pub(crate) fn i2p_endpoint_candidates(descriptor: &PeerDescriptor) -> Vec<I2pEndpoint> {
+    let mut endpoints = descriptor
+        .i2p_endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            let url = crate::tunnel::normalize_i2p_url(&endpoint.url).ok()?;
+            Some(I2pEndpoint { url })
         })
         .collect::<Vec<_>>();
     endpoints.sort_by(|left, right| left.url.cmp(&right.url));
@@ -422,8 +447,9 @@ pub fn rank_candidates(candidates: impl IntoIterator<Item = Candidate>) -> Vec<C
         RouteKind::Libp2pDcutr => 4,
         RouteKind::WebRtcDirect => 5,
         RouteKind::WebRtcTurn => 6,
-        RouteKind::TorOnion => 7,
-        RouteKind::Libp2pRelay => 8,
+        RouteKind::I2p => 7,
+        RouteKind::TorOnion => 8,
+        RouteKind::Libp2pRelay => 9,
     });
     candidates.dedup();
     candidates

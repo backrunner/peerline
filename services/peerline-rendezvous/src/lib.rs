@@ -1,6 +1,6 @@
 use peerline_rendezvous_model::{
-    HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_VERSION, PeerDescriptor, PublicTunnelEndpoint,
-    RENDEZVOUS_DEFAULT_MAX_TTL_SECS, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
+    HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_VERSION, I2pEndpoint, PeerDescriptor,
+    PublicTunnelEndpoint, RENDEZVOUS_DEFAULT_MAX_TTL_SECS, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
     RendezvousDiscoverRequest, RendezvousDiscoverResponse, RendezvousRecord,
     RendezvousRegisterRequest, RendezvousRegisterResponse, RendezvousUnregisterResponse,
     TorOnionEndpoint, request_path_and_query, verify_peerline_request_signature,
@@ -28,6 +28,7 @@ const MAX_DIRECT_ENDPOINTS: usize = 8;
 const MAX_LIBP2P_ENDPOINTS: usize = 24;
 const MAX_PUBLIC_ENDPOINTS: usize = 8;
 const MAX_TOR_ENDPOINTS: usize = 8;
+const MAX_I2P_ENDPOINTS: usize = 8;
 const MAX_ENDPOINT_LEN: usize = 256;
 const MAX_ENDPOINT_PROVIDER_LEN: usize = 64;
 const RATE_WINDOW_MS: i64 = 60_000;
@@ -912,6 +913,7 @@ fn validate_descriptor(descriptor: &PeerDescriptor) -> std::result::Result<(), R
         && descriptor.libp2p_endpoints.is_empty()
         && descriptor.public_endpoints.is_empty()
         && descriptor.tor_endpoints.is_empty()
+        && descriptor.i2p_endpoints.is_empty()
     {
         return Err(Rejection::new("no advertised endpoints", 400));
     }
@@ -919,6 +921,7 @@ fn validate_descriptor(descriptor: &PeerDescriptor) -> std::result::Result<(), R
         || descriptor.libp2p_endpoints.len() > MAX_LIBP2P_ENDPOINTS
         || descriptor.public_endpoints.len() > MAX_PUBLIC_ENDPOINTS
         || descriptor.tor_endpoints.len() > MAX_TOR_ENDPOINTS
+        || descriptor.i2p_endpoints.len() > MAX_I2P_ENDPOINTS
     {
         return Err(Rejection::new("too many advertised endpoints", 400));
     }
@@ -938,6 +941,10 @@ fn validate_descriptor(descriptor: &PeerDescriptor) -> std::result::Result<(), R
             .tor_endpoints
             .iter()
             .any(|endpoint| !is_valid_tor_onion_endpoint(endpoint))
+        || descriptor
+            .i2p_endpoints
+            .iter()
+            .any(|endpoint| !is_valid_i2p_endpoint(endpoint))
     {
         return Err(Rejection::new("invalid advertised endpoint", 400));
     }
@@ -981,6 +988,33 @@ fn is_valid_public_tunnel_endpoint(endpoint: &PublicTunnelEndpoint) -> bool {
 
 fn is_valid_tor_onion_endpoint(endpoint: &TorOnionEndpoint) -> bool {
     is_valid_endpoint(&endpoint.url)
+}
+
+fn is_valid_i2p_endpoint(endpoint: &I2pEndpoint) -> bool {
+    is_valid_endpoint(&endpoint.url) && is_valid_i2p_b32_url(&endpoint.url)
+}
+
+fn is_valid_i2p_b32_url(raw: &str) -> bool {
+    let host = raw
+        .strip_prefix("ws://")
+        .or_else(|| raw.strip_prefix("http://"))
+        .and_then(|rest| {
+            rest.split(['/', '?', '#'])
+                .next()
+                .and_then(|authority| authority.rsplit('@').next())
+        })
+        .and_then(|authority| authority.split(':').next())
+        .map(str::to_ascii_lowercase);
+    let Some(host) = host else {
+        return false;
+    };
+    let Some(label) = host.strip_suffix(".b32.i2p") else {
+        return false;
+    };
+    label.len() == 52
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'2'..=b'7'))
 }
 
 fn namespace_from_path(path: &str) -> Option<&str> {
@@ -1137,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_public_tunnel_or_tor_only_descriptors() {
+    fn accepts_public_tunnel_tor_or_i2p_only_descriptors() {
         let mut descriptor = valid_descriptor();
         descriptor.direct_endpoints.clear();
         descriptor.public_endpoints = vec![PublicTunnelEndpoint {
@@ -1151,10 +1185,17 @@ mod tests {
             url: "ws://abcdefghijklmnopqrstuvwxyzabcdefghijklmnop.onion/".into(),
         }];
         assert!(validate_descriptor(&descriptor).is_ok());
+
+        descriptor.tor_endpoints.clear();
+        descriptor.i2p_endpoints = vec![I2pEndpoint {
+            url: "ws://abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz.b32.i2p/"
+                .into(),
+        }];
+        assert!(validate_descriptor(&descriptor).is_ok());
     }
 
     #[test]
-    fn rejects_invalid_public_tunnel_or_tor_endpoints() {
+    fn rejects_invalid_public_tunnel_tor_or_i2p_endpoints() {
         let mut descriptor = valid_descriptor();
         descriptor.public_endpoints = vec![PublicTunnelEndpoint {
             provider: "cloudflared".into(),
@@ -1173,10 +1214,16 @@ mod tests {
             url: "ws://abcdefghijklmnopqrstuvwxyzabcdefghijklmnop.onion/ with-space".into(),
         }];
         assert!(validate_descriptor(&descriptor).is_err());
+
+        descriptor.tor_endpoints.clear();
+        descriptor.i2p_endpoints = vec![I2pEndpoint {
+            url: "ws://example.b32.i2p/ with-space".into(),
+        }];
+        assert!(validate_descriptor(&descriptor).is_err());
     }
 
     #[test]
-    fn rejects_too_many_public_tunnel_or_tor_endpoints() {
+    fn rejects_too_many_public_tunnel_tor_or_i2p_endpoints() {
         let mut descriptor = valid_descriptor();
         descriptor.public_endpoints = (0..=MAX_PUBLIC_ENDPOINTS)
             .map(|index| PublicTunnelEndpoint {
@@ -1190,6 +1237,14 @@ mod tests {
         descriptor.tor_endpoints = (0..=MAX_TOR_ENDPOINTS)
             .map(|index| TorOnionEndpoint {
                 url: format!("ws://example{index}.onion/"),
+            })
+            .collect();
+        assert!(validate_descriptor(&descriptor).is_err());
+
+        descriptor.tor_endpoints.clear();
+        descriptor.i2p_endpoints = (0..=MAX_I2P_ENDPOINTS)
+            .map(|index| I2pEndpoint {
+                url: format!("ws://example{index}.b32.i2p/"),
             })
             .collect();
         assert!(validate_descriptor(&descriptor).is_err());
@@ -1238,6 +1293,7 @@ mod tests {
             libp2p_endpoints: Vec::new(),
             public_endpoints: Vec::new(),
             tor_endpoints: Vec::new(),
+            i2p_endpoints: Vec::new(),
             published_unix_ms: 0,
         }
     }
