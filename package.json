@@ -1,6 +1,6 @@
 {
   "name": "peerline",
-  "version": "0.1.1-beta.0",
+  "version": "0.1.1-beta.1",
   "description": "P2P post-quantum encrypted file transfer CLI",
   "repository": {
     "type": "git",
