@@ -1,9 +1,10 @@
 use peerline_core::{HumanCode, HumanName, NameCode};
 use std::{
+    io::{BufRead, BufReader},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
-    sync::{Mutex, MutexGuard, OnceLock},
+    sync::{Mutex, MutexGuard, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -61,6 +62,7 @@ fn spawn_recv(cwd: &Path, port: u16, overwrite: bool, extra_env: &[(&str, &str)]
         .env_remove("RUST_LOG")
         .env("PEERLINE_DISABLE_TOR", "1")
         .env("PEERLINE_DISABLE_PUBLIC_TUNNELS", "1")
+        .env("PEERLINE_DISABLE_I2P", "1")
         .arg("recv")
         .arg("river-mango-42")
         .arg("rose-lime-iris-jade-1234")
@@ -68,7 +70,7 @@ fn spawn_recv(cwd: &Path, port: u16, overwrite: bool, extra_env: &[(&str, &str)]
         .arg("--port")
         .arg(port.to_string())
         .arg("--idle-timeout-minutes")
-        .arg("0.02");
+        .arg("0.1");
     if overwrite {
         cmd.arg("--overwrite");
     }
@@ -84,6 +86,7 @@ fn spawn_send(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> std::pro
         .env_remove("RUST_LOG")
         .env("PEERLINE_DISABLE_TOR", "1")
         .env("PEERLINE_DISABLE_PUBLIC_TUNNELS", "1")
+        .env("PEERLINE_DISABLE_I2P", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (key, value) in extra_env {
@@ -108,11 +111,39 @@ fn wait_for_port(port: u16, timeout: Duration) {
     }
 }
 
+fn wait_for_direct_recv_ready(child: &mut Child, timeout: Duration) -> u16 {
+    let stdout = child.stdout.take().expect("recv stdout must be piped");
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if let Some(endpoint) = line.strip_prefix("direct: ")
+                && let Ok(addr) = endpoint.parse::<std::net::SocketAddr>()
+            {
+                let _ = ready_tx.send(addr.port());
+            }
+        }
+    });
+
+    if let Ok(port) = ready_rx.recv_timeout(timeout) {
+        return port;
+    }
+
+    match child.try_wait() {
+        Ok(Some(status)) => panic!("recv exited before advertising direct listener: {status}"),
+        Ok(None) => panic!("timed out waiting for recv to advertise direct listener"),
+        Err(error) => panic!("could not inspect recv process: {error}"),
+    }
+}
+
 fn configure_pkarr_only_env(cmd: &mut Command, bootstrap: &str) {
     cmd.env("PEERLINE_BOOTSTRAP", "")
         .env("PEERLINE_DISABLE_MDNS", "1")
         .env("PEERLINE_DISABLE_TOR", "1")
         .env("PEERLINE_DISABLE_PUBLIC_TUNNELS", "1")
+        .env("PEERLINE_DISABLE_I2P", "1")
         .env("PEERLINE_PKARR_BOOTSTRAP", bootstrap)
         .env("PEERLINE_RENDEZVOUS_URLS", RENDEZVOUS_BLACKHOLE_URL);
 }
@@ -285,20 +316,20 @@ fn direct_tcp_roundtrip_uses_destination_cwd() {
     std::fs::create_dir(&dst).unwrap();
     std::fs::write(src.join("hello.txt"), "hello direct cli").unwrap();
 
-    let port = free_port();
+    let port = 0;
     let mut recv = spawn_recv(
         &dst,
         port,
         false,
         &[("PEERLINE_BOOTSTRAP", ""), ("PEERLINE_DISABLE_MDNS", "1")],
     );
-    wait_for_port(port, Duration::from_secs(5));
+    let recv_port = wait_for_direct_recv_ready(&mut recv, Duration::from_secs(20));
 
     let send = spawn_send(
         temp.path(),
         &[
             "send",
-            &format!("127.0.0.1:{port}"),
+            &format!("127.0.0.1:{recv_port}"),
             src.join("hello.txt").to_str().unwrap(),
             "--code",
             "rose-lime-iris-jade-1234",
@@ -329,20 +360,20 @@ fn direct_tcp_roundtrip_multiple_files_in_one_send() {
     std::fs::write(src.join("one.txt"), "first").unwrap();
     std::fs::write(src.join("two.txt"), "second").unwrap();
 
-    let port = free_port();
+    let port = 0;
     let mut recv = spawn_recv(
         &dst,
         port,
         false,
         &[("PEERLINE_BOOTSTRAP", ""), ("PEERLINE_DISABLE_MDNS", "1")],
     );
-    wait_for_port(port, Duration::from_secs(5));
+    let recv_port = wait_for_direct_recv_ready(&mut recv, Duration::from_secs(20));
 
     let send = spawn_send(
         temp.path(),
         &[
             "send",
-            &format!("127.0.0.1:{port}"),
+            &format!("127.0.0.1:{recv_port}"),
             src.join("one.txt").to_str().unwrap(),
             src.join("two.txt").to_str().unwrap(),
             "--code",
@@ -378,20 +409,20 @@ fn direct_tcp_respects_overwrite_flag() {
     std::fs::write(src.join("hello.txt"), "fresh").unwrap();
     std::fs::write(dst.join("hello.txt"), "stale").unwrap();
 
-    let port = free_port();
+    let port = 0;
     let mut recv = spawn_recv(
         &dst,
         port,
         true,
         &[("PEERLINE_BOOTSTRAP", ""), ("PEERLINE_DISABLE_MDNS", "1")],
     );
-    wait_for_port(port, Duration::from_secs(5));
+    let recv_port = wait_for_direct_recv_ready(&mut recv, Duration::from_secs(20));
 
     let send = spawn_send(
         temp.path(),
         &[
             "send",
-            &format!("127.0.0.1:{port}"),
+            &format!("127.0.0.1:{recv_port}"),
             src.join("hello.txt").to_str().unwrap(),
             "--code",
             "rose-lime-iris-jade-1234",
@@ -423,20 +454,20 @@ fn direct_tcp_roundtrip_directory() {
     std::fs::create_dir(&dst).unwrap();
     std::fs::write(src.join("nested/hello.txt"), "hello folder cli").unwrap();
 
-    let port = free_port();
+    let port = 0;
     let mut recv = spawn_recv(
         &dst,
         port,
         false,
         &[("PEERLINE_BOOTSTRAP", ""), ("PEERLINE_DISABLE_MDNS", "1")],
     );
-    wait_for_port(port, Duration::from_secs(5));
+    let recv_port = wait_for_direct_recv_ready(&mut recv, Duration::from_secs(20));
 
     let send = spawn_send(
         temp.path(),
         &[
             "send",
-            &format!("127.0.0.1:{port}"),
+            &format!("127.0.0.1:{recv_port}"),
             src.to_str().unwrap(),
             "--code",
             "rose-lime-iris-jade-1234",
@@ -467,21 +498,21 @@ fn direct_tcp_receiver_accepts_multiple_sends_before_idle_exit() {
     std::fs::write(src.join("one.txt"), "first").unwrap();
     std::fs::write(src.join("two.txt"), "second").unwrap();
 
-    let port = free_port();
+    let port = 0;
     let mut recv = spawn_recv(
         &dst,
         port,
         false,
         &[("PEERLINE_BOOTSTRAP", ""), ("PEERLINE_DISABLE_MDNS", "1")],
     );
-    wait_for_port(port, Duration::from_secs(5));
+    let recv_port = wait_for_direct_recv_ready(&mut recv, Duration::from_secs(20));
 
     for file in ["one.txt", "two.txt"] {
         let send = spawn_send(
             temp.path(),
             &[
                 "send",
-                &format!("127.0.0.1:{port}"),
+                &format!("127.0.0.1:{recv_port}"),
                 src.join(file).to_str().unwrap(),
                 "--code",
                 "rose-lime-iris-jade-1234",

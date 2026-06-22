@@ -21,7 +21,7 @@ use peerline_net::{
 };
 use rand::Rng;
 use std::{
-    io::{ErrorKind, IsTerminal},
+    io::{ErrorKind, IsTerminal, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
@@ -256,6 +256,7 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
         ),
         None => println!("idle timeout: disabled"),
     }
+    std::io::stdout().flush()?;
 
     let (network_events, network_event_rx) = mpsc::unbounded_channel();
     let (activity_tx, mut activity_rx) = mpsc::unbounded_channel();
