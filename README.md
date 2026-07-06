@@ -35,11 +35,11 @@ The secure session combines the shared code with OPAQUE PAKE, X25519, ML-KEM, HK
 
 ## Install And Run
 
-Install it with Homebrew:
+Install it with Homebrew from this repository:
 
 ```sh
-brew tap backrunner/tap
-brew install peerline
+brew tap backrunner/peerline https://github.com/backrunner/peerline
+brew install backrunner/peerline/peerline
 peerline --help
 ```
 
