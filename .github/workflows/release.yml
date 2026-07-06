@@ -289,3 +289,61 @@ jobs:
               echo "::warning::failed to delete stale tag $stale_tag"
             fi
           done < stale-tags.txt
+
+  homebrew-tap:
+    name: Homebrew tap
+    needs: github-release
+    if: ${{ needs['github-release'].result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Download platform assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-assets
+          merge-multiple: true
+
+      - name: Generate Homebrew formula
+        run: npm run homebrew:formula -- --dist dist-assets --output dist/homebrew/Formula/peerline.rb
+
+      - name: Publish Homebrew tap
+        shell: bash
+        env:
+          HOMEBREW_TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set; skipping Homebrew tap update"
+            exit 0
+          fi
+
+          version="$(node -p "require('./package.json').version")"
+          tap_repository="${HOMEBREW_TAP_REPOSITORY:-backrunner/homebrew-tap}"
+          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${tap_repository}.git" homebrew-tap
+          mkdir -p homebrew-tap/Formula
+          cp dist/homebrew/Formula/peerline.rb homebrew-tap/Formula/peerline.rb
+
+          cd homebrew-tap
+          git add Formula/peerline.rb
+          if git diff --cached --quiet; then
+            echo "Homebrew formula is already up to date."
+            exit 0
+          fi
+
+          git \
+            -c user.name=BackRunner \
+            -c user.email=dev@backrunner.top \
+            -c commit.gpgsign=false \
+            commit -m "peerline: update to ${version}"
+          branch="$(git branch --show-current)"
+          git push origin "HEAD:${branch}"

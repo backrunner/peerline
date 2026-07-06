@@ -35,6 +35,16 @@ The secure session combines the shared code with OPAQUE PAKE, X25519, ML-KEM, HK
 
 ## Install And Run
 
+Install it with Homebrew:
+
+```sh
+brew tap backrunner/tap
+brew install peerline
+peerline --help
+```
+
+The Homebrew formula installs the matching macOS or Linux binary from the GitHub Release.
+
 Use the npm package without installing it globally:
 
 ```sh

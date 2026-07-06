@@ -17,14 +17,15 @@
   "scripts": {
     "build": "cargo build --release -p peerline-cli",
     "build:platform-asset": "node npm/build-platform-asset.js",
-    "lint": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && node --check npm/peerline.js && node --check npm/release.js && node --check npm/release-alpha.js && node --check npm/build-platform-asset.js && node --check npm/prepack.js && node --check npm/peerline.test.js && node --check npm/release.test.js",
+    "homebrew:formula": "node npm/homebrew-formula.js",
+    "lint": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && node --check npm/peerline.js && node --check npm/release.js && node --check npm/release-alpha.js && node --check npm/build-platform-asset.js && node --check npm/homebrew-formula.js && node --check npm/prepack.js && node --check npm/peerline.test.js && node --check npm/release.test.js && node --check npm/homebrew-formula.test.js",
     "prepack": "node npm/prepack.js",
     "release:alpha": "node npm/release.js --channel=alpha",
     "release:beta": "node npm/release.js --channel=beta",
     "release:stable": "node npm/release.js --channel=stable",
     "release": "node npm/release.js --channel=stable",
     "test": "npm run test:rust && npm run test:node",
-    "test:node": "node --test npm/peerline.test.js npm/release.test.js",
+    "test:node": "node --test npm/peerline.test.js npm/release.test.js npm/homebrew-formula.test.js",
     "test:rust": "cargo test --workspace -- --test-threads=1",
     "smoke": "node npm/peerline.js --version"
   },
