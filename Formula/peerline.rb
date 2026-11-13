@@ -3,30 +3,30 @@
 class Peerline < Formula
   desc "Terminal-first peer-to-peer file transfer CLI"
   homepage "https://github.com/backrunner/peerline"
-  version "0.1.1-beta.1"
+  version "0.1.1-beta.2"
   license "Apache-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/backrunner/peerline/releases/download/v0.1.1-beta.1/peerline-darwin-arm64", using: :nounzip
-      sha256 "2f36de56534a4d4df394cd4c8c258d0897ea856589d64ecb09d85165d29f5177"
+      url "https://github.com/backrunner/peerline/releases/download/v0.1.1-beta.2/peerline-darwin-arm64", using: :nounzip
+      sha256 "cb221db8dd6d3748e4a6772d35779fd7fbe9c7c7224e4be3d26140fb0ebc5798"
     end
 
     on_intel do
-      url "https://github.com/backrunner/peerline/releases/download/v0.1.1-beta.1/peerline-darwin-x64", using: :nounzip
-      sha256 "7e980acf58a6f1927091b0b7c11bbd45fc9fb7e86846fd30bf46a790a0c2b0d3"
+      url "https://github.com/backrunner/peerline/releases/download/v0.1.1-beta.2/peerline-darwin-x64", using: :nounzip
+      sha256 "973c035889dfa667f14e71d86b845422382e4737e335d5dfa819c0f8e4addfb2"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/backrunner/peerline/releases/download/v0.1.1-beta.1/peerline-linux-arm64-gnu", using: :nounzip
-      sha256 "6d9e9e7ef19ba529b9acddd9d77d72683f725a3ba2f5d3c2b06f79e005e17e64"
+      url "https://github.com/backrunner/peerline/releases/download/v0.1.1-beta.2/peerline-linux-arm64-gnu", using: :nounzip
+      sha256 "a00c7031b56a70bad205f3f082ec26645b392821bfcab19a0a23715008962d94"
     end
 
     on_intel do
-      url "https://github.com/backrunner/peerline/releases/download/v0.1.1-beta.1/peerline-linux-x64-gnu", using: :nounzip
-      sha256 "0024cb16f90798a7a5612cda6cd6e430c2ce1b4cfbfc120a77395daf984f8fef"
+      url "https://github.com/backrunner/peerline/releases/download/v0.1.1-beta.2/peerline-linux-x64-gnu", using: :nounzip
+      sha256 "dafc52b26ca5dd51da3e58d45481ad6e70650efd4b922a6dfd0f92e54adf2a6d"
     end
   end
 
