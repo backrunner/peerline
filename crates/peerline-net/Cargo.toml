@@ -10,11 +10,7 @@ bytes = "1.12.1"
 flate2 = "1.1.11"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["server", "http1"] }
-hyper-util = { version = "0.1.21", features = ["tokio", "server"] }
 plist = "1.10.3"
-rcgen = "0.14.10"
-socket2 = { version = "0.6.5", features = ["all"] }
-tokio-rustls = "0.26.6"
 
 anyhow.workspace = true
 async-trait.workspace = true
@@ -62,4 +58,8 @@ tokio = { workspace = true, features = ["test-util"] }
 dbus = { version = "0.9.12", features = ["vendored"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+hyper-util = { version = "0.1.21", features = ["tokio", "server"] }
 libc = "0.2.191"
+rcgen = "0.14.10"
+socket2 = { version = "0.6.5", features = ["all"] }
+tokio-rustls = "0.26.6"

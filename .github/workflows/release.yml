@@ -148,6 +148,15 @@ jobs:
           fi
           npm run build:platform-asset -- --platform-package="$PEERLINE_PLATFORM_PACKAGE"
 
+      - name: Smoke-test native binary
+        shell: bash
+        env:
+          PEERLINE_PLATFORM_PACKAGE: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          asset="$(node -e 'const release = require("./npm/release.js"); const launcher = require("./npm/peerline.js"); const info = release.platformPackageInfo(process.env.PEERLINE_PLATFORM_PACKAGE, "0.0.0"); process.stdout.write(launcher.releaseAssetName(info.name, info.binaryName));')"
+          "./dist/$asset" --version
+
       - name: Upload platform asset
         uses: actions/upload-artifact@v4
         with:

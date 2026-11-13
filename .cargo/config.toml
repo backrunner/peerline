@@ -1,0 +1,5 @@
+[env]
+# Vendored D-Bus uses GCC atomic builtins. ARM64 musl's self-contained Rust
+# link does not provide GCC's __aarch64_ldadd4_sync outline helper, so emit
+# baseline ARMv8 atomic instructions directly for this target's C objects.
+CFLAGS_aarch64_unknown_linux_musl = "-mno-outline-atomics"
