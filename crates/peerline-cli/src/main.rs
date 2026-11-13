@@ -1,3 +1,5 @@
+#[path = "main/airdrop.rs"]
+mod airdrop;
 #[path = "main/ble.rs"]
 mod ble;
 #[path = "main/clipboard.rs"]
@@ -80,9 +82,15 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct RecvArgs {
+    /// Experimental native AirDrop receive on macOS/AWDL; confirm each offer.
+    #[arg(long, conflicts_with_all = ["ble", "tunnel", "first", "second", "overwrite"])]
+    airdrop: bool,
     /// Explicitly copy the code; expire it after 30 seconds when still owned.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "airdrop")]
     copy_code: bool,
+    /// Maximum compressed and expanded AirDrop batch size in MiB.
+    #[arg(long, default_value_t = 1024, requires = "airdrop", value_parser = clap::value_parser!(u64).range(1..=10240))]
+    airdrop_max_mib: u64,
     /// Receive offline over Bluetooth LE only.
     #[arg(long, conflicts_with = "tunnel")]
     ble: bool,
@@ -240,6 +248,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn recv(args: RecvArgs) -> anyhow::Result<()> {
+    if args.airdrop {
+        return airdrop::recv(args).await;
+    }
     if args.ble {
         return ble::recv(args).await;
     }
@@ -1851,6 +1862,25 @@ fn resolve_named_send(args: SendArgs) -> anyhow::Result<(HumanName, HumanCode, V
 mod tests {
     use super::*;
 
+    #[test]
+    fn optional_receive_modes_are_explicit_and_mutually_exclusive() {
+        let Command::Recv(defaults) = Cli::try_parse_from(["peerline", "recv"]).unwrap().command
+        else {
+            panic!()
+        };
+        assert!(!defaults.ble && !defaults.airdrop && !defaults.copy_code);
+        assert!(Cli::try_parse_from(["peerline", "recv", "--ble", "--airdrop"]).is_err());
+        assert!(Cli::try_parse_from(["peerline", "recv", "--airdrop", "--copy-code"]).is_err());
+        assert!(Cli::try_parse_from(["peerline", "recv", "--airdrop-max-mib", "20"]).is_err());
+        assert!(
+            Cli::try_parse_from(["peerline", "recv", "--airdrop", "--airdrop-max-mib", "0"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["peerline", "recv", "--airdrop", "--airdrop-max-mib", "20"])
+                .is_ok()
+        );
+    }
     use clap::Parser;
     use std::time::Duration;
 

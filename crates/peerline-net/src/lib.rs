@@ -1,3 +1,4 @@
+pub mod airdrop;
 pub mod ble;
 pub mod direct;
 pub mod discovery;
