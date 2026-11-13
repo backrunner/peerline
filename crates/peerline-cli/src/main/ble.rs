@@ -6,6 +6,9 @@ pub(super) async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     let mut receiver = peerline_net::ble::BleReceiver::bind(&name).await?;
     let result = async {
         println!("peerline recv --ble\nname: {name}\ncode: {code}");
+        if args.copy_code {
+            clipboard::copy_code(&code).await?;
+        }
         println!("Offline Bluetooth LE; keep both devices nearby. Ctrl-C to stop.");
         std::io::stdout().flush()?;
         let (events, mut activity) = mpsc::unbounded_channel();

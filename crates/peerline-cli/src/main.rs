@@ -1,5 +1,7 @@
 #[path = "main/ble.rs"]
 mod ble;
+#[path = "main/clipboard.rs"]
+mod clipboard;
 #[path = "main/doctor/mod.rs"]
 mod doctor;
 #[path = "main/i2p.rs"]
@@ -62,6 +64,8 @@ const I2P_FALLBACK_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(hide = true, name = "__clipboard-code")]
+    ClipboardCode,
     /// Check Peerline configuration and platform dependencies.
     Doctor(doctor::DoctorArgs),
     /// Receive files and folders from a paired peer.
@@ -76,6 +80,9 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct RecvArgs {
+    /// Explicitly copy the code; expire it after 30 seconds when still owned.
+    #[arg(long)]
+    copy_code: bool,
     /// Receive offline over Bluetooth LE only.
     #[arg(long, conflicts_with = "tunnel")]
     ble: bool,
@@ -224,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
     init_tracing(cli.debug);
     match cli.command {
         Command::Doctor(args) => doctor::run(args).await,
+        Command::ClipboardCode => clipboard::worker(),
         Command::Recv(args) => recv(args).await,
         Command::Send(args) => send(args).await,
         Command::Set(args) => set(args),
@@ -250,6 +258,9 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
     println!("peerline recv");
     println!("name: {name}");
     println!("code: {code}");
+    if args.copy_code {
+        clipboard::copy_code(&code).await?;
+    }
     println!("direct: {actual_bind}");
     println!(
         "waiting for transfers over {}...",
