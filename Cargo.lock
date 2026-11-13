@@ -4504,7 +4504,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "peerline-cli"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4536,7 +4536,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-core"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4552,7 +4552,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-crypto"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4571,7 +4571,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-net"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4623,7 +4623,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-rendezvous-model"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -4632,7 +4632,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-testkit"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "anyhow",
  "peerline-core",
@@ -4641,7 +4641,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-transfer"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4657,7 +4657,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-tui"
-version = "0.1.1-beta.1"
+version = "0.1.1-beta.2"
 dependencies = [
  "anyhow",
  "crossterm",
