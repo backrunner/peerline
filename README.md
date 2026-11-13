@@ -31,7 +31,11 @@ For direct transfers, the sender can skip discovery and dial an IP address or `h
 
 During a transfer, Peerline scans the requested paths into a manifest, preserves directories with safe relative paths, compresses when useful, and streams the archive to the receiver. The receiver verifies file sizes and BLAKE3 hashes before writing files into the current directory. Existing files are kept by default; conflicting names receive a non-overwriting suffix unless `--overwrite` is used.
 
-The secure session combines the shared code with OPAQUE PAKE, X25519, ML-KEM, HKDF, ratcheted message keys, and ChaCha20-Poly1305. Discovery and transport routes can vary, but file contents stay encrypted by Peerline itself.
+The secure session combines the shared code with OPAQUE PAKE, X25519, ML-KEM, HKDF, ratcheted message keys, and ChaCha20-Poly1305. Discovery and Peerline transport routes can vary, but file contents stay encrypted by Peerline itself. The optional AirDrop compatibility receiver described below uses AirDrop's separate HTTPS protocol.
+
+This revision uses Peerline protocol version 4, including an authenticated
+completion acknowledgement for TCP and BLE. Both peers must upgrade; older
+protocol versions are rejected explicitly.
 
 ## Install And Run
 
@@ -135,6 +139,87 @@ peerline send 192.168.1.23 ./folder --code=fig-mint-rose-123456
 When the port is omitted, Peerline probes the default direct window `43117-43121`.
 
 ## Common Options
+
+### Offline Bluetooth LE
+
+BLE is an explicit, experimental file transport on macOS, Linux and Windows.
+File bytes, authentication and acknowledgements travel over Bluetooth GATT; this
+mode does not start TCP listeners, publish discovery records, or contact relays.
+It uses the same OPAQUE, hybrid key exchange, encrypted archive and BLAKE3
+verification as the other Peerline transports.
+
+```sh
+# Receiver: prints a short name and a code
+peerline recv --ble --no-tui
+
+# Sender: type the name and code printed by the receiver
+peerline send --ble <name> ./file.txt ./folder --code <code>
+```
+
+Keep both devices nearby with Bluetooth enabled. Grant Bluetooth access to
+Peerline or its hosting terminal when prompted on macOS. Linux requires a
+running BlueZ service and permission to use its system D-Bus API. Windows
+requires a Bluetooth adapter supporting LE peripheral advertising on the
+receiver. The adapter must exist and be powered on before any scan or peripheral
+advertisement starts. Ordinary `recv` / `send` do not initialize Bluetooth.
+An OS machine name, internet connection, Wi-Fi and OS Bluetooth pairing
+are not required. The code must be shared separately; it is never advertised.
+
+The initial implementation uses conservative 19-byte chunks and acknowledged
+GATT writes/read polling, so it is intended for small offline handoffs rather
+than large files. It accepts one active sender, bounds buffering, times out
+stalled sessions, and preserves partial archives for resume within a receive
+session. BLE is selected explicitly and never silently falls back to IP.
+Receive uses text output; send uses the existing progress UI when interactive.
+Protocol simulation is covered by tests; physical interoperability and
+throughput require two-device testing on each platform.
+
+See [sendme architecture and BLE protocol notes](docs/sendme-and-ble.md).
+
+### Optional clipboard copy
+
+Names and codes remain short enough to type; Peerline does not use a long sendme
+ticket. It does not write to the clipboard by default. To explicitly copy the
+receive code, use `peerline recv --copy-code` (also works with `--ble`). A small
+helper stays alive for 30 seconds even if the receive session ends, then attempts
+to expire its copy. Clipboard history exclusion is requested; Windows cloud
+clipboard exclusion is also requested.
+
+On macOS/Windows, cleanup checks the native clipboard generation and text so a
+later copy is preserved, including a later copy with identical text. Linux
+releases only its own X11/Wayland selection. macOS offers no atomic
+compare-and-clear API, so its final check is best effort. Cleanup cannot revoke
+copies already stored by clipboard history/sync tools, affect manual terminal
+selection copies, or run if the helper is killed. Type the code when those
+limits are unacceptable.
+
+### Experimental AirDrop receive
+
+```sh
+peerline recv --airdrop
+peerline recv --airdrop --airdrop-max-mib 256
+```
+
+This optional macOS receiver publishes an AirDrop service over the native AWDL
+interface. It requires working Bluetooth and Wi-Fi, an interactive terminal,
+and explicit approval for each batch. Nearby Apple senders may discover
+`Peerline <name>` in their AirDrop picker. Current Apple OS interoperability
+still requires testing with physical devices; this is experimental, not a
+qualified replacement for the system AirDrop receiver.
+
+AirDrop sends file bytes over Wi-Fi/AWDL and HTTPS, independently of Peerline's
+offline BLE channel. It uses Everyone-style discovery with **unverified sender
+names**, not Apple ID/contact authentication or Peerline's PAKE/hybrid encryption.
+It does not change system AirDrop settings. Linux and Windows fail explicitly
+because this implementation requires macOS's native AWDL stack.
+
+Only approved file/folder roots are accepted. Each batch is checked in private
+staging and saved into a fresh `AirDrop-*` directory in the current directory.
+Existing files are never overwritten. Links, special files, unsafe paths and
+URL shares are rejected. Compressed and expanded batch data are each limited to
+1 GiB by default; `--airdrop-max-mib` accepts 1–10240 MiB. Invalid or interrupted
+uploads are discarded. Use Ctrl-C to stop or the existing idle timeout option.
+See [AirDrop protocol and verification notes](docs/airdrop-receive.md).
 
 Receiver options:
 
