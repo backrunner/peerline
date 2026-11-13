@@ -4560,7 +4560,6 @@ dependencies = [
  "hkdf",
  "ml-kem",
  "opaque-ke",
- "postcard",
  "proptest",
  "rand 0.10.3",
  "serde",
@@ -4637,9 +4636,7 @@ version = "0.1.1-beta.1"
 dependencies = [
  "anyhow",
  "peerline-core",
- "peerline-net",
  "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -4654,7 +4651,6 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.21",
- "tokio",
  "walkdir",
  "zstd",
 ]

@@ -12,7 +12,6 @@ chacha20poly1305.workspace = true
 hkdf.workspace = true
 ml-kem.workspace = true
 opaque-ke.workspace = true
-postcard.workspace = true
 rand.workspace = true
 serde.workspace = true
 sha2.workspace = true

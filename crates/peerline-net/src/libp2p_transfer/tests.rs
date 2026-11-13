@@ -47,12 +47,21 @@ async fn spawn_bootstrap_peer() -> (String, tokio::task::JoinHandle<()>) {
     (bootstrap_addr, handle)
 }
 
-#[derive(NetworkBehaviour)]
-struct RendezvousServerBehaviour {
-    rendezvous: rendezvous::server::Behaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
+// Scope the Rust 1.100 workaround to generated behaviour code.
+// https://github.com/libp2p/rust-libp2p/issues/6600
+#[allow(unreachable_code)]
+mod derived {
+    use super::*;
+
+    #[derive(NetworkBehaviour)]
+    pub(super) struct RendezvousServerBehaviour {
+        pub(super) rendezvous: rendezvous::server::Behaviour,
+        pub(super) identify: identify::Behaviour,
+        pub(super) ping: ping::Behaviour,
+    }
 }
+
+use derived::RendezvousServerBehaviour;
 
 async fn spawn_rendezvous_peer() -> (Libp2pRendezvousPeer, tokio::task::JoinHandle<()>) {
     let mut swarm = SwarmBuilder::with_new_identity()

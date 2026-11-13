@@ -8,6 +8,4 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 peerline-core = { path = "../peerline-core" }
-peerline-net = { path = "../peerline-net" }
 tempfile.workspace = true
-tokio.workspace = true

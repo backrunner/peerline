@@ -12,16 +12,25 @@ use peerline_rendezvous_model::{
 };
 use std::net::SocketAddr;
 
-#[derive(NetworkBehaviour)]
-#[behaviour(prelude = "libp2p::swarm::derive_prelude")]
-pub(super) struct DiscoveryBehaviour {
-    pub(super) kad: kad::Behaviour<kad::store::MemoryStore>,
-    pub(super) mdns: Toggle<mdns::tokio::Behaviour>,
-    pub(super) upnp: Toggle<upnp::tokio::Behaviour>,
-    pub(super) rendezvous: rendezvous::client::Behaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
+// Scope the Rust 1.100 workaround to generated behaviour code.
+// https://github.com/libp2p/rust-libp2p/issues/6600
+#[allow(unreachable_code)]
+mod derived {
+    use super::*;
+
+    #[derive(NetworkBehaviour)]
+    #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+    pub(in crate::discovery) struct DiscoveryBehaviour {
+        pub(in crate::discovery) kad: kad::Behaviour<kad::store::MemoryStore>,
+        pub(in crate::discovery) mdns: Toggle<mdns::tokio::Behaviour>,
+        pub(in crate::discovery) upnp: Toggle<upnp::tokio::Behaviour>,
+        pub(in crate::discovery) rendezvous: rendezvous::client::Behaviour,
+        pub(super) identify: identify::Behaviour,
+        pub(super) ping: ping::Behaviour,
+    }
 }
+
+pub(super) use derived::{DiscoveryBehaviour, DiscoveryBehaviourEvent};
 
 pub(super) fn build_discovery_swarm(
     server_mode: bool,

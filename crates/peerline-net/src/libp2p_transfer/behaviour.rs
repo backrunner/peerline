@@ -13,20 +13,29 @@ use libp2p::{
 use rand::rng;
 use std::{error::Error as StdError, time::Duration};
 
-#[derive(NetworkBehaviour)]
-#[behaviour(prelude = "libp2p::swarm::derive_prelude")]
-pub(crate) struct TransferBehaviour {
-    pub(crate) kad: kad::Behaviour<kad::store::MemoryStore>,
-    pub(crate) mdns: Toggle<mdns::tokio::Behaviour>,
-    pub(crate) upnp: Toggle<upnp::tokio::Behaviour>,
-    pub(crate) identify: identify::Behaviour,
-    pub(crate) ping: ping::Behaviour,
-    pub(crate) rendezvous: rendezvous::client::Behaviour,
-    pub(crate) relay: relay::client::Behaviour,
-    pub(crate) dcutr: dcutr::Behaviour,
-    pub(crate) autonat: autonat::v1::Behaviour,
-    pub(crate) transfer: request_response::Behaviour<WireCodec>,
+// Scope the Rust 1.100 workaround to generated behaviour code.
+// https://github.com/libp2p/rust-libp2p/issues/6600
+#[allow(unreachable_code)]
+mod derived {
+    use super::*;
+
+    #[derive(NetworkBehaviour)]
+    #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+    pub(crate) struct TransferBehaviour {
+        pub(crate) kad: kad::Behaviour<kad::store::MemoryStore>,
+        pub(crate) mdns: Toggle<mdns::tokio::Behaviour>,
+        pub(crate) upnp: Toggle<upnp::tokio::Behaviour>,
+        pub(crate) identify: identify::Behaviour,
+        pub(crate) ping: ping::Behaviour,
+        pub(crate) rendezvous: rendezvous::client::Behaviour,
+        pub(crate) relay: relay::client::Behaviour,
+        pub(crate) dcutr: dcutr::Behaviour,
+        pub(crate) autonat: autonat::v1::Behaviour,
+        pub(crate) transfer: request_response::Behaviour<WireCodec>,
+    }
 }
+
+pub(crate) use derived::{TransferBehaviour, TransferBehaviourEvent};
 
 pub(crate) async fn build_sender_swarm(
     enable_mdns: bool,
