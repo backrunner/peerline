@@ -73,7 +73,7 @@ impl Publisher {
 
         let signed_packet = build_signed_packet(&self.keypair, &payload)?;
         self.client
-            .publish(&signed_packet, None)
+            .publish(&signed_packet)
             .await
             .context("pkarr publish failed")?;
         self.last_payload = Some(payload);
@@ -125,8 +125,13 @@ pub(crate) async fn resolve_peer_descriptor(
 ) -> anyhow::Result<Option<PeerDescriptor>> {
     let client = build_client(timeout)?;
     let public_key = public_key_for_lookup_key(lookup_key);
-    let Some(signed_packet) = client.resolve_most_recent(&public_key).await else {
-        return Ok(None);
+    let signed_packet = match client
+        .resolve(&public_key, ::pkarr::ResolvePolicy::NetworkOnly)
+        .await
+    {
+        Ok(packet) => packet,
+        Err(::pkarr::errors::ResolveError::NotFound) => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
 
     Ok(Some(PkarrAnnouncementV1::from_signed_packet(
@@ -143,12 +148,15 @@ fn build_client(timeout: Duration) -> anyhow::Result<Client> {
     if let Some(bootstrap) = configured_bootstrap() {
         builder.no_default_network().bootstrap(&bootstrap);
         if bootstrap_targets_localhost(&bootstrap) {
-            builder.dht(|dht| dht.bind_address(Ipv4Addr::LOCALHOST));
+            builder.dht(|dht| {
+                dht.bind_address = Some(Ipv4Addr::LOCALHOST);
+                dht
+            });
         }
     } else {
         builder.no_relays();
     }
-    builder.no_relays().request_timeout(timeout);
+    builder.no_relays().dht_request_timeout(timeout);
     builder.build().context("could not build pkarr client")
 }
 

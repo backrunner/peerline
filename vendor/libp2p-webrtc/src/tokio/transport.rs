@@ -26,7 +26,7 @@ use std::{
 };
 
 use futures::{future::BoxFuture, prelude::*, stream::SelectAll};
-use if_watch::{tokio::IfWatcher, IfEvent};
+use if_watch::{IfEvent, tokio::IfWatcher};
 use libp2p_core::{
     multiaddr::{Multiaddr, Protocol},
     transport::{DialOpts, ListenerId, TransportError, TransportEvent},
@@ -80,10 +80,9 @@ impl Transport {
     /// ```
     /// use libp2p_identity as identity;
     /// use libp2p_webrtc::tokio::{Certificate, Transport};
-    /// use rand::thread_rng;
     ///
     /// let id_keys = identity::Keypair::generate_ed25519();
-    /// let transport = Transport::new(id_keys, Certificate::generate(&mut thread_rng()).unwrap());
+    /// let transport = Transport::new(id_keys, Certificate::generate(&mut rand::rng()).unwrap());
     /// ```
     pub fn new(id_keys: identity::Keypair, certificate: Certificate) -> Self {
         Self::new_with_ice_servers(id_keys, certificate, Vec::new())
@@ -459,7 +458,6 @@ mod tests {
 
     use futures::future::poll_fn;
     use libp2p_core::Transport as _;
-    use rand::thread_rng;
 
     use super::*;
 
@@ -523,11 +521,13 @@ mod tests {
     async fn close_listener() {
         let id_keys = identity::Keypair::generate_ed25519();
         let mut transport =
-            Transport::new(id_keys, Certificate::generate(&mut thread_rng()).unwrap());
+            Transport::new(id_keys, Certificate::generate(&mut rand::rng()).unwrap());
 
-        assert!(poll_fn(|cx| Pin::new(&mut transport).as_mut().poll(cx))
-            .now_or_never()
-            .is_none());
+        assert!(
+            poll_fn(|cx| Pin::new(&mut transport).as_mut().poll(cx))
+                .now_or_never()
+                .is_none()
+        );
 
         // Run test twice to check that there is no unexpected behaviour if `QuicTransport.listener`
         // is temporarily empty.
@@ -573,9 +573,11 @@ mod tests {
             }
             // Poll once again so that the listener has the chance to return `Poll::Ready(None)` and
             // be removed from the list of listeners.
-            assert!(poll_fn(|cx| Pin::new(&mut transport).as_mut().poll(cx))
-                .now_or_never()
-                .is_none());
+            assert!(
+                poll_fn(|cx| Pin::new(&mut transport).as_mut().poll(cx))
+                    .now_or_never()
+                    .is_none()
+            );
             assert!(transport.listeners.is_empty());
         }
     }

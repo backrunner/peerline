@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-WORKER_BUILD_VERSION="0.8.3"
+WORKER_BUILD_VERSION="0.9.0"
 WORKER_BUILD="$HOME/.cargo/bin/worker-build"
 
 if command -v rustup >/dev/null 2>&1; then

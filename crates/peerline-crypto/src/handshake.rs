@@ -4,7 +4,6 @@ use ml_kem::{
     EncapsulationKey768, KeyExport, MlKem768, TryKeyInit,
     kem::{Decapsulate, Encapsulate, Kem},
 };
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha512;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -51,7 +50,7 @@ pub struct ServerHandshake {
 
 impl ClientHandshake {
     pub fn start() -> Self {
-        let secret = StaticSecret::random_from_rng(OsRng);
+        let secret = StaticSecret::random_from_rng(&mut rand::rng());
         let public = PublicKey::from(&secret);
         Self {
             secret,
@@ -90,7 +89,7 @@ impl ClientHandshake {
 impl ServerHandshake {
     pub fn start(client: &ClientHello) -> anyhow::Result<Self> {
         let _client_public = PublicKey::from(client.x25519_public);
-        let secret = StaticSecret::random_from_rng(OsRng);
+        let secret = StaticSecret::random_from_rng(&mut rand::rng());
         let public = PublicKey::from(&secret);
         let (dk, ek) = MlKem768::generate_keypair();
         let ek_bytes = ek.to_bytes();

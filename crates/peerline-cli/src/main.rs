@@ -19,7 +19,7 @@ use peerline_net::{
     Candidate, Libp2pRecvOptions, Libp2pSendOptions, PublicTunnelEndpoint, PublicTunnelProvider,
     RecvOptions, RouteKind, SendOptions, TorOnionEndpoint, bind_direct_listener,
 };
-use rand::Rng;
+use rand::RngExt;
 use std::{
     io::{ErrorKind, IsTerminal, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -1149,7 +1149,7 @@ fn retry_delay(attempt: usize) -> Duration {
     if jitter_ms <= 0 {
         return Duration::from_millis(base_ms);
     }
-    let delta = rand::thread_rng().gen_range(-jitter_ms..=jitter_ms);
+    let delta = rand::rng().random_range(-jitter_ms..=jitter_ms);
     let adjusted = (base_ms as i64 + delta).max(0) as u64;
     Duration::from_millis(adjusted)
 }

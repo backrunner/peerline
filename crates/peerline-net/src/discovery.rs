@@ -13,7 +13,7 @@ use crate::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use endpoints::LocalDirectNetworks;
 use futures::StreamExt;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use peerline_core::{ConnectionRoute, HumanCode, HumanName, LookupKey, NameCode};
 use peerline_rendezvous_model::{
     I2pEndpoint, PeerDescriptor, PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,

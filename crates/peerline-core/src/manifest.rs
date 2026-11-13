@@ -1,4 +1,4 @@
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
@@ -60,7 +60,7 @@ pub enum EntryKind {
 impl TransferId {
     pub fn random() -> Self {
         let mut bytes = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         Self(bytes)
     }
 
@@ -76,7 +76,7 @@ impl TransferId {
 impl NodeId {
     pub fn random() -> Self {
         let mut bytes = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         Self(bytes)
     }
 

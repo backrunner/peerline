@@ -232,7 +232,8 @@ impl DirectPortMappingLease {
                 ..
             } => {
                 mapping.renew().await?;
-                let external_ip = direct_natpmp_pcp_external_ip(mapping.gateway(), mapping).await?;
+                let external_ip =
+                    direct_natpmp_pcp_external_ip(mapping.gateway().into(), mapping).await?;
                 *external_endpoint = SocketAddr::new(external_ip, mapping.external_port().get());
             }
         }
@@ -260,7 +261,7 @@ impl DirectPortMappingLease {
             Self::CrabNat { mapping, .. } => {
                 if let Err((error, mapping)) = mapping.try_drop().await {
                     tracing::debug!(
-                        gateway = %mapping.gateway(),
+                        gateway = ?mapping.gateway(),
                         external_port = %mapping.external_port(),
                         %error,
                         "could not remove direct NAT-PMP/PCP port mapping"
@@ -312,12 +313,10 @@ async fn try_direct_upnp_port_mapping(
         return Ok(None);
     }
 
-    let gateway = igd_next::aio::tokio::search_gateway(igd_next::SearchOptions {
-        timeout: Some(Duration::from_secs(5)),
-        single_search_timeout: Some(Duration::from_secs(2)),
-        ..Default::default()
-    })
-    .await?;
+    let mut search_options = igd_next::SearchOptions::default();
+    search_options.timeout = Some(Duration::from_secs(5));
+    search_options.single_search_timeout = Some(Duration::from_secs(2));
+    let gateway = igd_next::aio::tokio::search_gateway(search_options).await?;
     let external_ip = gateway.get_external_ip().await?;
     if !is_public_endpoint_ip(&external_ip) {
         tracing::debug!(%external_ip, "direct UPnP gateway external address is not public");
@@ -393,7 +392,7 @@ async fn try_direct_natpmp_pcp_port_mapping(
         None => return Ok(None),
     };
     let mapping = match crab_nat::PortMapping::new(
-        gateway,
+        gateway.into(),
         local_endpoint.ip(),
         crab_nat::InternetProtocol::Tcp,
         internal_port,
@@ -490,7 +489,7 @@ async fn direct_natpmp_pcp_external_ip(
         crab_nat::PortMappingType::Pcp { external_ip, .. } => Ok(external_ip),
         crab_nat::PortMappingType::NatPmp => match gateway {
             IpAddr::V4(gateway) => Ok(IpAddr::V4(
-                crab_nat::natpmp::external_address(IpAddr::V4(gateway), None).await?,
+                crab_nat::natpmp::external_address(IpAddr::V4(gateway).into(), None).await?,
             )),
             IpAddr::V6(_) => anyhow::bail!("NAT-PMP requires an IPv4 gateway"),
         },

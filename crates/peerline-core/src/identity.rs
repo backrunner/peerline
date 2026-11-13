@@ -1,5 +1,5 @@
 use argon2::Argon2;
-use rand::{Rng, seq::SliceRandom};
+use rand::{Rng, RngExt, seq::IndexedRandom};
 use serde::{Deserialize, Serialize};
 use std::{fmt, net::SocketAddr, str::FromStr};
 use thiserror::Error;
@@ -56,9 +56,9 @@ impl HumanName {
     }
 
     pub fn generate() -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let word = random_word(&mut rng);
-        let number: u16 = rng.gen_range(100..=999);
+        let number: u16 = rng.random_range(100..=999);
         Self(format!("{word}-{number}"))
     }
 
@@ -73,11 +73,11 @@ impl HumanCode {
     }
 
     pub fn generate() -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let first = random_word(&mut rng);
         let second = random_word(&mut rng);
         let third = random_word(&mut rng);
-        let number: u32 = rng.gen_range(100_000..=999_999);
+        let number: u32 = rng.random_range(100_000..=999_999);
         Self(format!("{first}-{second}-{third}-{number}"))
     }
 

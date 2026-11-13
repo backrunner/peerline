@@ -10,7 +10,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, behaviour::toggle::Toggle},
     upnp, yamux,
 };
-use rand::thread_rng;
+use rand::rng;
 use std::{error::Error as StdError, time::Duration};
 
 #[derive(NetworkBehaviour)]
@@ -60,7 +60,7 @@ async fn build_swarm(
         )?
         .with_quic()
         .with_other_transport(move |key| {
-            let certificate = libp2p_webrtc::tokio::Certificate::generate(&mut thread_rng())
+            let certificate = libp2p_webrtc::tokio::Certificate::generate(&mut rng())
                 .map_err(|err| Box::new(err) as Box<dyn StdError + Send + Sync>)?;
             Ok(libp2p_webrtc::tokio::Transport::new_with_ice_servers(
                 key.clone(),

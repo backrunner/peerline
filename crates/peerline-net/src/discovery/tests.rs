@@ -21,6 +21,7 @@ use peerline_rendezvous_model::{
     I2pEndpoint, PeerDescriptor, PublicTunnelEndpoint, RENDEZVOUS_DESCRIPTOR_PROTOCOL_VERSION,
     TorOnionEndpoint,
 };
+use std::net::SocketAddr;
 use std::{
     net::{IpAddr, Ipv4Addr},
     sync::{LazyLock, Mutex},
@@ -94,7 +95,7 @@ fn dht_publish_and_discovery_keys_use_the_same_lookup_key() {
 #[test]
 fn discover_peer_candidates_includes_pkarr_mainline_results() {
     let _guard = PKARR_TEST_LOCK.lock().unwrap();
-    let testnet = ::pkarr::mainline::Testnet::builder(3).build().unwrap();
+    let testnet = mainline::Testnet::builder(3).build().unwrap();
     let _bootstrap = set_test_bootstrap(testnet.bootstrap.clone());
 
     tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -208,9 +209,18 @@ fn descriptor_candidates_never_rank_loopback_first() {
     };
 
     let endpoints = discovered_direct_endpoint_candidates(&descriptor, None, true);
-    assert_eq!(endpoints[0], "192.168.1.20:43117".parse().unwrap());
-    assert_eq!(endpoints[1], "203.0.113.7:43117".parse().unwrap());
-    assert_eq!(endpoints[2], "127.0.0.1:43117".parse().unwrap());
+    assert_eq!(
+        endpoints[0],
+        "192.168.1.20:43117".parse::<SocketAddr>().unwrap()
+    );
+    assert_eq!(
+        endpoints[1],
+        "203.0.113.7:43117".parse::<SocketAddr>().unwrap()
+    );
+    assert_eq!(
+        endpoints[2],
+        "127.0.0.1:43117".parse::<SocketAddr>().unwrap()
+    );
 }
 
 #[test]
@@ -229,8 +239,8 @@ fn unspecified_bind_advertises_routable_ips_not_loopback_by_default() {
     assert_eq!(
         endpoints,
         vec![
-            "192.168.1.20:43117".parse().unwrap(),
-            "203.0.113.7:43117".parse().unwrap(),
+            "192.168.1.20:43117".parse::<SocketAddr>().unwrap(),
+            "203.0.113.7:43117".parse::<SocketAddr>().unwrap(),
         ]
     );
 }
@@ -249,8 +259,8 @@ fn loopback_discovery_is_explicit_opt_in_and_ranked_last() {
     assert_eq!(
         endpoints,
         vec![
-            "10.0.0.8:43117".parse().unwrap(),
-            "127.0.0.1:43117".parse().unwrap(),
+            "10.0.0.8:43117".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:43117".parse::<SocketAddr>().unwrap(),
         ]
     );
 }

@@ -16,7 +16,7 @@ const PKARR_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 const RENDEZVOUS_BLACKHOLE_URL: &str = "http://127.0.0.1:9";
 
 struct LocalPkarrTestnet {
-    _testnet: pkarr::mainline::Testnet,
+    _testnet: mainline::Testnet,
     bootstrap: String,
 }
 
@@ -29,7 +29,7 @@ fn network_e2e_guard() -> MutexGuard<'static, ()> {
 
 impl LocalPkarrTestnet {
     fn new() -> Self {
-        let testnet = pkarr::mainline::Testnet::builder(3).build().unwrap();
+        let testnet = mainline::Testnet::builder(3).build().unwrap();
         let bootstrap = testnet.bootstrap.join(",");
         Self {
             _testnet: testnet,
@@ -181,13 +181,16 @@ fn wait_for_pkarr_publish(name: &str, code: &str, bootstrap: &str, timeout: Dura
         .no_default_network()
         .bootstrap(&bootstrap)
         .no_relays()
-        .request_timeout(Duration::from_secs(1));
+        .dht_request_timeout(Duration::from_secs(1));
     if !bootstrap.is_empty()
         && bootstrap
             .iter()
             .all(|value| value.starts_with("127.0.0.1:") || value.starts_with("localhost:"))
     {
-        builder.dht(|dht| dht.bind_address(std::net::Ipv4Addr::LOCALHOST));
+        builder.dht(|dht| {
+            dht.bind_address = Some(std::net::Ipv4Addr::LOCALHOST);
+            dht
+        });
     }
     let client = builder.build().unwrap();
     let public_key = pkarr_public_key(name, code);
@@ -197,7 +200,12 @@ fn wait_for_pkarr_publish(name: &str, code: &str, bootstrap: &str, timeout: Dura
         .block_on(async move {
             let start = Instant::now();
             loop {
-                if client.resolve_most_recent(&public_key).await.is_some() {
+                if client
+                    .resolve(&public_key, pkarr::ResolvePolicy::NetworkOnly)
+                    .await
+                    .ok()
+                    .is_some()
+                {
                     return;
                 }
                 assert!(

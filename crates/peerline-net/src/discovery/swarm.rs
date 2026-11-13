@@ -280,14 +280,20 @@ fn handle_discovery_event_with_snapshot(
             changed
         }
         DiscoveryBehaviourEvent::Upnp(event) => match event {
-            upnp::Event::NewExternalAddr(addr) => {
+            upnp::Event::NewExternalAddr {
+                external_addr: addr,
+                ..
+            } => {
                 tracing::debug!(%addr, "UPnP external address confirmed");
                 if let Some(snapshot) = snapshot.as_mut() {
                     snapshot.observe_local_peer(*swarm.local_peer_id());
                 }
                 true
             }
-            upnp::Event::ExpiredExternalAddr(addr) => {
+            upnp::Event::ExpiredExternalAddr {
+                external_addr: addr,
+                ..
+            } => {
                 tracing::debug!(%addr, "UPnP external address expired");
                 true
             }

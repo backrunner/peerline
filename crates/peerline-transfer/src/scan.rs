@@ -121,6 +121,7 @@ fn hash_file(path: &Path) -> anyhow::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
 
     #[test]

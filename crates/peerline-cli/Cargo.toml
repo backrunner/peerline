@@ -10,6 +10,7 @@ name = "peerline"
 path = "src/main.rs"
 
 [dependencies]
+arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
 anyhow.workspace = true
 clap.workspace = true
 crossterm.workspace = true
@@ -30,7 +31,17 @@ tracing-subscriber.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+mainline = "8"
 assert_cmd.workspace = true
 blake3.workspace = true
 pkarr.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+clipboard-win = "5.4.3"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString"] }

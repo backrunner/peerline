@@ -5,7 +5,6 @@ use libp2p::{StreamProtocol, request_response::Codec};
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WireCodec;
 
-#[async_trait::async_trait]
 impl Codec for WireCodec {
     type Protocol = StreamProtocol;
     type Request = WireFrame;

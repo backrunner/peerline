@@ -10,10 +10,10 @@
 # See Cargo.toml.orig for the original contents.
 
 [package]
-edition = "2021"
-rust-version = "1.83.0"
+edition = "2024"
+rust-version = "1.88.0"
 name = "libp2p-webrtc"
-version = "0.9.0-alpha.1"
+version = "0.10.0-alpha"
 authors = ["Parity Technologies <admin@parity.io>"]
 build = false
 autolib = false
@@ -34,6 +34,7 @@ categories = [
 ]
 license = "MIT"
 repository = "https://github.com/libp2p/rust-libp2p"
+resolver = "2"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -60,46 +61,46 @@ required-features = ["tokio"]
 version = "0.1"
 
 [dependencies.futures]
-version = "0.3.30"
+version = "0.3"
 
 [dependencies.futures-timer]
-version = "3"
+version = "3.0"
 
 [dependencies.hex]
 version = "0.4"
 
 [dependencies.if-watch]
-version = "3.2.1"
+version = "3.2"
 
 [dependencies.libp2p-core]
-version = "0.43.1"
+version = "0.44.0"
 
 [dependencies.libp2p-identity]
-version = "0.2.12"
+version = "0.3.0"
 
 [dependencies.libp2p-noise]
-version = "0.46.1"
+version = "0.47.0"
 
 [dependencies.libp2p-webrtc-utils]
-version = "0.4.0"
+version = "0.5.0"
 
 [dependencies.multihash]
-version = "0.19.1"
+version = "0.19"
 
 [dependencies.rand]
-version = "0.8"
+version = "0.10"
 
 [dependencies.rcgen]
 version = "0.13"
 
 [dependencies.stun]
-version = "0.7"
+version = "0.17"
 
 [dependencies.thiserror]
 version = "2"
 
 [dependencies.tokio]
-version = "1.38"
+version = "1.53"
 features = ["net"]
 optional = true
 default-features = false
@@ -110,26 +111,26 @@ features = ["compat"]
 optional = true
 
 [dependencies.tracing]
-version = "0.1.41"
+version = "0.1"
 
 [dependencies.webrtc]
-version = "0.12.0"
+version = "0.17"
 optional = true
 
 [dev-dependencies.libp2p-identity]
-version = "0.2.12"
+version = "0.3.0"
 features = ["rand"]
 
 [dev-dependencies.quickcheck]
-version = "1.0.3"
+version = "1.1"
 
 [dev-dependencies.tokio]
-version = "1.38"
+version = "1.53"
 features = ["full"]
 default-features = false
 
 [dev-dependencies.tracing-subscriber]
-version = "0.3.19"
+version = "0.3"
 features = ["env-filter"]
 
 [lints.clippy]

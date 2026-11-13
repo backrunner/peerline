@@ -1,6 +1,5 @@
 use opaque_ke::argon2::Argon2;
 use opaque_ke::ciphersuite::CipherSuite;
-use opaque_ke::rand::rngs::OsRng;
 use opaque_ke::{
     ClientLogin, ClientLoginFinishParameters, ClientRegistration,
     ClientRegistrationFinishParameters, CredentialFinalization, CredentialRequest,
@@ -56,7 +55,7 @@ pub fn create_server_record(
 ) -> Result<OpaqueServerRecord, OpaqueError> {
     let password = Zeroizing::new(password.as_ref().to_vec());
     let identifier = identifier.as_ref().to_vec();
-    let mut rng = OsRng;
+    let mut rng = rand::rng();
     let server_setup = ServerSetup::<PeerlineOpaqueSuite>::new(&mut rng);
 
     let client_start = ClientRegistration::<PeerlineOpaqueSuite>::start(&mut rng, &password)
@@ -92,7 +91,7 @@ pub fn create_server_record(
 
 pub fn start_client_login(password: impl AsRef<[u8]>) -> Result<OpaqueClientStart, OpaqueError> {
     let password = Zeroizing::new(password.as_ref().to_vec());
-    let mut rng = OsRng;
+    let mut rng = rand::rng();
     let start = ClientLogin::<PeerlineOpaqueSuite>::start(&mut rng, &password)
         .map_err(|err| OpaqueError::Protocol(err.to_string()))?;
     Ok(OpaqueClientStart {
@@ -105,7 +104,7 @@ pub fn start_server_login(
     record: &OpaqueServerRecord,
     request: &[u8],
 ) -> Result<OpaqueServerResponse, OpaqueError> {
-    let mut rng = OsRng;
+    let mut rng = rand::rng();
     let setup = ServerSetup::<PeerlineOpaqueSuite>::deserialize(&record.server_setup)
         .map_err(|err| OpaqueError::Protocol(err.to_string()))?;
     let password_file =
@@ -135,7 +134,7 @@ impl OpaqueClientStart {
         response: &[u8],
     ) -> Result<OpaqueClientFinish, OpaqueError> {
         let password = Zeroizing::new(password.as_ref().to_vec());
-        let mut rng = OsRng;
+        let mut rng = rand::rng();
         let response = CredentialResponse::deserialize(response)
             .map_err(|err| OpaqueError::Protocol(err.to_string()))?;
         let finish = self
