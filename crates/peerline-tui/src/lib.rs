@@ -229,6 +229,7 @@ fn connection_route_label(route: &ConnectionRoute) -> &'static str {
         ConnectionRoute::Libp2pRelay => "libp2p-relay",
         ConnectionRoute::WebRtcDirect => "webrtc-direct",
         ConnectionRoute::WebRtcTurn => "webrtc-turn",
+        ConnectionRoute::Ble => "ble",
     }
 }
 

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>sh.pwp.peerline.cli</string>
+    <key>CFBundleName</key><string>Peerline</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>Peerline uses Bluetooth to transfer files directly to nearby devices without an internet connection.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>Peerline uses Bluetooth to receive files from nearby devices.</string>
+</dict></plist>

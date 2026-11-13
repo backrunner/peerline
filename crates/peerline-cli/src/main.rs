@@ -1,3 +1,5 @@
+#[path = "main/ble.rs"]
+mod ble;
 #[path = "main/doctor/mod.rs"]
 mod doctor;
 #[path = "main/i2p.rs"]
@@ -74,6 +76,9 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct RecvArgs {
+    /// Receive offline over Bluetooth LE only.
+    #[arg(long, conflicts_with = "tunnel")]
+    ble: bool,
     #[arg(value_name = "NAME_OR_CODE")]
     first: Option<String>,
     #[arg(value_name = "CODE")]
@@ -118,6 +123,9 @@ struct RecvArgs {
 
 #[derive(Debug, Args)]
 struct SendArgs {
+    /// Send offline to a nearby receive name; requires --code.
+    #[arg(long, requires = "code", conflicts_with = "name")]
+    ble: bool,
     #[arg(value_name = "ARGS", required = true)]
     args: Vec<String>,
     #[arg(long)]
@@ -224,6 +232,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn recv(args: RecvArgs) -> anyhow::Result<()> {
+    if args.ble {
+        return ble::recv(args).await;
+    }
     let store = ConfigStore::user_default()?;
     let config = store.load()?;
     let tunnel_provider = recv_public_tunnel_provider(&args);
@@ -511,6 +522,9 @@ async fn recv(args: RecvArgs) -> anyhow::Result<()> {
 }
 
 async fn send(args: SendArgs) -> anyhow::Result<()> {
+    if args.ble {
+        return ble::send(args).await;
+    }
     if let Some(target) = direct_endpoint_arg(&args) {
         return send_direct_mode(args, target).await;
     }
@@ -1825,6 +1839,7 @@ fn resolve_named_send(args: SendArgs) -> anyhow::Result<(HumanName, HumanCode, V
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use clap::Parser;
     use std::time::Duration;
 
@@ -1848,6 +1863,7 @@ mod tests {
     #[test]
     fn name_flag_prevents_ip_like_path_from_becoming_direct_endpoint() {
         let args = SendArgs {
+            ble: false,
             args: vec!["127.0.0.1".into()],
             name: Some("river-mango-42".into()),
             code: Some("rose-lime-iris-jade-1234".into()),
@@ -1874,6 +1890,7 @@ mod tests {
     #[test]
     fn direct_endpoint_arg_distinguishes_ip_and_ip_port() {
         let ip_only = SendArgs {
+            ble: false,
             args: vec!["127.0.0.1".into()],
             name: None,
             code: Some("rose-lime-iris-jade-1234".into()),
@@ -1897,6 +1914,7 @@ mod tests {
         ));
 
         let ip_port = SendArgs {
+            ble: false,
             args: vec!["127.0.0.1:43117".into()],
             name: None,
             code: Some("rose-lime-iris-jade-1234".into()),
@@ -1923,6 +1941,7 @@ mod tests {
     #[test]
     fn partial_named_flags_are_rejected() {
         let name_only = SendArgs {
+            ble: false,
             args: vec!["file.txt".into()],
             name: Some("river-mango-42".into()),
             code: None,
@@ -1943,6 +1962,7 @@ mod tests {
         assert!(resolve_named_send(name_only).is_err());
 
         let code_only = SendArgs {
+            ble: false,
             args: vec!["file.txt".into()],
             name: None,
             code: Some("rose-lime-iris-jade-1234".into()),

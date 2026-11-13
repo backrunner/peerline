@@ -3,7 +3,8 @@ use peerline_crypto::{ChunkAead, ClientHello, ClientKem, EncryptedChunk, ServerH
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub(crate) const PROTOCOL_VERSION: u16 = 3;
+// Version 4 authenticates the byte-stream receiver's completion acknowledgement.
+pub(crate) const PROTOCOL_VERSION: u16 = 4;
 pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
 pub(crate) const SECURE_AAD: &[u8] = b"peerline:secure-frame:v1";
 pub(crate) const LIBP2P_TRANSFER_PROTOCOL: &str = "/peerline/transfer/1";

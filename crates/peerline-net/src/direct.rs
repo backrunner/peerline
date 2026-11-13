@@ -663,9 +663,9 @@ fn connection_route_from_endpoint(endpoint: &SocketAddr) -> ConnectionRoute {
     }
 }
 
-struct DirectSession {
-    endpoint: SocketAddr,
-    stream: TcpStream,
+struct DirectSession<S = TcpStream> {
+    endpoint: String,
+    stream: S,
     opaque_client: OpaqueClientStart,
     server_response: Vec<u8>,
     client_handshake: ClientHandshake,
@@ -759,7 +759,17 @@ async fn open_direct_session(
     code: &HumanCode,
     descriptor: TransferDescriptor,
 ) -> anyhow::Result<DirectSession> {
-    let mut stream = TcpStream::connect(endpoint).await?;
+    let stream = TcpStream::connect(endpoint).await?;
+    open_stream_session(stream, endpoint.to_string(), name, code, descriptor).await
+}
+
+async fn open_stream_session<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: S,
+    endpoint: String,
+    name: Option<&HumanName>,
+    code: &HumanCode,
+    descriptor: TransferDescriptor,
+) -> anyhow::Result<DirectSession<S>> {
     let transcript = direct_transcript(name);
     let opaque_client = start_client_login(code.as_str().as_bytes())?;
     let client_handshake = ClientHandshake::start();
@@ -828,8 +838,8 @@ async fn open_direct_session_with_timeout(
     }
 }
 
-async fn complete_direct_transfer(
-    mut session: DirectSession,
+async fn complete_direct_transfer<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut session: DirectSession<S>,
     archive: &Archive,
     options: &SendOptions,
     transfer_id: TransferId,
@@ -920,8 +930,30 @@ async fn complete_direct_transfer(
         &SecureFrame::Done,
     )
     .await?;
-    match read_wire(&mut session.stream).await? {
-        WireFrame::Ack => {}
+    read_completion(&mut session.stream, keys.recv_key).await?;
+    session.stream.shutdown().await?;
+    emit_stage(&options.events, TransferStage::Complete);
+
+    Ok(SentTransfer {
+        endpoint: session.endpoint.to_string(),
+        files: descriptor.files,
+        bytes: archive.manifest.total_bytes,
+    })
+}
+
+async fn read_completion<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    key: [u8; 32],
+) -> anyhow::Result<()> {
+    match read_wire(reader).await? {
+        WireFrame::Secure(encrypted) => {
+            let mut aead = ChunkAead::new(key, *b"pl01");
+            let response = crate::protocol::decrypt_secure(&mut aead, &mut 0, encrypted)?;
+            anyhow::ensure!(
+                matches!(response, SecureFrame::Done),
+                "unexpected secure completion response"
+            );
+        }
         WireFrame::Error { message } => {
             return Err(TransferError::fatal(anyhow::anyhow!(message)).into());
         }
@@ -932,14 +964,7 @@ async fn complete_direct_transfer(
             .into());
         }
     }
-    session.stream.shutdown().await?;
-    emit_stage(&options.events, TransferStage::Complete);
-
-    Ok(SentTransfer {
-        endpoint: session.endpoint.to_string(),
-        files: descriptor.files,
-        bytes: archive.manifest.total_bytes,
-    })
+    Ok(())
 }
 
 pub async fn recv_once(options: RecvOptions) -> anyhow::Result<ReceivedTransfer> {
@@ -1111,8 +1136,17 @@ pub fn descriptor_for_archive(options: &SendOptions, archive: &Archive) -> Trans
 }
 
 async fn receive_stream(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
+    options: RecvOptions,
+) -> anyhow::Result<ReceivedTransfer> {
+    receive_transport(stream, peer.to_string(), options).await
+}
+
+/// Run the existing authenticated transfer protocol over an ordered byte stream.
+pub(crate) async fn receive_transport<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: S,
+    peer: String,
     options: RecvOptions,
 ) -> anyhow::Result<ReceivedTransfer> {
     let intro = match read_wire(&mut stream).await? {
@@ -1246,7 +1280,10 @@ async fn receive_stream(
     match result {
         Ok(received) => {
             resume::remove_partial(&resume_state)?;
-            write_wire(&mut stream, &WireFrame::Ack).await?;
+            // Reverse-direction key proves the authenticated receiver actually
+            // finished verification; a transport peer cannot forge success.
+            let mut reply_aead = ChunkAead::new(keys.send_key, *b"pl01");
+            write_secure(&mut stream, &mut reply_aead, &mut 0, &SecureFrame::Done).await?;
             emit_event(
                 &options.events,
                 PeerlineEvent::StageChanged(TransferStage::Complete),
@@ -1262,6 +1299,32 @@ async fn receive_stream(
     }
 }
 
+/// BLE and TCP share authentication, encryption, resume and archive verification.
+pub(crate) async fn send_transport<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: S,
+    endpoint: String,
+    options: SendOptions,
+) -> anyhow::Result<SentTransfer> {
+    let archive = create_archive(&options.paths, options.compression)?;
+    let descriptor = descriptor_for_archive(&options, &archive);
+    let session = open_stream_session(
+        stream,
+        endpoint,
+        options.name.as_ref(),
+        &options.code,
+        descriptor.clone(),
+    )
+    .await?;
+    complete_direct_transfer(
+        session,
+        &archive,
+        &options,
+        TransferId::random(),
+        descriptor,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1270,6 +1333,25 @@ mod tests {
     use peerline_crypto::{ChunkAead, ClientHandshake, start_client_login};
     use std::io::Read;
     use std::sync::{Arc, OnceLock};
+
+    #[tokio::test]
+    async fn completion_requires_authenticated_receiver_key() {
+        for (plaintext, wrong_key) in [(false, false), (true, false), (false, true)] {
+            let (mut receiver, mut sender) = tokio::io::duplex(4096);
+            if plaintext {
+                write_wire(&mut receiver, &WireFrame::Ack).await.unwrap();
+            } else {
+                let mut aead = ChunkAead::new(if wrong_key { [9; 32] } else { [7; 32] }, *b"pl01");
+                write_secure(&mut receiver, &mut aead, &mut 0, &SecureFrame::Done)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                read_completion(&mut sender, [7; 32]).await.is_ok(),
+                !plaintext && !wrong_key
+            );
+        }
+    }
 
     static DIRECT_TEST_PORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
