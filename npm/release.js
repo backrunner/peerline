@@ -25,6 +25,13 @@ const workspacePackageNames = [
   "peerline-transfer",
   "peerline-tui",
 ];
+const cargoLockFiles = [
+  { path: cargoLockPath, packages: workspacePackageNames },
+  {
+    path: path.join(repoRoot, "services", "peerline-rendezvous", "Cargo.lock"),
+    packages: ["peerline-rendezvous-model"],
+  },
+];
 const platformPackageSpecs = {
   "peerline-darwin-arm64": {
     arch: "arm64",
@@ -209,10 +216,10 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function setCargoLockVersion(cargoLock, version) {
+function setCargoLockVersion(cargoLock, version, packageNames = workspacePackageNames) {
   let updated = cargoLock;
 
-  for (const name of workspacePackageNames) {
+  for (const name of packageNames) {
     const pattern = new RegExp(
       `(\\[\\[package\\]\\]\\nname = "${escapeRegExp(name)}"\\n[\\s\\S]*?^version = ")([^"]+)(")`,
       "m"
@@ -394,21 +401,18 @@ function setProjectVersion(version, versions = currentVersions()) {
 
   writeJson(packageJsonPath, nextPackageJson);
   fs.writeFileSync(cargoTomlPath, setCargoWorkspaceVersion(versions.cargoToml, version));
-  fs.writeFileSync(cargoLockPath, setCargoLockVersion(fs.readFileSync(cargoLockPath, "utf8"), version));
+  for (const lock of cargoLockFiles) {
+    fs.writeFileSync(lock.path, setCargoLockVersion(fs.readFileSync(lock.path, "utf8"), version, lock.packages));
+  }
   run("cargo", ["check", "--workspace", "--all-targets", "--locked"]);
 }
 
 function verifyCargoLockVersion(version) {
-  const lock = fs.readFileSync(cargoLockPath, "utf8");
-  const packageBlocks = lock.split(/\n(?=\[\[package\]\]\n)/);
-  const stalePeerlinePackages = packageBlocks
-    .filter((block) => /^name = "peerline-/m.test(block))
-    .filter((block) => !new RegExp(`^version = "${version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`, "m").test(block))
-    .map((block) => block.match(/^name = "([^"]+)"/m)?.[1])
-    .filter(Boolean);
-
-  if (stalePeerlinePackages.length > 0) {
-    throw new Error(`Cargo.lock was not updated for: ${stalePeerlinePackages.join(", ")}`);
+  for (const lock of cargoLockFiles) {
+    const contents = fs.readFileSync(lock.path, "utf8");
+    if (setCargoLockVersion(contents, version, lock.packages) !== contents) {
+      throw new Error(`${path.relative(repoRoot, lock.path)} contains stale workspace package versions`);
+    }
   }
 }
 
@@ -417,7 +421,7 @@ function releaseName(channel) {
 }
 
 function commitRelease(version, channel) {
-  run("git", ["add", "package.json", "Cargo.toml", "Cargo.lock"]);
+  run("git", ["add", "package.json", "Cargo.toml", ...cargoLockFiles.map((lock) => path.relative(repoRoot, lock.path))]);
   const staged = run("git", ["diff", "--cached", "--name-only"], { capture: true }).trim();
   if (!staged) {
     console.log("No version changes to commit.");
@@ -429,8 +433,6 @@ function commitRelease(version, channel) {
     "user.name=BackRunner",
     "-c",
     "user.email=dev@backrunner.top",
-    "-c",
-    "commit.gpgsign=false",
     "commit",
     "-m",
     `chore: bump ${releaseName(channel)} release to ${version}`,

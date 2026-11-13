@@ -88,6 +88,17 @@ test("cargo lock version replacement touches only workspace packages", () => {
   assert.match(updated, /name = "peerline-core"\nversion = "0\.1\.0-alpha\.2"/);
 });
 
+test("Worker lockfile bump preserves the independently versioned Worker and dependencies", () => {
+  const lock = fs.readFileSync(path.join(__dirname, "..", "services", "peerline-rendezvous", "Cargo.lock"), "utf8");
+  const updated = setCargoLockVersion(lock, "9.9.9-beta.1", ["peerline-rendezvous-model"]);
+  const otherPackages = (contents) => contents.split(/\n(?=\[\[package\]\]\n)/)
+    .filter((block) => !/^name = "peerline-rendezvous-model"$/m.test(block));
+
+  assert.match(updated, /name = "peerline-rendezvous-model"\nversion = "9\.9\.9-beta\.1"/);
+  assert.deepEqual(otherPackages(updated), otherPackages(lock));
+  assert.throws(() => setCargoLockVersion(lock, "9.9.9-beta.1"), /could not find peerline-cli/);
+});
+
 test("parseArgs supports publish options and current-version retries", () => {
   const options = parseArgs([
     "--channel=beta",
