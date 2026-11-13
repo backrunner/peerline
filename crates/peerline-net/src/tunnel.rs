@@ -435,9 +435,9 @@ where
             opaque_response,
             server_hello,
         } if version == PROTOCOL_VERSION => (resume_offset, opaque_response, server_hello),
-        WireFrame::ServerIntro { version, .. } => {
+        WireFrame::ServerIntro { version, .. } | WireFrame::UnsupportedIntro { version } => {
             return Err(TransferError::fatal(anyhow::anyhow!(
-                "incompatible peerline protocol version {version}; expected {PROTOCOL_VERSION}"
+                crate::protocol::version_mismatch_message(version)
             ))
             .into());
         }
@@ -594,10 +594,8 @@ where
             opaque_request,
             client_hello,
         } if version == PROTOCOL_VERSION => (name, descriptor, opaque_request, client_hello),
-        WireFrame::ClientIntro { version, .. } => {
-            let message = format!(
-                "incompatible peerline protocol version {version}; expected {PROTOCOL_VERSION}"
-            );
+        WireFrame::ClientIntro { version, .. } | WireFrame::UnsupportedIntro { version } => {
+            let message = crate::protocol::version_mismatch_message(version);
             let _ = ws_write_wire(
                 stream,
                 &WireFrame::Error {
@@ -737,7 +735,7 @@ async fn ws_write_wire<S>(stream: &mut WebSocketStream<S>, frame: &WireFrame) ->
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let payload = postcard::to_allocvec(frame)?;
+    let payload = crate::protocol::encode_wire(frame)?;
     stream.send(Message::Binary(payload.into())).await?;
     Ok(())
 }
@@ -748,7 +746,7 @@ where
 {
     loop {
         match stream.next().await {
-            Some(Ok(Message::Binary(payload))) => return Ok(postcard::from_bytes(&payload)?),
+            Some(Ok(Message::Binary(payload))) => return crate::protocol::decode_wire(&payload),
             Some(Ok(Message::Text(_))) => anyhow::bail!("expected binary websocket frame"),
             Some(Ok(Message::Ping(payload))) => {
                 stream.send(Message::Pong(payload)).await?;
@@ -851,7 +849,44 @@ fn emit_progress(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_public_tunnel_url, normalize_tor_onion_url};
+    use super::*;
+
+    #[tokio::test]
+    async fn websocket_rejects_unknown_version_before_parsing_body_or_creating_state() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        for version in [3u16, u16::MAX] {
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("received");
+            let (client, server) = tokio::io::duplex(8192);
+            let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+            let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+            let mut payload = vec![0];
+            payload.extend(postcard::to_allocvec(&version).unwrap());
+            payload.extend([0xff; 8]);
+            client.send(Message::Binary(payload.into())).await.unwrap();
+            let error = receive_ws_stream(
+                &mut server,
+                "test".into(),
+                RecvOptions {
+                    destination: destination.clone(),
+                    ..Default::default()
+                },
+                PUBLIC_TUNNEL_ROUTE_LABEL,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("version {version}; expected 4"))
+            );
+            assert!(
+                matches!(ws_read_wire(&mut client).await.unwrap(), WireFrame::Error { message }
+                if message.contains("upgrade"))
+            );
+            assert!(!destination.exists());
+        }
+    }
 
     #[test]
     fn normalizes_public_tunnel_urls_to_websocket_schemes() {

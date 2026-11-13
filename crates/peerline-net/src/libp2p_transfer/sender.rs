@@ -173,10 +173,8 @@ pub(crate) async fn send_prebuilt_libp2p(
             opaque_response,
             server_hello,
         } if version == PROTOCOL_VERSION => (resume_offset, opaque_response, server_hello),
-        WireFrame::ServerIntro { version, .. } => {
-            anyhow::bail!(
-                "incompatible peerline protocol version {version}; expected {PROTOCOL_VERSION}"
-            )
+        WireFrame::ServerIntro { version, .. } | WireFrame::UnsupportedIntro { version } => {
+            anyhow::bail!(crate::protocol::version_mismatch_message(version))
         }
         WireFrame::Error { message } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected libp2p handshake response: {other:?}"),

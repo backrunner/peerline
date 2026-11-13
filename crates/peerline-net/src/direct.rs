@@ -716,7 +716,11 @@ impl std::fmt::Display for TransferError {
     }
 }
 
-impl std::error::Error for TransferError {}
+impl std::error::Error for TransferError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 pub async fn bind_direct_listener(bind: SocketAddr) -> anyhow::Result<(TcpListener, SocketAddr)> {
     bind_direct_listener_with_window(bind, DEFAULT_DIRECT_PORT_WINDOW).await
@@ -792,9 +796,9 @@ async fn open_stream_session<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + U
             opaque_response,
             server_hello,
         } if version == PROTOCOL_VERSION => (resume_offset, opaque_response, server_hello),
-        WireFrame::ServerIntro { version, .. } => {
+        WireFrame::ServerIntro { version, .. } | WireFrame::UnsupportedIntro { version } => {
             return Err(TransferError::fatal(anyhow::anyhow!(
-                "incompatible peerline protocol version {version}; expected {PROTOCOL_VERSION}"
+                crate::protocol::version_mismatch_message(version)
             ))
             .into());
         }
@@ -1073,6 +1077,7 @@ pub async fn send_prebuilt_direct_probe(
     );
 
     let mut last_error = None;
+    let mut fatal_error = None;
     for port in direct_port_candidates(start_port, DEFAULT_DIRECT_PORT_WINDOW) {
         let endpoint = SocketAddr::new(endpoint_ip, port);
         match time::timeout(
@@ -1099,7 +1104,14 @@ pub async fn send_prebuilt_direct_probe(
             }
             Ok(Err(error)) => {
                 tracing::debug!(%endpoint, %error, "direct port probe failed");
-                last_error = Some(error);
+                if error
+                    .downcast_ref::<TransferError>()
+                    .is_some_and(|error| error.kind() == TransferErrorKind::Fatal)
+                {
+                    fatal_error.get_or_insert(error);
+                } else {
+                    last_error = Some(error);
+                }
             }
             Err(_) => {
                 let error = anyhow::anyhow!("timed out probing {}", endpoint);
@@ -1109,7 +1121,7 @@ pub async fn send_prebuilt_direct_probe(
         }
     }
 
-    Err(last_error.unwrap_or_else(|| {
+    Err(fatal_error.or(last_error).unwrap_or_else(|| {
         anyhow::anyhow!(
             "could not find a peerline receiver on {} starting at port {}",
             endpoint_ip,
@@ -1157,10 +1169,8 @@ pub(crate) async fn receive_transport<S: tokio::io::AsyncRead + tokio::io::Async
             opaque_request,
             client_hello,
         } if version == PROTOCOL_VERSION => (name, descriptor, opaque_request, client_hello),
-        WireFrame::ClientIntro { version, .. } => {
-            let message = format!(
-                "incompatible peerline protocol version {version}; expected {PROTOCOL_VERSION}"
-            );
+        WireFrame::ClientIntro { version, .. } | WireFrame::UnsupportedIntro { version } => {
+            let message = crate::protocol::version_mismatch_message(version);
             let _ = write_wire(
                 &mut stream,
                 &WireFrame::Error {
@@ -1333,6 +1343,162 @@ mod tests {
     use peerline_crypto::{ChunkAead, ClientHandshake, start_client_login};
     use std::io::Read;
     use std::sync::{Arc, OnceLock};
+
+    async fn write_unknown_intro<W: tokio::io::AsyncWrite + Unpin>(
+        stream: &mut W,
+        tag: u8,
+        version: u16,
+    ) {
+        let mut payload = vec![tag];
+        payload.extend(postcard::to_allocvec(&version).unwrap());
+        payload.extend([0xff; 8]);
+        stream
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&payload).await.unwrap();
+    }
+
+    fn version_test_options(root: &std::path::Path) -> (RecvOptions, SendOptions) {
+        let recv = RecvOptions {
+            destination: root.join("received"),
+            ..Default::default()
+        };
+        let path = root.join("hello.txt");
+        std::fs::write(&path, "version boundary test").unwrap();
+        let send = SendOptions {
+            endpoint: "127.0.0.1:0".parse().unwrap(),
+            name: None,
+            code: recv.code.clone(),
+            source_id: NodeId::random(),
+            paths: vec![path],
+            compression: Compression::None,
+            events: None,
+        };
+        (recv, send)
+    }
+
+    #[tokio::test]
+    async fn unsupported_versions_do_not_write_files_or_stop_the_receiver() {
+        let temp = tempfile::tempdir().unwrap();
+        let (recv, mut send) = version_test_options(temp.path());
+        let destination = recv.destination.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        send.endpoint = listener.local_addr().unwrap();
+        let receiver = tokio::spawn(async move { recv_once_bound(&listener, recv).await });
+
+        for version in [0, 3, 5, u16::MAX] {
+            let mut client = TcpStream::connect(send.endpoint).await.unwrap();
+            write_unknown_intro(&mut client, 0, version).await;
+            let reply = time::timeout(Duration::from_secs(2), read_wire(&mut client))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(reply, WireFrame::Error { message }
+                if message.contains(&format!("version {version}; expected 4"))
+                    && message.contains("upgrade")));
+            assert!(
+                !destination.exists(),
+                "rejection must precede partial-file creation"
+            );
+            assert!(!receiver.is_finished());
+        }
+
+        time::timeout(Duration::from_secs(10), send_direct(send))
+            .await
+            .unwrap()
+            .unwrap();
+        time::timeout(Duration::from_secs(2), receiver)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(destination.join("hello.txt")).unwrap(),
+            "version boundary test"
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_rejects_old_and_future_servers_before_sending_finish() {
+        for (version, legacy_error_reply) in [(3, false), (5, false), (u16::MAX, false), (3, true)]
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let (_, send) = version_test_options(temp.path());
+            let (client, mut server) = tokio::io::duplex(16384);
+            let expected = if legacy_error_reply {
+                let message = "incompatible peerline protocol version 4; expected 3";
+                write_wire(
+                    &mut server,
+                    &WireFrame::Error {
+                        message: message.into(),
+                    },
+                )
+                .await
+                .unwrap();
+                message.to_owned()
+            } else {
+                write_unknown_intro(&mut server, 1, version).await;
+                format!("version {version}; expected 4")
+            };
+            let error = send_transport(client, "test".into(), send)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<TransferError>().unwrap().kind(),
+                TransferErrorKind::Fatal
+            );
+            assert!(error.to_string().contains(&expected));
+            assert!(matches!(
+                read_wire(&mut server).await.unwrap(),
+                WireFrame::ClientIntro { version: 4, .. }
+            ));
+            let mut next = [0];
+            assert_eq!(
+                server.read(&mut next).await.unwrap(),
+                0,
+                "must not send ClientFinish or data"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probing_preserves_version_errors_but_still_tries_compatible_receivers() {
+        let _guard = direct_test_guard().await;
+        for compatible_later in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (recv, mut send) = version_test_options(temp.path());
+            let (port, listeners) = reserve_probe_window().await;
+            send.endpoint.set_port(port);
+            let peers = tokio::spawn(async move {
+                for (index, listener) in listeners.into_iter().enumerate() {
+                    if compatible_later && index == 1 {
+                        recv_once_bound(&listener, recv).await.unwrap();
+                        return;
+                    }
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    read_wire(&mut stream).await.unwrap();
+                    if index == 0 {
+                        write_unknown_intro(&mut stream, 1, 3).await;
+                    }
+                }
+            });
+            let result = time::timeout(Duration::from_secs(10), send_direct_probe(send))
+                .await
+                .unwrap();
+            if compatible_later {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<TransferError>().unwrap().kind(),
+                    TransferErrorKind::Fatal
+                );
+                assert!(error.to_string().contains("version 3; expected 4"));
+            }
+            peers.await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn completion_requires_authenticated_receiver_key() {

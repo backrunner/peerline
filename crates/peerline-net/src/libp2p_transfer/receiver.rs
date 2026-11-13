@@ -587,11 +587,11 @@ fn handle_inbound_request(
                 server_hello: hello,
             }))
         }
-        WireFrame::ClientIntro { version, .. } => Ok(InboundResponse::Frame(WireFrame::Error {
-            message: format!(
-                "incompatible peerline protocol version {version}; expected {PROTOCOL_VERSION}"
-            ),
-        })),
+        WireFrame::ClientIntro { version, .. } | WireFrame::UnsupportedIntro { version } => {
+            Ok(InboundResponse::Frame(WireFrame::Error {
+                message: crate::protocol::version_mismatch_message(version),
+            }))
+        }
         WireFrame::ClientFinish {
             opaque_finalization,
             client_kem,
@@ -722,5 +722,86 @@ fn handle_inbound_request(
         _ => Ok(InboundResponse::Frame(WireFrame::Error {
             message: "unexpected libp2p frame".into(),
         })),
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn incompatible_libp2p_peer_gets_error_without_creating_a_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = Libp2pRecvOptions {
+            name: peerline_core::HumanName::generate(),
+            code: peerline_core::HumanCode::generate(),
+            direct_bind: "127.0.0.1:0".parse().unwrap(),
+            destination: temp.path().join("received"),
+            overwrite: false,
+            discovery: crate::discovery::DiscoveryConfig::default(),
+            public_tunnel_endpoints: vec![],
+            tor_onion_endpoints: vec![],
+            i2p_endpoints: vec![],
+            events: None,
+        };
+        let lookup_key =
+            peerline_core::NameCode::new(options.name.clone(), options.code.clone()).lookup_key();
+        let mut server = build_receiver_swarm(false, false, &[]).await.unwrap();
+        let mut client = super::super::behaviour::build_sender_swarm(false, false, &[])
+            .await
+            .unwrap();
+        server
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let address = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = server.select_next_some().await {
+                break address;
+            }
+        };
+        let server_id = *server.local_peer_id();
+        let mut sessions = HashMap::new();
+        for version in [3, u16::MAX] {
+            let request = WireFrame::ClientIntro {
+                version,
+                name: None,
+                descriptor: peerline_core::TransferDescriptor {
+                    source_id: peerline_core::NodeId::random(),
+                    resource_id: peerline_core::ResourceId::from_bytes([0; 32]),
+                    archive_bytes: 0,
+                    logical_bytes: 0,
+                    files: 0,
+                    compression: peerline_core::Compression::None,
+                },
+                opaque_request: vec![], // Authentication must never be attempted.
+                client_hello: peerline_crypto::ClientHandshake::start().hello,
+            };
+            client.behaviour_mut().transfer.send_request_with_addresses(
+                &server_id,
+                request,
+                vec![address.clone()],
+            );
+            time::timeout(Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        event = server.select_next_some() => {
+                            if let SwarmEvent::Behaviour(TransferBehaviourEvent::Transfer(event)) = event {
+                                assert!(handle_transfer_event(&mut server, &mut sessions, &server_id, event, &options, &lookup_key).unwrap().is_none());
+                            }
+                        }
+                        event = client.select_next_some() => {
+                            if let SwarmEvent::Behaviour(TransferBehaviourEvent::Transfer(RequestResponseEvent::Message {
+                                message: RequestResponseMessage::Response { response, .. }, ..
+                            })) = event {
+                                assert!(matches!(response, WireFrame::Error { message }
+                                    if message.contains(&format!("version {version}; expected 4"))));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }).await.unwrap();
+            assert!(sessions.is_empty());
+            assert!(!options.destination.exists());
+        }
     }
 }

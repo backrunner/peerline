@@ -35,7 +35,8 @@ The secure session combines the shared code with OPAQUE PAKE, X25519, ML-KEM, HK
 
 This revision uses Peerline protocol version 4, including an authenticated
 completion acknowledgement for TCP and BLE. Both peers must upgrade; older
-protocol versions are rejected explicitly.
+protocol versions are rejected explicitly. See the
+[compatibility policy and rejection behavior](docs/protocol-compatibility.md).
 
 ## Install And Run
 

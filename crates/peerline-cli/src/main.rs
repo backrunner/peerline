@@ -649,9 +649,7 @@ async fn send_direct_mode(args: SendArgs, target: DirectTarget) -> anyhow::Resul
             Err(error) => {
                 if let Some(sender) = ui.events.as_ref() {
                     let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
-                        format!(
-                            "failed after {retry_attempts} attempt(s): {error}; press r to retry or q to quit"
-                        ),
+                        format!("send failed: {error}; press r to retry or q to quit"),
                     )));
                 } else {
                     return Err(error);
@@ -743,9 +741,7 @@ async fn send_named_mode(args: SendArgs) -> anyhow::Result<()> {
             Err(error) => {
                 if let Some(sender) = ui.events.as_ref() {
                     let _ = sender.send(PeerlineEvent::StageChanged(TransferStage::Failed(
-                        format!(
-                            "failed after {retry_attempts} attempt(s): {error}; press r to retry or q to quit"
-                        ),
+                        format!("send failed: {error}; press r to retry or q to quit"),
                     )));
                 } else {
                     return Err(error);
@@ -990,7 +986,7 @@ async fn named_send_attempt(
                                 route_label(&candidate_route)
                             )));
                         }
-                        last_error = Some(error);
+                        remember_send_error(&mut last_error, error);
                     }
                 }
             }
@@ -1003,13 +999,9 @@ async fn named_send_attempt(
         }
     }
 
-    let error = last_error
-        .map(|error| error.to_string())
-        .unwrap_or_else(|| "no usable endpoint".into());
-    Err(anyhow::anyhow!(
-        "discovered {}, but all routes failed: {error}",
-        plan.name
-    ))
+    let error = last_error.unwrap_or_else(|| anyhow::anyhow!("no usable endpoint"));
+    let message = format!("discovered {}, but all routes failed: {error}", plan.name);
+    Err(error.context(message))
 }
 
 async fn send_candidate(
@@ -1194,12 +1186,25 @@ fn is_fatal_error(error: &anyhow::Error) -> bool {
     if let Some(transfer_error) = error.downcast_ref::<peerline_net::direct::TransferError>() {
         return transfer_error.kind() == peerline_net::direct::TransferErrorKind::Fatal;
     }
-    let message = error.to_string();
-    message.contains("receiver name mismatch")
-        || message.contains("incompatible peerline protocol version")
-        || message.contains("authentication")
-        || message.contains("hash mismatch")
-        || message.contains("protocol version")
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("receiver name mismatch")
+            || message.contains("incompatible peerline protocol version")
+            || message.contains("authentication")
+            || message.contains("hash mismatch")
+            || message.contains("protocol version")
+    })
+}
+
+fn remember_send_error(previous: &mut Option<anyhow::Error>, error: anyhow::Error) {
+    // Try other candidates even after an unauthenticated handshake rejection.
+    // If all fail, retain the actionable error instead of a later socket error.
+    if previous
+        .as_ref()
+        .is_none_or(|previous| !is_fatal_error(previous))
+    {
+        *previous = Some(error);
+    }
 }
 
 fn route_label(route: &RouteKind) -> &'static str {
@@ -2154,6 +2159,30 @@ mod tests {
         assert!(!is_fatal_error(&anyhow::anyhow!(
             "connection reset by peer"
         )));
+    }
+
+    #[test]
+    fn route_failures_preserve_version_error_regardless_of_completion_order() {
+        for mismatch_first in [false, true] {
+            let mismatch = anyhow::anyhow!("incompatible peerline protocol version 3; expected 4")
+                .context("candidate rejected the handshake");
+            let connection = anyhow::anyhow!("connection refused");
+            let mut error = None;
+            let errors = if mismatch_first {
+                [mismatch, connection]
+            } else {
+                [connection, mismatch]
+            };
+            for next in errors {
+                remember_send_error(&mut error, next);
+            }
+            let error = error.unwrap().context("all routes failed");
+            assert!(is_fatal_error(&error));
+            assert!(format!("{error:#}").contains("protocol version 3"));
+        }
+        let typed = peerline_net::direct::TransferError::fatal(anyhow::anyhow!("rejected"));
+        let error = anyhow::Error::new(typed).context("all routes failed");
+        assert!(is_fatal_error(&error));
     }
 
     #[test]
