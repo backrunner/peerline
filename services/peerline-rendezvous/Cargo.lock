@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "peerline-rendezvous-model"
-version = "0.1.1-beta.2"
+version = "0.1.1-beta.3"
 dependencies = [
  "base64",
  "blake3",
