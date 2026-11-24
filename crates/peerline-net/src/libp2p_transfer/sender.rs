@@ -16,10 +16,7 @@ use peerline_core::{ConnectionRoute, PeerlineEvent, TransferId, TransferStage};
 use peerline_crypto::{ChunkAead, ClientHandshake, start_client_login};
 use peerline_transfer::{Archive, create_archive};
 use std::time::Duration;
-use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
-    time,
-};
+use tokio::time;
 
 const LIBP2P_REQUEST_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -66,22 +63,6 @@ fn emit_transfer_started(
     );
 }
 
-fn emit_progress(
-    events: &Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
-    id: TransferId,
-    bytes_done: u64,
-    bytes_total: u64,
-) {
-    emit_event(
-        events,
-        PeerlineEvent::Progress {
-            id,
-            bytes_done,
-            bytes_total,
-        },
-    );
-}
-
 fn route_label(route: &ConnectionRoute) -> &'static str {
     match route {
         ConnectionRoute::LanDirect => "lan-direct",
@@ -104,12 +85,12 @@ pub(crate) async fn send_libp2p(
     emit_message(&options.events, "building archive from selected paths");
     let archive = create_archive(&options.paths, options.compression)?;
     let transfer_id = TransferId::random();
-    send_prebuilt_libp2p(options, archive, transfer_id).await
+    send_prebuilt_libp2p(options, &archive, transfer_id).await
 }
 
 pub(crate) async fn send_prebuilt_libp2p(
     options: Libp2pSendOptions,
-    archive: Archive,
+    archive: &Archive,
     transfer_id: TransferId,
 ) -> anyhow::Result<crate::direct::SentTransfer> {
     let descriptor = descriptor_for_archive(
@@ -122,7 +103,7 @@ pub(crate) async fn send_prebuilt_libp2p(
             compression: options.compression,
             events: options.events.clone(),
         },
-        &archive,
+        archive,
     );
     emit_stage(
         &options.events,
@@ -218,10 +199,7 @@ pub(crate) async fn send_prebuilt_libp2p(
     }
     emit_stage(&options.events, TransferStage::Transferring);
     let mut sequence = 0u64;
-    let mut archive_reader = tokio::fs::File::from_std(archive.reader()?);
-    archive_reader
-        .seek(std::io::SeekFrom::Start(server_intro.0))
-        .await?;
+    let mut chunks = crate::archive_io::prefetch(archive, server_intro.0)?;
     let mut bytes_sent = server_intro.0;
     send_secure_request(
         &mut swarm,
@@ -234,24 +212,22 @@ pub(crate) async fn send_prebuilt_libp2p(
     )
     .await?;
 
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let read = archive_reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        bytes_sent += read as u64;
+    let mut progress = crate::progress::Progress::default();
+    while bytes_sent < descriptor.archive_bytes {
+        let bytes = chunks
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("archive reader stopped early"))??;
+        bytes_sent += bytes.len() as u64;
         send_secure_request(
             &mut swarm,
             &options,
             &mut aead,
             &mut sequence,
-            SecureFrame::ArchiveChunk {
-                bytes: buffer[..read].to_vec(),
-            },
+            SecureFrame::ArchiveChunk { bytes },
         )
         .await?;
-        emit_progress(
+        progress.report(
             &options.events,
             transfer_id,
             bytes_sent,

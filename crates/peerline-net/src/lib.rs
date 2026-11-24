@@ -1,9 +1,11 @@
 pub mod airdrop;
+mod archive_io;
 pub mod ble;
 pub mod direct;
 pub mod discovery;
 pub mod libp2p_transfer;
 pub(crate) mod pkarr;
+mod progress;
 pub(crate) mod protocol;
 pub mod rendezvous;
 pub(crate) mod resume;

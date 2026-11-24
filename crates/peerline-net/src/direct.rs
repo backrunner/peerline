@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     sync::watch,
     task::JoinHandle,
@@ -639,22 +639,6 @@ fn emit_transfer_started(
     );
 }
 
-fn emit_progress(
-    events: &Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
-    id: TransferId,
-    bytes_done: u64,
-    bytes_total: u64,
-) {
-    emit_event(
-        events,
-        PeerlineEvent::Progress {
-            id,
-            bytes_done,
-            bytes_total,
-        },
-    );
-}
-
 fn connection_route_from_endpoint(endpoint: &SocketAddr) -> ConnectionRoute {
     match endpoint.ip() {
         IpAddr::V4(ip) if ip.is_private() || ip.is_loopback() => ConnectionRoute::LanDirect,
@@ -891,10 +875,7 @@ async fn complete_direct_transfer<S: tokio::io::AsyncRead + tokio::io::AsyncWrit
     emit_stage(&options.events, TransferStage::Transferring);
     let mut sequence = 0u64;
     let mut bytes_sent = session.resume_offset;
-    let mut archive_reader = tokio::fs::File::from_std(archive.reader()?);
-    archive_reader
-        .seek(std::io::SeekFrom::Start(session.resume_offset))
-        .await?;
+    let mut chunks = crate::archive_io::prefetch(archive, session.resume_offset)?;
     write_secure(
         &mut session.stream,
         &mut aead,
@@ -904,23 +885,21 @@ async fn complete_direct_transfer<S: tokio::io::AsyncRead + tokio::io::AsyncWrit
         },
     )
     .await?;
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let read = archive_reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        bytes_sent += read as u64;
+    let mut progress = crate::progress::Progress::default();
+    while bytes_sent < descriptor.archive_bytes {
+        let bytes = chunks
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("archive reader stopped early"))??;
+        bytes_sent += bytes.len() as u64;
         write_secure(
             &mut session.stream,
             &mut aead,
             &mut sequence,
-            &SecureFrame::ArchiveChunk {
-                bytes: buffer[..read].to_vec(),
-            },
+            &SecureFrame::ArchiveChunk { bytes },
         )
         .await?;
-        emit_progress(
+        progress.report(
             &options.events,
             transfer_id,
             bytes_sent,
@@ -1020,10 +999,11 @@ pub async fn send_direct(options: SendOptions) -> anyhow::Result<SentTransfer> {
 
 pub async fn send_prebuilt_direct(
     options: SendOptions,
-    archive: Archive,
+    archive: impl std::borrow::Borrow<Archive>,
     transfer_id: TransferId,
 ) -> anyhow::Result<SentTransfer> {
-    let descriptor = descriptor_for_archive(&options, &archive);
+    let archive = archive.borrow();
+    let descriptor = descriptor_for_archive(&options, archive);
     emit_stage(
         &options.events,
         TransferStage::Connecting(connection_route_from_endpoint(&options.endpoint)),
@@ -1037,7 +1017,7 @@ pub async fn send_prebuilt_direct(
         DIRECT_SESSION_OPEN_TIMEOUT,
     )
     .await?;
-    complete_direct_transfer(session, &archive, &options, transfer_id, descriptor).await
+    complete_direct_transfer(session, archive, &options, transfer_id, descriptor).await
 }
 
 pub async fn send_direct_probe(options: SendOptions) -> anyhow::Result<SentTransfer> {
@@ -1052,10 +1032,11 @@ pub async fn send_direct_probe(options: SendOptions) -> anyhow::Result<SentTrans
 
 pub async fn send_prebuilt_direct_probe(
     options: SendOptions,
-    archive: Archive,
+    archive: impl std::borrow::Borrow<Archive>,
     transfer_id: TransferId,
 ) -> anyhow::Result<SentTransfer> {
-    let descriptor = descriptor_for_archive(&options, &archive);
+    let archive = archive.borrow();
+    let descriptor = descriptor_for_archive(&options, archive);
     let endpoint_ip = options.endpoint.ip();
     let start_port = options.endpoint.port();
     let end_port = direct_port_candidates(start_port, DEFAULT_DIRECT_PORT_WINDOW)
@@ -1095,7 +1076,7 @@ pub async fn send_prebuilt_direct_probe(
                 emit_message(&options.events, format!("dialing {}", endpoint));
                 return complete_direct_transfer(
                     session,
-                    &archive,
+                    archive,
                     &options,
                     transfer_id,
                     descriptor,
@@ -1343,6 +1324,7 @@ mod tests {
     use peerline_crypto::{ChunkAead, ClientHandshake, start_client_login};
     use std::io::Read;
     use std::sync::{Arc, OnceLock};
+    use tokio::io::AsyncReadExt;
 
     async fn write_unknown_intro<W: tokio::io::AsyncWrite + Unpin>(
         stream: &mut W,

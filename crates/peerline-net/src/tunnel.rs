@@ -14,11 +14,7 @@ use peerline_crypto::{
 };
 use peerline_transfer::{Archive, create_archive, unpack_archive_from_reader};
 use std::{net::SocketAddr, time::Duration};
-use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
-    net::TcpListener,
-    time,
-};
+use tokio::{net::TcpListener, time};
 use tokio_socks::tcp::Socks5Stream;
 use tokio_tungstenite::{
     WebSocketStream, accept_hdr_async, client_async, connect_async,
@@ -233,12 +229,13 @@ pub async fn send_public_tunnel(
 
 pub async fn send_prebuilt_public_tunnel(
     options: SendOptions,
-    archive: Archive,
+    archive: impl std::borrow::Borrow<Archive>,
     transfer_id: TransferId,
     endpoint: String,
 ) -> anyhow::Result<SentTransfer> {
+    let archive = archive.borrow();
     let endpoint = normalize_public_tunnel_url(&endpoint)?;
-    let descriptor = crate::direct::descriptor_for_archive(&options, &archive);
+    let descriptor = crate::direct::descriptor_for_archive(&options, archive);
     emit_stage(
         &options.events,
         TransferStage::Connecting(ConnectionRoute::PublicTunnel),
@@ -263,18 +260,19 @@ pub async fn send_prebuilt_public_tunnel(
             PUBLIC_TUNNEL_SESSION_OPEN_TIMEOUT.as_secs()
         ),
     };
-    complete_public_tunnel_transfer(session, &archive, &options, transfer_id, descriptor).await
+    complete_public_tunnel_transfer(session, archive, &options, transfer_id, descriptor).await
 }
 
 pub async fn send_prebuilt_tor_onion(
     options: SendOptions,
-    archive: Archive,
+    archive: impl std::borrow::Borrow<Archive>,
     transfer_id: TransferId,
     endpoint: String,
     socks_proxy: SocketAddr,
 ) -> anyhow::Result<SentTransfer> {
+    let archive = archive.borrow();
     let endpoint = normalize_tor_onion_url(&endpoint)?;
-    let descriptor = crate::direct::descriptor_for_archive(&options, &archive);
+    let descriptor = crate::direct::descriptor_for_archive(&options, archive);
     emit_stage(
         &options.events,
         TransferStage::Connecting(ConnectionRoute::TorOnion),
@@ -303,18 +301,19 @@ pub async fn send_prebuilt_tor_onion(
             PUBLIC_TUNNEL_SESSION_OPEN_TIMEOUT.as_secs()
         ),
     };
-    complete_public_tunnel_transfer(session, &archive, &options, transfer_id, descriptor).await
+    complete_public_tunnel_transfer(session, archive, &options, transfer_id, descriptor).await
 }
 
 pub async fn send_prebuilt_i2p(
     options: SendOptions,
-    archive: Archive,
+    archive: impl std::borrow::Borrow<Archive>,
     transfer_id: TransferId,
     endpoint: String,
     sam_addr: SocketAddr,
 ) -> anyhow::Result<SentTransfer> {
+    let archive = archive.borrow();
     let endpoint = normalize_i2p_url(&endpoint)?;
-    let descriptor = crate::direct::descriptor_for_archive(&options, &archive);
+    let descriptor = crate::direct::descriptor_for_archive(&options, archive);
     emit_stage(
         &options.events,
         TransferStage::Connecting(ConnectionRoute::I2p),
@@ -343,7 +342,7 @@ pub async fn send_prebuilt_i2p(
             I2P_SESSION_OPEN_TIMEOUT.as_secs()
         ),
     };
-    complete_public_tunnel_transfer(session, &archive, &options, transfer_id, descriptor).await
+    complete_public_tunnel_transfer(session, archive, &options, transfer_id, descriptor).await
 }
 
 struct PublicTunnelSession<S> {
@@ -512,10 +511,7 @@ where
     emit_stage(&options.events, TransferStage::Transferring);
     let mut sequence = 0u64;
     let mut bytes_sent = session.resume_offset;
-    let mut archive_reader = tokio::fs::File::from_std(archive.reader()?);
-    archive_reader
-        .seek(std::io::SeekFrom::Start(session.resume_offset))
-        .await?;
+    let mut chunks = crate::archive_io::prefetch(archive, session.resume_offset)?;
     ws_write_secure(
         &mut session.stream,
         &mut aead,
@@ -525,23 +521,21 @@ where
         },
     )
     .await?;
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let read = archive_reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        bytes_sent += read as u64;
+    let mut progress = crate::progress::Progress::default();
+    while bytes_sent < descriptor.archive_bytes {
+        let bytes = chunks
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("archive reader stopped early"))??;
+        bytes_sent += bytes.len() as u64;
         ws_write_secure(
             &mut session.stream,
             &mut aead,
             &mut sequence,
-            &SecureFrame::ArchiveChunk {
-                bytes: buffer[..read].to_vec(),
-            },
+            &SecureFrame::ArchiveChunk { bytes },
         )
         .await?;
-        emit_progress(
+        progress.report(
             &options.events,
             transfer_id,
             bytes_sent,
@@ -827,22 +821,6 @@ fn emit_transfer_started(
             files,
             bytes,
             resume_offset,
-        },
-    );
-}
-
-fn emit_progress(
-    events: &Option<tokio::sync::mpsc::UnboundedSender<PeerlineEvent>>,
-    id: TransferId,
-    bytes_done: u64,
-    bytes_total: u64,
-) {
-    emit_event(
-        events,
-        PeerlineEvent::Progress {
-            id,
-            bytes_done,
-            bytes_total,
         },
     );
 }

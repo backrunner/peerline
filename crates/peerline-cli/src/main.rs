@@ -803,7 +803,7 @@ async fn direct_send_with_retries(
                         compression,
                         events: events.clone(),
                     },
-                    clone_archive(&archive)?,
+                    &archive,
                     transfer_id,
                 )
                 .await
@@ -819,7 +819,7 @@ async fn direct_send_with_retries(
                         compression,
                         events: events.clone(),
                     },
-                    clone_archive(&archive)?,
+                    &archive,
                     transfer_id,
                 )
                 .await
@@ -871,7 +871,7 @@ async fn named_send_with_retries(
             tokio::time::sleep(delay).await;
         }
 
-        match named_send_attempt(&plan, clone_archive(&archive)?, transfer_id, quit_rx).await {
+        match named_send_attempt(&plan, &archive, transfer_id, quit_rx).await {
             Ok(TaskOutcome::Completed(sent)) => return Ok(TaskOutcome::Completed(sent)),
             Ok(TaskOutcome::Quit) => return Ok(TaskOutcome::Quit),
             Err(error) if is_fatal_error(&error) => return Err(error),
@@ -884,7 +884,7 @@ async fn named_send_with_retries(
 
 async fn named_send_attempt(
     plan: &NamedSendPlan,
-    archive: peerline_transfer::Archive,
+    archive: &peerline_transfer::Archive,
     transfer_id: TransferId,
     quit_rx: &mut Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<TaskOutcome<peerline_net::SentTransfer>> {
@@ -939,7 +939,6 @@ async fn named_send_attempt(
         }
 
         let candidate_plan = plan.clone();
-        let candidate_archive = clone_archive(&archive)?;
         let candidate_delay = delay_anonymous_fallback
             && matches!(candidate.route, RouteKind::TorOnion | RouteKind::I2p);
         attempts.push(async move {
@@ -951,8 +950,7 @@ async fn named_send_attempt(
                 tokio::time::sleep(delay).await;
             }
             let candidate_route = candidate.route.clone();
-            let result =
-                send_candidate(&candidate, &candidate_plan, candidate_archive, transfer_id).await;
+            let result = send_candidate(&candidate, &candidate_plan, archive, transfer_id).await;
             (candidate_route, result)
         });
         queued_attempts += 1;
@@ -1007,7 +1005,7 @@ async fn named_send_attempt(
 async fn send_candidate(
     candidate: &Candidate,
     plan: &NamedSendPlan,
-    archive: peerline_transfer::Archive,
+    archive: &peerline_transfer::Archive,
     transfer_id: TransferId,
 ) -> anyhow::Result<peerline_net::SentTransfer> {
     match candidate.route {
@@ -1134,18 +1132,6 @@ async fn send_candidate(
             .await
         }
     }
-}
-
-fn clone_archive(
-    archive: &peerline_transfer::Archive,
-) -> anyhow::Result<peerline_transfer::Archive> {
-    peerline_transfer::Archive::from_existing(
-        archive.manifest.clone(),
-        archive.compression,
-        archive.resource_id,
-        archive.reader()?,
-        archive.len(),
-    )
 }
 
 fn emit_send_message(

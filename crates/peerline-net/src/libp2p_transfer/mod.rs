@@ -52,9 +52,10 @@ pub async fn send_libp2p(
 
 pub async fn send_prebuilt_libp2p(
     options: Libp2pSendOptions,
-    archive: peerline_transfer::Archive,
+    archive: impl std::borrow::Borrow<peerline_transfer::Archive>,
     transfer_id: peerline_core::TransferId,
 ) -> anyhow::Result<crate::direct::SentTransfer> {
+    let archive = archive.borrow();
     sender::send_prebuilt_libp2p(options, archive, transfer_id).await
 }
 
