@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::{
     fs,
-    io::{self, BufReader, Cursor, Read, Write},
+    io::{self, BufReader, BufWriter, Cursor, Read, Seek, Write},
     path::{Path, PathBuf},
 };
 use tempfile::NamedTempFile;
@@ -87,17 +87,63 @@ pub fn create_archive(paths: &[PathBuf], compression: Compression) -> anyhow::Re
         .map(|source| source.manifest_entry.clone())
         .collect::<Vec<_>>();
     let mut manifest = Manifest::new(compression, manifest_entries);
-    let body = create_archive_body(&sources)?;
-    let raw_len = archive_frame_len(&ArchiveFrame::Manifest(manifest.clone()))?
-        + body.as_file().metadata()?.len() as usize;
-    let actual_compression = resolved_compression_for_size(compression, raw_len as u64);
+    let mut actual_compression = resolved_compression_for_size(compression, manifest.total_bytes);
+    // Auto's historical threshold counts serialized framing too. Only tiny inputs
+    // need an exact count. Spill to disk for a tree with many empty entries.
+    let mut small_body = None;
+    if compression == Compression::Auto && actual_compression == Compression::None {
+        let mut body = tempfile::spooled_tempfile(1024);
+        write_archive_body(&mut body, &sources)?;
+        let raw_len = archive_frame_len(&ArchiveFrame::Manifest(manifest.clone()))? as u64
+            + body.stream_position()?;
+        actual_compression = resolved_compression_for_size(compression, raw_len);
+        body.rewind()?;
+        small_body = Some(body);
+    }
     manifest.compression = actual_compression;
     manifest.id = deterministic_manifest_id(actual_compression, &manifest.entries);
 
-    let raw = create_raw_archive(&manifest, &body)?;
-    let file = compress_raw_archive(actual_compression, raw)?;
+    let mut write_raw = |writer: &mut dyn Write| -> anyhow::Result<()> {
+        write_frame(&mut *writer, &ArchiveFrame::Manifest(manifest.clone()))?;
+        if let Some(body) = &mut small_body {
+            io::copy(body, writer)?;
+        } else {
+            write_archive_body(writer, &sources)?;
+        }
+        Ok(())
+    };
+
+    let mut file = NamedTempFile::new()?;
+    let mut hasher = blake3::Hasher::new();
+    {
+        let mut output = BufWriter::with_capacity(
+            256 * 1024,
+            HashingWriter {
+                file: file.as_file_mut(),
+                hasher: &mut hasher,
+            },
+        );
+        match actual_compression {
+            Compression::None => write_raw(&mut output)?,
+            Compression::Zstd | Compression::Auto => {
+                let mut encoder = ZstdEncoder::new(&mut output, ZSTD_COMPRESSION_LEVEL)?;
+                write_raw(&mut encoder)?;
+                encoder.finish()?;
+            }
+            Compression::Lzma => {
+                let mut raw = tempfile::tempfile()?;
+                let mut writer = BufWriter::new(&mut raw);
+                write_raw(&mut writer)?;
+                writer.flush()?;
+                drop(writer);
+                raw.rewind()?;
+                lzma_rs::lzma_compress(&mut BufReader::new(raw), &mut output)?;
+            }
+        }
+        output.flush()?;
+    }
+    let resource_id = ResourceId::from_bytes(*hasher.finalize().as_bytes());
     let len = file.as_file().metadata()?.len();
-    let resource_id = resource_id_for_file(&file)?;
 
     Ok(Archive {
         manifest,
@@ -121,8 +167,20 @@ pub fn resource_id_for_reader(mut reader: impl Read) -> anyhow::Result<ResourceI
     Ok(ResourceId::from_bytes(*hasher.finalize().as_bytes()))
 }
 
-fn resource_id_for_file(file: &NamedTempFile) -> anyhow::Result<ResourceId> {
-    resource_id_for_reader(file.reopen()?)
+struct HashingWriter<'a> {
+    file: &'a mut fs::File,
+    hasher: &'a mut blake3::Hasher,
+}
+
+impl Write for HashingWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let n = self.file.write(bytes)?;
+        self.hasher.update(&bytes[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
 }
 
 fn deterministic_manifest_id(compression: Compression, entries: &[ManifestEntry]) -> TransferId {
@@ -164,13 +222,12 @@ fn entry_kind_tag(kind: EntryKind) -> u8 {
     }
 }
 
-fn create_archive_body(sources: &[SourceEntry]) -> anyhow::Result<NamedTempFile> {
-    let mut raw = NamedTempFile::new()?;
+fn write_archive_body(writer: &mut dyn Write, sources: &[SourceEntry]) -> anyhow::Result<()> {
     for source in sources {
         match source.manifest_entry.kind {
             EntryKind::Directory => {
                 write_frame(
-                    raw.as_file_mut(),
+                    &mut *writer,
                     &ArchiveFrame::Directory {
                         path: source.relative_path.clone(),
                     },
@@ -184,7 +241,7 @@ fn create_archive_body(sources: &[SourceEntry]) -> anyhow::Result<NamedTempFile>
                     .blake3
                     .ok_or_else(|| anyhow::anyhow!("file entry missing hash"))?;
                 write_frame(
-                    raw.as_file_mut(),
+                    &mut *writer,
                     &ArchiveFrame::FileStart {
                         path: source.relative_path.clone(),
                         size,
@@ -198,59 +255,17 @@ fn create_archive_body(sources: &[SourceEntry]) -> anyhow::Result<NamedTempFile>
                         break;
                     }
                     write_frame(
-                        raw.as_file_mut(),
+                        &mut *writer,
                         &ArchiveFrame::FileChunk {
                             bytes: buffer[..read].to_vec(),
                         },
                     )?;
                 }
-                write_frame(raw.as_file_mut(), &ArchiveFrame::FileEnd)?;
+                write_frame(&mut *writer, &ArchiveFrame::FileEnd)?;
             }
         }
     }
-    raw.as_file_mut().flush()?;
-    Ok(raw)
-}
-
-fn create_raw_archive(manifest: &Manifest, body: &NamedTempFile) -> anyhow::Result<NamedTempFile> {
-    let mut raw = NamedTempFile::new()?;
-    write_frame(raw.as_file_mut(), &ArchiveFrame::Manifest(manifest.clone()))?;
-    let mut reader = BufReader::new(body.reopen()?);
-    io::copy(&mut reader, raw.as_file_mut())?;
-    raw.as_file_mut().flush()?;
-    Ok(raw)
-}
-
-fn compress_raw_archive(
-    compression: Compression,
-    raw: NamedTempFile,
-) -> anyhow::Result<NamedTempFile> {
-    match compression {
-        Compression::None => Ok(raw),
-        Compression::Zstd | Compression::Auto => {
-            let mut output = NamedTempFile::new()?;
-            {
-                let input = raw.reopen()?;
-                let mut reader = BufReader::new(input);
-                let writer = output.as_file_mut();
-                let mut encoder = ZstdEncoder::new(writer, ZSTD_COMPRESSION_LEVEL)?;
-                io::copy(&mut reader, &mut encoder)?;
-                let writer = encoder.finish()?;
-                writer.flush()?;
-            }
-            Ok(output)
-        }
-        Compression::Lzma => {
-            let mut output = NamedTempFile::new()?;
-            {
-                let input = raw.reopen()?;
-                let mut reader = BufReader::new(input);
-                lzma_rs::lzma_compress(&mut reader, output.as_file_mut())?;
-                output.as_file_mut().flush()?;
-            }
-            Ok(output)
-        }
-    }
+    Ok(())
 }
 
 pub fn unpack_archive(
@@ -373,7 +388,10 @@ fn unpack_raw_archive<R: Read>(
                     fs::create_dir_all(parent)?;
                 }
                 active.temp_file.persist(&path)?;
-                if remaining_entries.remove(&active.relative).is_none() {
+                if remaining_entries
+                    .remove(active.relative.as_path())
+                    .is_none()
+                {
                     anyhow::bail!(
                         "file manifest entry already consumed or missing for {}",
                         active.relative.display()
@@ -437,21 +455,21 @@ fn validate_manifest_entries(entries: &[ManifestEntry]) -> anyhow::Result<()> {
 
 fn expected_manifest_entries(
     manifest: &Manifest,
-) -> anyhow::Result<HashMap<PathBuf, ManifestEntry>> {
+) -> anyhow::Result<HashMap<&Path, &ManifestEntry>> {
     let mut entries = HashMap::new();
     for entry in &manifest.entries {
-        if entries.insert(entry.path.clone(), entry.clone()).is_some() {
+        if entries.insert(entry.path.as_path(), entry).is_some() {
             anyhow::bail!("duplicate manifest entry for {}", entry.path.display());
         }
     }
     Ok(entries)
 }
 
-fn take_expected_manifest_entry(
-    entries: &mut HashMap<PathBuf, ManifestEntry>,
+fn take_expected_manifest_entry<'a>(
+    entries: &mut HashMap<&Path, &'a ManifestEntry>,
     path: &Path,
     kind: EntryKind,
-) -> anyhow::Result<ManifestEntry> {
+) -> anyhow::Result<&'a ManifestEntry> {
     let Some(entry) = entries.get(path) else {
         anyhow::bail!("unexpected archive entry for {}", path.display());
     };
@@ -464,7 +482,7 @@ fn take_expected_manifest_entry(
 }
 
 fn expected_manifest_entry<'a>(
-    entries: &'a HashMap<PathBuf, ManifestEntry>,
+    entries: &'a HashMap<&Path, &ManifestEntry>,
     path: &Path,
     kind: EntryKind,
 ) -> anyhow::Result<&'a ManifestEntry> {
@@ -486,14 +504,25 @@ pub fn write_frame(mut writer: impl Write, frame: &ArchiveFrame) -> anyhow::Resu
 
 pub fn read_frame(mut reader: impl Read) -> anyhow::Result<Option<ArchiveFrame>> {
     let mut len = [0u8; 4];
-    match reader.read_exact(&mut len) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err.into()),
-    }
+    let prefix = loop {
+        match reader.read(&mut len) {
+            Ok(0) => return Ok(None),
+            Ok(n) => break n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
+    reader.read_exact(&mut len[prefix..])?;
     let len = u32::from_be_bytes(len) as usize;
-    let mut payload = vec![0u8; len];
+    // Read ordinary file frames directly. Grow large manifest buffers as data arrives.
+    let mut payload = vec![0u8; len.min(ARCHIVE_FILE_CHUNK_SIZE + 16)];
     reader.read_exact(&mut payload)?;
+    if payload.len() < len {
+        reader
+            .take((len - payload.len()) as u64)
+            .read_to_end(&mut payload)?;
+        anyhow::ensure!(payload.len() == len, "truncated archive frame");
+    }
     Ok(Some(postcard::from_bytes(&payload)?))
 }
 
@@ -604,6 +633,49 @@ mod tests {
             chunk_sizes,
             vec![ARCHIVE_FILE_CHUNK_SIZE, ARCHIVE_FILE_CHUNK_SIZE, 11]
         );
+    }
+
+    #[test]
+    fn streaming_writer_preserves_previous_archive_ids_for_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("stable.bin");
+        // Generated with the pre-streaming archive writer and the locked codecs.
+        for (len, compression, expected) in [
+            (
+                800,
+                Compression::Auto,
+                "89ff61f13d6b92ab637b987d7771e371fbf25a7e5a11ce26d4817d483d189af9",
+            ),
+            (
+                950,
+                Compression::Auto,
+                "16bba6c88d269ba03a41840d88b2dbc8172d223c9da78b4459e4441d93fb6e45",
+            ),
+            (
+                262157,
+                Compression::Zstd,
+                "e5ae258d8d182ce70ddaaae530996c2adef6eb187165275195e23f91db49873d",
+            ),
+            (
+                262157,
+                Compression::None,
+                "2cbba8ddb927ca85f92edc50628b45763707ad124babb2530defdc5137c83438",
+            ),
+            (
+                262157,
+                Compression::Lzma,
+                "c7a3f66e1eb2116756f4e07fade0c2276fe075d2d5ecc37338acc191cd8a5f10",
+            ),
+        ] {
+            let bytes = (0..len).map(|i| (i % 193) as u8).collect::<Vec<_>>();
+            fs::write(&path, bytes).unwrap();
+            let archive = create_archive(std::slice::from_ref(&path), compression).unwrap();
+            assert_eq!(archive.resource_id.hex(), expected);
+            assert_eq!(
+                resource_id_for_reader(archive.reader().unwrap()).unwrap(),
+                archive.resource_id
+            );
+        }
     }
 
     #[test]
