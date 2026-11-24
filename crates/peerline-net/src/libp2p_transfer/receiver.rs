@@ -167,6 +167,9 @@ pub(crate) async fn recv_libp2p(
                             &options.discovery,
                         );
                     }
+                    SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                        sessions.remove(&peer_id);
+                    }
                     SwarmEvent::Behaviour(TransferBehaviourEvent::Transfer(event)) => {
                         let local_peer_id = *swarm.local_peer_id();
                         if let Some(done) = handle_transfer_event(
@@ -176,7 +179,7 @@ pub(crate) async fn recv_libp2p(
                             event,
                             &options,
                             &lookup_key,
-                        )? {
+                        ).await? {
                             time::sleep(Duration::from_millis(100)).await;
                             emit_event(
                                 &options.events,
@@ -423,7 +426,7 @@ fn emit_event(
     }
 }
 
-fn handle_transfer_event(
+async fn handle_transfer_event(
     swarm: &mut Swarm<TransferBehaviour>,
     sessions: &mut HashMap<PeerId, ReceiverSession>,
     receiver_peer_id: &PeerId,
@@ -450,7 +453,14 @@ fn handle_transfer_event(
                 request,
                 options,
                 lookup_key,
-            )?;
+            )
+            .await
+            .unwrap_or_else(|error| {
+                sessions.remove(&peer);
+                InboundResponse::Frame(WireFrame::Error {
+                    message: error.to_string(),
+                })
+            });
             match response {
                 InboundResponse::Frame(frame) => {
                     let _ = swarm.behaviour_mut().transfer.send_response(channel, frame);
@@ -509,7 +519,7 @@ enum InboundResponse {
     Frame(WireFrame),
 }
 
-fn handle_inbound_request(
+async fn handle_inbound_request(
     sessions: &mut HashMap<PeerId, ReceiverSession>,
     receiver_peer_id: &PeerId,
     peer: PeerId,
@@ -655,14 +665,13 @@ fn handle_inbound_request(
                         &mut session.resume_state,
                         &session.descriptor,
                         &bytes,
-                    )?;
-                    emit_event(
+                    )
+                    .await?;
+                    session.progress.report(
                         &options.events,
-                        PeerlineEvent::Progress {
-                            id: session.transfer_id,
-                            bytes_done,
-                            bytes_total: session.descriptor.archive_bytes,
-                        },
+                        session.transfer_id,
+                        bytes_done,
+                        session.descriptor.archive_bytes,
                     );
                     Ok(InboundResponse::Frame(WireFrame::Ack))
                 }
@@ -675,7 +684,8 @@ fn handle_inbound_request(
                         PeerlineEvent::StageChanged(TransferStage::Verifying),
                     );
                     let archive =
-                        resume::complete_partial(&session.resume_state, &session.descriptor)?;
+                        resume::complete_partial(&mut session.resume_state, &session.descriptor)
+                            .await?;
                     let result = unpack_archive_from_reader(
                         &options.destination,
                         compression,
@@ -694,7 +704,7 @@ fn handle_inbound_request(
 
                     match result {
                         Ok(result) => {
-                            resume::remove_partial(&session.resume_state)?;
+                            resume::remove_partial(&mut session.resume_state)?;
                             emit_event(
                                 &options.events,
                                 PeerlineEvent::StageChanged(TransferStage::Complete),
@@ -703,7 +713,9 @@ fn handle_inbound_request(
                             Ok(InboundResponse::Frame(WireFrame::Ack))
                         }
                         Err(error) => {
-                            let _ = resume::remove_partial(&session.resume_state);
+                            if error.downcast_ref::<std::io::Error>().is_none() {
+                                let _ = resume::remove_partial(&mut session.resume_state);
+                            }
                             let message = error.to_string();
                             emit_event(
                                 &options.events,
@@ -785,7 +797,7 @@ mod version_tests {
                     tokio::select! {
                         event = server.select_next_some() => {
                             if let SwarmEvent::Behaviour(TransferBehaviourEvent::Transfer(event)) = event {
-                                assert!(handle_transfer_event(&mut server, &mut sessions, &server_id, event, &options, &lookup_key).unwrap().is_none());
+                                assert!(handle_transfer_event(&mut server, &mut sessions, &server_id, event, &options, &lookup_key).await.unwrap().is_none());
                             }
                         }
                         event = client.select_next_some() => {

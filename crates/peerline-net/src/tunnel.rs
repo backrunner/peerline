@@ -666,18 +666,17 @@ where
         PeerlineEvent::StageChanged(TransferStage::ReceivingManifest),
     );
 
-    std::fs::create_dir_all(&options.destination)?;
+    let mut progress = crate::progress::Progress::default();
     loop {
         match ws_read_secure(stream, &mut aead, &mut expected_sequence).await? {
             SecureFrame::ArchiveChunk { bytes } => {
-                let bytes_received = resume::append_chunk(&mut resume_state, &intro.1, &bytes)?;
-                emit_event(
+                let bytes_received =
+                    resume::append_chunk(&mut resume_state, &intro.1, &bytes).await?;
+                progress.report(
                     &options.events,
-                    PeerlineEvent::Progress {
-                        id: transfer_id,
-                        bytes_done: bytes_received,
-                        bytes_total: intro.1.archive_bytes,
-                    },
+                    transfer_id,
+                    bytes_received,
+                    intro.1.archive_bytes,
                 );
             }
             SecureFrame::Done => break,
@@ -689,7 +688,7 @@ where
         PeerlineEvent::StageChanged(TransferStage::Verifying),
     );
 
-    let archive = resume::complete_partial(&resume_state, &intro.1)?;
+    let archive = resume::complete_partial(&mut resume_state, &intro.1).await?;
     let result = unpack_archive_from_reader(
         &options.destination,
         compression,
@@ -708,7 +707,7 @@ where
 
     match result {
         Ok(received) => {
-            resume::remove_partial(&resume_state)?;
+            resume::remove_partial(&mut resume_state)?;
             ws_write_wire(stream, &WireFrame::Ack).await?;
             emit_event(
                 &options.events,
@@ -717,7 +716,9 @@ where
             Ok(received)
         }
         Err(error) => {
-            let _ = resume::remove_partial(&resume_state);
+            if error.downcast_ref::<std::io::Error>().is_none() {
+                let _ = resume::remove_partial(&mut resume_state);
+            }
             let message = error.to_string();
             let _ = ws_write_wire(stream, &WireFrame::Error { message }).await;
             Err(TransferError::fatal(error).into())

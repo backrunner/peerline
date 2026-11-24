@@ -177,6 +177,27 @@ throughput require two-device testing on each platform.
 
 See [sendme architecture and BLE protocol notes](docs/sendme-and-ble.md).
 
+### Resuming an interrupted Peerline transfer
+
+Restart the receiver in the same destination directory. On the original sender,
+send the same paths and compression setting using the receiver's current pairing
+details. Peerline uses the saved sender identity and the archive's BLAKE3 hash
+to find the matching checkpoint in `.peerline-resume`. A sender restart rebuilds
+the archive and seeks to the offset advertised by the receiver.
+
+Each active sender route can prefetch eight 64 KiB chunks. The receiver can
+fill one 1 MiB batch while another is written to disk. When those buffers fill,
+the transfer waits for disk I/O. The receiver checkpoints the first chunk, then
+after 8 MiB or on the next chunk after five seconds, and again at the end.
+Only synchronized data with a published checkpoint
+counts toward resume. On retry, the receiver discards any uncommitted tail and
+verifies the full archive before extraction. Completed transfers clear their
+checkpoint, and later sessions clean up partials older than 24 hours.
+
+Extraction publishes each verified file separately. If extraction is interrupted
+after some files have appeared, a retry with default overwrite settings can create
+numbered copies of those files.
+
 ### Optional clipboard copy
 
 Names and codes remain short enough to type; Peerline does not use a long sendme
